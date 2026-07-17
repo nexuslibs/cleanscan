@@ -753,6 +753,10 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
             }
             app.save_config();
         }
+        KeyCode::Char('c') => {
+            app.wizard_step = WizardStep::Settings;
+            app.cursor = 0;
+        }
         KeyCode::Right | KeyCode::Enter if (app.wizard_step as usize) < 2 => {
             app.wizard_step = WizardStep::Settings;
             app.cursor = 0;

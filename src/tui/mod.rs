@@ -343,7 +343,12 @@ impl App {
         let filename = format!("cleanscan_{ts}.tsv");
         let mut f = fs::File::create(&filename)?;
         writeln!(f, "rank\tip\tok\tfail\tavg\tp50\tp90\tp95\tmax")?;
-        for (i, r) in self.results.iter().enumerate() {
+        for (i, r) in self
+            .sorted_results()
+            .into_iter()
+            .take(self.config.top)
+            .enumerate()
+        {
             writeln!(
                 f,
                 "{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}",
