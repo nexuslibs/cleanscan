@@ -162,7 +162,12 @@ pub fn collect_targets(
 /// Validate a single CIDR/IP string without sampling any targets. Returns the
 /// parsed network on success. Used by the TUI to validate custom CIDR input.
 pub fn cidr_valid(s: &str) -> Result<IpNet> {
-    IpNet::from_str(s.trim()).map_err(|_| anyhow!("invalid IP/CIDR: {}", s))
+    let trimmed = s.trim();
+    if let Ok(ip) = IpAddr::from_str(trimmed) {
+        let prefix = if ip.is_ipv4() { 32 } else { 128 };
+        return IpNet::new(ip, prefix).map_err(|_| anyhow!("invalid IP/CIDR: {}", s));
+    }
+    IpNet::from_str(trimmed).map_err(|_| anyhow!("invalid IP/CIDR: {}", s))
 }
 
 /// Build a target set from an explicit list of CIDR strings (used by the TUI
@@ -280,10 +285,37 @@ async fn test_ip(
     let mut samples = Vec::new();
     let mut fail = 0usize;
 
-    while let Some(joined) = futs.next().await {
-        match joined {
-            Ok(Some(v)) => samples.push(v),
-            _ => fail += 1,
+    let mut cancelled = false;
+    let cancellation = async {
+        while !cancel.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    tokio::pin!(cancellation);
+    while !futs.is_empty() {
+        tokio::select! {
+            biased;
+            _ = &mut cancellation, if !cancelled => {
+                cancelled = true;
+                for task in futs.iter_mut() {
+                    task.abort();
+                }
+            }
+            joined = futs.next() => {
+                match joined {
+                    Some(Ok(Some(v))) => samples.push(v),
+                    Some(_) => fail += 1,
+                    None => break,
+                }
+            }
+        }
+        if cancelled {
+            while let Some(joined) = futs.next().await {
+                if joined.is_err() {
+                    fail += 1;
+                }
+            }
+            break;
         }
     }
 
@@ -342,4 +374,17 @@ pub async fn run_scan(
             }
         })
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cidr_valid;
+
+    #[test]
+    fn cidr_valid_accepts_bare_ipv4_and_ipv6() {
+        assert_eq!(cidr_valid(" 192.0.2.1 ").unwrap().prefix_len(), 32);
+        assert_eq!(cidr_valid("2001:db8::1").unwrap().prefix_len(), 128);
+        assert!(cidr_valid("192.0.2.0/24").is_ok());
+        assert!(cidr_valid("not-an-ip").is_err());
+    }
 }

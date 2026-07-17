@@ -115,7 +115,7 @@ impl App {
         // Populate candidates from defaults
         for c in crate::scanner::DEFAULT_CLOUDFLARE_CIDRS {
             let selected =
-                config.selected_cidrs.is_empty() || config.selected_cidrs.contains(&c.to_string());
+                !config.selected_cidrs_persisted || config.selected_cidrs.contains(&c.to_string());
             cidr_candidates.push(CidrEntry {
                 cidr: c.to_string(),
                 selected,
@@ -171,7 +171,7 @@ impl App {
         }
     }
 
-    pub fn save_config(&self) {
+    pub fn save_config(&mut self) {
         let default_set: std::collections::HashSet<String> =
             crate::scanner::DEFAULT_CLOUDFLARE_CIDRS
                 .iter()
@@ -196,7 +196,9 @@ impl App {
         current_config.custom_cidrs = custom_cidrs;
         current_config.selected_cidrs = selected_cidrs;
 
-        let _ = crate::config::save_config(&current_config);
+        if let Err(e) = crate::config::save_config(&current_config) {
+            self.toast(format!("Config save failed: {e}"));
+        }
     }
 
     /// Switch to the scanning dashboard once targets are known. Resets per-scan state.
@@ -343,10 +345,8 @@ impl App {
         let filename = format!("cleanscan_{ts}.tsv");
         let mut f = fs::File::create(&filename)?;
         writeln!(f, "rank\tip\tok\tfail\tavg\tp50\tp90\tp95\tmax")?;
-        for (i, r) in self
-            .sorted_results()
+        for (i, r) in ranked_export_results(&self.results, self.config.top)
             .into_iter()
-            .take(self.config.top)
             .enumerate()
         {
             writeln!(
@@ -376,6 +376,45 @@ impl App {
             Ok(name) => self.toast(format!("Results saved to {name}")),
             Err(e) => self.toast(format!("Save failed: {e}")),
         }
+    }
+}
+
+fn ranked_export_results(results: &[ProbeResult], top: usize) -> Vec<&ProbeResult> {
+    let mut ranked: Vec<&ProbeResult> = results.iter().filter(|r| r.fail == 0).collect();
+    ranked.sort_by(|a, b| App::natural_cmp(a, b));
+    ranked.truncate(top);
+    ranked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ranked_export_results, ProbeResult};
+
+    fn result(ip: &str, fail: usize, p95: f64) -> ProbeResult {
+        ProbeResult {
+            ip: ip.to_string(),
+            ok: 1,
+            fail,
+            avg: p95,
+            p50: p95,
+            p90: p95,
+            p95,
+            max: p95,
+            samples: vec![p95],
+        }
+    }
+
+    #[test]
+    fn export_ranks_successes_and_applies_top_limit() {
+        let results = vec![
+            result("failed", 1, 0.001),
+            result("slow", 0, 0.2),
+            result("fast", 0, 0.1),
+        ];
+        let ranked = ranked_export_results(&results, 1);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].ip, "fast");
+        assert_eq!(ranked[0].fail, 0);
     }
 }
 
@@ -478,6 +517,7 @@ pub fn run_tui(
                     path: app.config.path.clone(),
                     custom_cidrs: app.config.custom_cidrs.clone(),
                     selected_cidrs: app.config.selected_cidrs.clone(),
+                    selected_cidrs_persisted: app.config.selected_cidrs_persisted,
                     sample_per_cidr: app.config.sample_per_cidr,
                     probes: app.config.probes,
                     concurrency: app.config.concurrency,
@@ -510,12 +550,12 @@ pub fn run_tui(
             terminal.draw(|f| app.render(f))?;
 
             if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
                         app.handle_key(key.code, key.modifiers);
                     }
-                } else if let Event::Mouse(m) = event::read()? {
-                    app.handle_mouse(m);
+                    Event::Mouse(m) => app.handle_mouse(m),
+                    _ => {}
                 }
             }
 
@@ -543,6 +583,11 @@ pub fn run_tui(
 impl App {
     /// Top-level key dispatch.
     fn handle_key(&mut self, code: KeyCode, _mods: KeyModifiers) {
+        if self.screen == Screen::Wizard && (self.edit_field.is_some() || self.custom_input_mode) {
+            wizard::handle_wizard_key(self, code);
+            return;
+        }
+
         // Global keys work on every screen.
         match code {
             KeyCode::Char('?') => {
@@ -688,11 +733,9 @@ impl App {
                         if let Some(inner) = self.settings_inner {
                             if point_in(inner, p) && self.edit_field.is_none() {
                                 let idx = (m.row - inner.y) as usize;
-                                // Offset check since preset bar is at the top (idx 0 is preset bar, settings start after)
-                                let last = SettingField::ALL.len();
-                                if idx > 0 && (idx - 1) < last {
-                                    self.cursor = idx - 1;
-                                    self.start_edit(idx - 1);
+                                if idx < SettingField::ALL.len() {
+                                    self.cursor = idx;
+                                    self.start_edit(idx);
                                 }
                             }
                         }

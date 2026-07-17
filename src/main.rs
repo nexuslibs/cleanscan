@@ -86,14 +86,39 @@ fn main() -> Result<()> {
         config.top = top;
     }
 
-    if config.concurrency == 0 {
-        config.concurrency = 1;
-    }
+    normalize_config(&mut config);
 
     if args.cli {
         cli_mode(config, args.cidr, args.ips)
     } else {
         tui::run_tui(config, args.cidr, args.ips)
+    }
+}
+
+fn normalize_config(config: &mut AppConfig) {
+    if config.concurrency == 0 {
+        config.concurrency = 1;
+    }
+    if config.probes == 0 {
+        config.probes = 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_config;
+    use crate::config::AppConfig;
+
+    #[test]
+    fn zero_probe_and_concurrency_values_are_normalized() {
+        let mut config = AppConfig {
+            probes: 0,
+            concurrency: 0,
+            ..AppConfig::default()
+        };
+        normalize_config(&mut config);
+        assert_eq!(config.probes, 1);
+        assert_eq!(config.concurrency, 1);
     }
 }
 

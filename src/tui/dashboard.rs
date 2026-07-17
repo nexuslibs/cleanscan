@@ -168,9 +168,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
     };
 
     let median_latency = if !ok_results.is_empty() {
-        let mut p50s: Vec<f64> = ok_results.iter().map(|r| r.p50).collect();
-        p50s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        p50s[p50s.len() / 2]
+        median(ok_results.iter().map(|r| r.p50).collect())
     } else {
         0.0
     };
@@ -200,14 +198,11 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
     let (mut exc, mut gd, mut fr, mut pr) = (0, 0, 0, 0);
     for r in &ok_results {
         let ms = r.avg * 1000.0;
-        if ms < 80.0 {
-            exc += 1;
-        } else if ms < 150.0 {
-            gd += 1;
-        } else if ms < 250.0 {
-            fr += 1;
-        } else {
-            pr += 1;
+        match latency_bucket(ms) {
+            0 => exc += 1,
+            1 => gd += 1,
+            2 => fr += 1,
+            _ => pr += 1,
         }
     }
 
@@ -232,7 +227,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
             Span::styled(format!("{gd}"), theme::hint_style()),
         ]),
         Line::from(vec![
-            Span::styled("150-250 : ", theme::title_style()),
+            Span::styled("200-250 : ", theme::bad_style()),
             Span::raw(format!("{:<8} ", make_bar(fr))),
             Span::styled(format!("{fr}"), theme::hint_style()),
         ]),
@@ -269,11 +264,11 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
     // Compute column x-bounds for mouse header sorting.
     let mut bounds = Vec::new();
     let mut x = inner.x;
-    for w in WIDTHS.iter() {
+    for (i, w) in WIDTHS.iter().enumerate() {
         if let Constraint::Length(len) = w {
             let len = (*len).min(inner.width.saturating_sub(x - inner.x));
             bounds.push((x, x + len));
-            x += len;
+            x += len + u16::from(i + 1 < WIDTHS.len());
         }
     }
     app.table_col_bounds = bounds;
@@ -382,6 +377,28 @@ fn fmt_ms(sec: f64) -> String {
     format!("{:.1}ms", sec * 1000.0)
 }
 
+fn median(mut values: Vec<f64>) -> f64 {
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        (values[mid - 1] + values[mid]) / 2.0
+    } else {
+        values[mid]
+    }
+}
+
+fn latency_bucket(ms: f64) -> usize {
+    if ms < theme::LATENCY_GOOD_MS {
+        0
+    } else if ms < theme::LATENCY_WARN_MS {
+        1
+    } else if ms < 250.0 {
+        2
+    } else {
+        3
+    }
+}
+
 fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -411,8 +428,26 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     let msg = app.visible_message().unwrap_or(if app.scan_complete {
         "Scan complete — ↑/↓ scroll, s save, q quit"
     } else {
-        "↑/↓ scroll • space pause • s save • ? help • q quit"
+        "↑/↓ scroll • space pause • ? help • q quit"
     });
     let para = Paragraph::new(msg).style(theme::hint_style());
     frame.render_widget(para, chunks[1]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{latency_bucket, median};
+
+    #[test]
+    fn median_averages_even_central_values() {
+        assert_eq!(median(vec![4.0, 1.0, 3.0, 2.0]), 2.5);
+        assert_eq!(median(vec![3.0, 1.0, 2.0]), 2.0);
+    }
+
+    #[test]
+    fn dashboard_bucket_matches_table_classification_at_200ms() {
+        assert_eq!(latency_bucket(199.9), 1);
+        assert_eq!(latency_bucket(200.0), 2);
+        assert_eq!(latency_bucket(249.9), 2);
+    }
 }

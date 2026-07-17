@@ -95,14 +95,17 @@ impl SettingField {
         let raw = raw.trim();
         match self {
             SettingField::Host => {
-                if raw.is_empty() {
-                    return Err("host must not be empty".to_string());
+                if raw.is_empty() || raw.contains("://") || raw.contains('/') || raw.contains('\\')
+                {
+                    return Err(
+                        "host must be a non-empty authority without a scheme or path".to_string(),
+                    );
                 }
                 args.host = raw.to_string();
             }
             SettingField::Path => {
-                if raw.is_empty() {
-                    return Err("path must not be empty".to_string());
+                if raw.is_empty() || !raw.starts_with('/') {
+                    return Err("path must be non-empty and begin with /".to_string());
                 }
                 args.path = raw.to_string();
             }
@@ -697,23 +700,25 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
                 app.edit_caret = 0;
             }
             KeyCode::Backspace if app.edit_caret > 0 => {
-                app.edit_caret -= 1;
-                app.input_buffer.remove(app.edit_caret);
+                let previous = previous_char_boundary(&app.input_buffer, app.edit_caret);
+                app.input_buffer.drain(previous..app.edit_caret);
+                app.edit_caret = previous;
             }
             KeyCode::Delete if app.edit_caret < app.input_buffer.len() => {
-                app.input_buffer.remove(app.edit_caret);
+                let next = next_char_boundary(&app.input_buffer, app.edit_caret);
+                app.input_buffer.drain(app.edit_caret..next);
             }
             KeyCode::Left if app.edit_caret > 0 => {
-                app.edit_caret -= 1;
+                app.edit_caret = previous_char_boundary(&app.input_buffer, app.edit_caret);
             }
             KeyCode::Right if app.edit_caret < app.input_buffer.len() => {
-                app.edit_caret += 1;
+                app.edit_caret = next_char_boundary(&app.input_buffer, app.edit_caret);
             }
             KeyCode::Home => app.edit_caret = 0,
             KeyCode::End => app.edit_caret = app.input_buffer.len(),
             KeyCode::Char(c) => {
                 app.input_buffer.insert(app.edit_caret, c);
-                app.edit_caret += 1;
+                app.edit_caret += c.len_utf8();
             }
             _ => {}
         }
@@ -785,17 +790,19 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
                 app.edit_caret = 0;
             }
             KeyCode::Backspace if app.edit_caret > 0 => {
-                app.edit_caret -= 1;
-                app.edit_buffer.remove(app.edit_caret);
+                let previous = previous_char_boundary(&app.edit_buffer, app.edit_caret);
+                app.edit_buffer.drain(previous..app.edit_caret);
+                app.edit_caret = previous;
             }
             KeyCode::Delete if app.edit_caret < app.edit_buffer.len() => {
-                app.edit_buffer.remove(app.edit_caret);
+                let next = next_char_boundary(&app.edit_buffer, app.edit_caret);
+                app.edit_buffer.drain(app.edit_caret..next);
             }
             KeyCode::Left if app.edit_caret > 0 => {
-                app.edit_caret -= 1;
+                app.edit_caret = previous_char_boundary(&app.edit_buffer, app.edit_caret);
             }
             KeyCode::Right if app.edit_caret < app.edit_buffer.len() => {
-                app.edit_caret += 1;
+                app.edit_caret = next_char_boundary(&app.edit_buffer, app.edit_caret);
             }
             KeyCode::Home => app.edit_caret = 0,
             KeyCode::End => app.edit_caret = app.edit_buffer.len(),
@@ -813,7 +820,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             }
             KeyCode::Char(c) => {
                 app.edit_buffer.insert(app.edit_caret, c);
-                app.edit_caret += 1;
+                app.edit_caret += c.len_utf8();
             }
             _ => {}
         }
@@ -897,5 +904,52 @@ impl App {
             self.edit_buffer = field.value_string(&self.config);
             self.edit_caret = self.edit_buffer.len();
         }
+    }
+}
+
+fn previous_char_boundary(s: &str, index: usize) -> usize {
+    s[..index]
+        .char_indices()
+        .next_back()
+        .map(|(position, _)| position)
+        .unwrap_or(0)
+}
+
+fn next_char_boundary(s: &str, index: usize) -> usize {
+    s[index..]
+        .chars()
+        .next()
+        .map(|c| index + c.len_utf8())
+        .unwrap_or(index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_char_boundary, previous_char_boundary, SettingField};
+    use crate::config::AppConfig;
+
+    #[test]
+    fn host_and_path_validation_match_url_construction() {
+        let mut config = AppConfig::default();
+        assert!(SettingField::Host
+            .apply("example.test:443", &mut config)
+            .is_ok());
+        assert!(SettingField::Host
+            .apply("https://example.test", &mut config)
+            .is_err());
+        assert!(SettingField::Host
+            .apply("example.test/path", &mut config)
+            .is_err());
+        assert!(SettingField::Path.apply("/trace", &mut config).is_ok());
+        assert!(SettingField::Path.apply("trace", &mut config).is_err());
+    }
+
+    #[test]
+    fn editor_boundaries_are_utf8_safe() {
+        let value = "a🙂b";
+        assert_eq!(previous_char_boundary(value, value.len()), 5);
+        assert_eq!(previous_char_boundary(value, 5), 1);
+        assert_eq!(next_char_boundary(value, 1), 5);
+        assert_eq!(next_char_boundary(value, 5), value.len());
     }
 }

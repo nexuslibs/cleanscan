@@ -58,11 +58,14 @@ pub fn border_active_style() -> Style {
 
 /// Color a latency value (in milliseconds) so good/ok/bad are visually distinct.
 pub fn latency_style(ms: f64) -> Style {
-    if ms < 80.0 {
+    if ms < LATENCY_GOOD_MS {
         good_style()
-    } else if ms < 200.0 {
+    } else if ms < LATENCY_WARN_MS {
         warn_style()
     } else {
         bad_style()
     }
 }
+
+pub const LATENCY_GOOD_MS: f64 = 80.0;
+pub const LATENCY_WARN_MS: f64 = 200.0;
