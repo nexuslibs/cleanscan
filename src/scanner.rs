@@ -203,7 +203,24 @@ async fn test_ip(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let permit = sem.clone().acquire_owned().await.unwrap();
+        // Wait for a probe permit, but stop if cancellation fires while queued.
+        let permit = tokio::select! {
+            biased;
+            p = sem.clone().acquire_owned() => p.unwrap(),
+            _ = async {
+                while !cancel.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            } => break,
+        };
+
+        // Cancellation may have fired between requesting and obtaining the
+        // permit; drop it and stop scheduling without launching a request.
+        if cancel.load(Ordering::Relaxed) {
+            drop(permit);
+            break;
+        }
+
         let c = client.clone();
         let u = url.clone();
 
@@ -256,22 +273,26 @@ pub async fn run_scan(
     paused: Arc<AtomicBool>,
 ) {
     let sem = Arc::new(Semaphore::new(args.concurrency));
-    let mut tasks = FuturesUnordered::new();
 
-    for ip in targets {
-        if cancel.load(Ordering::Relaxed) {
-            break;
-        }
-        let tx = tx.clone();
-        let args = args.clone();
-        let sem = sem.clone();
-        let cancel = cancel.clone();
-        let paused = paused.clone();
-        tasks.push(tokio::spawn(async move {
-            let result = test_ip(ip, args, sem, cancel, paused).await;
-            let _ = tx.send(result);
-        }));
-    }
+    // Bound how many targets are processed at once so queued targets and their
+    // per-target client state cannot grow with the full input. Probe-level
+    // concurrency stays limited by `sem` inside `test_ip`.
+    let workers = args.concurrency.max(1);
 
-    while tasks.next().await.is_some() {}
+    futures::stream::iter(targets)
+        .for_each_concurrent(workers, |ip| {
+            let tx = tx.clone();
+            let args = args.clone();
+            let sem = sem.clone();
+            let cancel = cancel.clone();
+            let paused = paused.clone();
+            async move {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                let result = test_ip(ip, args, sem, cancel, paused).await;
+                let _ = tx.send(result);
+            }
+        })
+        .await;
 }
