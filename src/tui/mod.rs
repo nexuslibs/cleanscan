@@ -386,38 +386,6 @@ fn ranked_export_results(results: &[ProbeResult], top: usize) -> Vec<&ProbeResul
     ranked
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{ranked_export_results, ProbeResult};
-
-    fn result(ip: &str, fail: usize, p95: f64) -> ProbeResult {
-        ProbeResult {
-            ip: ip.to_string(),
-            ok: 1,
-            fail,
-            avg: p95,
-            p50: p95,
-            p90: p95,
-            p95,
-            max: p95,
-            samples: vec![p95],
-        }
-    }
-
-    #[test]
-    fn export_ranks_successes_and_applies_top_limit() {
-        let results = vec![
-            result("failed", 1, 0.001),
-            result("slow", 0, 0.2),
-            result("fast", 0, 0.1),
-        ];
-        let ranked = ranked_export_results(&results, 1);
-        assert_eq!(ranked.len(), 1);
-        assert_eq!(ranked[0].ip, "fast");
-        assert_eq!(ranked[0].fail, 0);
-    }
-}
-
 /// Center a rectangle of the given percentage size within `area`.
 pub fn centered(area: Rect, percent_w: u16, percent_h: u16) -> Rect {
     let vertical = Layout::default()
@@ -813,5 +781,37 @@ impl Drop for RestoreGuard {
     fn drop(&mut self) {
         let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture);
         ratatui::restore();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ranked_export_results, ProbeResult};
+
+    fn result(ip: &str, fail: usize, p95: f64) -> ProbeResult {
+        ProbeResult {
+            ip: ip.to_string(),
+            ok: 1,
+            fail,
+            avg: p95,
+            p50: p95,
+            p90: p95,
+            p95,
+            max: p95,
+            samples: vec![p95],
+        }
+    }
+
+    #[test]
+    fn export_ranks_successes_and_applies_top_limit() {
+        let results = vec![
+            result("failed", 1, 0.001),
+            result("slow", 0, 0.2),
+            result("fast", 0, 0.1),
+        ];
+        let ranked = ranked_export_results(&results, 1);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].ip, "fast");
+        assert_eq!(ranked[0].fail, 0);
     }
 }

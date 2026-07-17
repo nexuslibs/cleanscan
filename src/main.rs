@@ -104,24 +104,6 @@ fn normalize_config(config: &mut AppConfig) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::normalize_config;
-    use crate::config::AppConfig;
-
-    #[test]
-    fn zero_probe_and_concurrency_values_are_normalized() {
-        let mut config = AppConfig {
-            probes: 0,
-            concurrency: 0,
-            ..AppConfig::default()
-        };
-        normalize_config(&mut config);
-        assert_eq!(config.probes, 1);
-        assert_eq!(config.concurrency, 1);
-    }
-}
-
 fn cli_mode(config: AppConfig, cidr: Vec<String>, ips: Option<String>) -> Result<()> {
     let targets = scanner::collect_targets(&config, &cidr, &ips)?;
     let total = targets.len();
@@ -179,4 +161,22 @@ fn cli_mode(config: AppConfig, cidr: Vec<String>, ips: Option<String>) -> Result
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_config;
+    use crate::config::AppConfig;
+
+    #[test]
+    fn zero_probe_and_concurrency_values_are_normalized() {
+        let mut config = AppConfig {
+            probes: 0,
+            concurrency: 0,
+            ..AppConfig::default()
+        };
+        normalize_config(&mut config);
+        assert_eq!(config.probes, 1);
+        assert_eq!(config.concurrency, 1);
+    }
 }
