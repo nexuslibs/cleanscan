@@ -41,6 +41,8 @@ jobs:
       - name: Install zig (cross musl linker)
         if: contains(matrix.target, 'linux-musl')
         uses: mlugg/setup-zig@v1 # v1
+        with:
+          use-cache: false
 
       - name: Install cargo-zigbuild
         if: contains(matrix.target, 'linux-musl')
