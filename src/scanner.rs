@@ -3,8 +3,8 @@ use std::{
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
-    sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -47,7 +47,11 @@ fn random_ip_from_net(net: IpNet) -> Option<IpAddr> {
             let broadcast = u32::from(v4.broadcast());
             let prefix = v4.prefix_len();
             let host_bits = 32u32.saturating_sub(prefix as u32);
-            let size: u32 = if host_bits >= 32 { u32::MAX } else { 1u32 << host_bits };
+            let size: u32 = if host_bits >= 32 {
+                u32::MAX
+            } else {
+                1u32 << host_bits
+            };
 
             let (start, end) = if size <= 2 {
                 (network, broadcast)

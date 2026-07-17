@@ -2,8 +2,8 @@ mod scanner;
 mod tui;
 
 use clap::Parser;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use anyhow::Result;
 

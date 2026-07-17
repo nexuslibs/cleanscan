@@ -1,8 +1,8 @@
 use std::{
     fs,
     io::{self, Write},
-    sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
+    sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -176,10 +176,7 @@ impl App {
         } else {
             " [q] quit  [p] pause/resume"
         };
-        let message = self
-            .message
-            .as_deref()
-            .unwrap_or(text);
+        let message = self.message.as_deref().unwrap_or(text);
         let paragraph = Paragraph::new(message).style(Style::default().fg(Color::DarkGray));
         frame.render_widget(paragraph, area);
     }
