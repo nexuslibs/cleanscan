@@ -155,6 +155,12 @@ pub fn collect_targets(args: &Args) -> Result<Vec<String>> {
     Ok(targets.into_iter().collect())
 }
 
+/// Validate a single CIDR/IP string without sampling any targets. Returns the
+/// parsed network on success. Used by the TUI to validate custom CIDR input.
+pub fn cidr_valid(s: &str) -> Result<IpNet> {
+    IpNet::from_str(s.trim()).map_err(|_| anyhow!("invalid IP/CIDR: {}", s))
+}
+
 /// Build a target set from an explicit list of CIDR strings (used by the TUI
 /// CIDR selection screen). Each CIDR is sampled as in `collect_targets`.
 pub fn collect_from_cidrs(cidrs: &[String], sample_per_cidr: usize) -> Result<Vec<String>> {
