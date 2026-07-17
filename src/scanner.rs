@@ -15,7 +15,7 @@ use rand::Rng;
 use reqwest::Client;
 use tokio::sync::Semaphore;
 
-use crate::Args;
+use crate::config::AppConfig;
 
 /// Built-in list of common Cloudflare edge CIDR ranges offered for selection
 /// in the TUI when no targets are supplied on the command line.
@@ -132,18 +132,18 @@ fn add_ip_or_cidr(s: &str, out: &mut BTreeSet<String>, sample_per_cidr: usize) -
     Ok(())
 }
 
-pub fn collect_targets(args: &Args) -> Result<Vec<String>> {
+pub fn collect_targets(config: &AppConfig, cli_cidrs: &[String], cli_ips: &Option<String>) -> Result<Vec<String>> {
     let mut targets = BTreeSet::new();
 
-    if let Some(path) = &args.ips {
+    if let Some(path) = cli_ips {
         let text = fs::read_to_string(path)?;
         for line in text.lines() {
-            add_ip_or_cidr(line, &mut targets, args.sample_per_cidr)?;
+            add_ip_or_cidr(line, &mut targets, config.sample_per_cidr)?;
         }
     }
 
-    for cidr in &args.cidr {
-        add_ip_or_cidr(cidr, &mut targets, args.sample_per_cidr)?;
+    for cidr in cli_cidrs {
+        add_ip_or_cidr(cidr, &mut targets, config.sample_per_cidr)?;
     }
 
     if targets.is_empty() {
@@ -177,7 +177,7 @@ pub fn collect_from_cidrs(cidrs: &[String], sample_per_cidr: usize) -> Result<Ve
     Ok(targets.into_iter().collect())
 }
 
-fn client_for_ip(host: &str, ip: &str, args: &Args) -> Result<Client> {
+fn client_for_ip(host: &str, ip: &str, args: &AppConfig) -> Result<Client> {
     let ip_addr = IpAddr::from_str(ip)?;
     let socket = SocketAddr::new(ip_addr, 443);
 
@@ -208,7 +208,7 @@ async fn probe_once(client: &Client, url: &str) -> Option<f64> {
 
 async fn test_ip(
     ip: String,
-    args: Arc<Args>,
+    args: Arc<AppConfig>,
     sem: Arc<Semaphore>,
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
@@ -310,7 +310,7 @@ async fn test_ip(
 /// scheduling until cleared.
 pub async fn run_scan(
     targets: Vec<String>,
-    args: Arc<Args>,
+    args: Arc<AppConfig>,
     tx: std::sync::mpsc::Sender<ProbeResult>,
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,

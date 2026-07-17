@@ -1,15 +1,15 @@
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Style},
+    style::{Style, Color},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
 
 use crate::tui::theme;
 use crate::tui::{App, ButtonAction, WizardStep};
-use crate::Args;
+use crate::config::AppConfig;
 
 /// Identifies an editable scan parameter on the settings step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,8 +50,21 @@ impl SettingField {
         }
     }
 
+    pub fn description(&self) -> &'static str {
+        match self {
+            SettingField::Host => "The hostname used in SNI and the Host header for HTTP probes (e.g. app.iplat.ir). Cleanscan resolves this host to the tested edge IPs directly.",
+            SettingField::Path => "The HTTP request path to probe (e.g. /cdn-cgi/trace). Typically points to a lightweight text file or endpoint to minimize bandwidth usage.",
+            SettingField::SamplePerCidr => "Number of random IPs sampled from each selected CIDR. Higher values increase coverage across the edge network, but increase total targets.",
+            SettingField::Probes => "Number of requests sent to each IP to probe latency. More probes filter out transient noise and establish a highly accurate latency percentile.",
+            SettingField::Concurrency => "Maximum number of simultaneous request workers. Higher concurrency speeds up scanning but may trigger rate limiting or CPU bottlenecks.",
+            SettingField::TimeoutMs => "Max time (in ms) allowed for an HTTP request to finish. Probes exceeding this threshold are treated as errors/failures.",
+            SettingField::ConnectTimeoutMs => "Max time (in ms) to establish a TCP socket connection. Lower values skip dead, blacklisted, or blocked IPs more rapidly.",
+            SettingField::Top => "Number of fastest, zero-fail IP addresses to show in the final dashboard results table and export to files.",
+        }
+    }
+
     /// Current value of this field as an editable string.
-    pub fn value_string(&self, args: &Args) -> String {
+    pub fn value_string(&self, args: &AppConfig) -> String {
         match self {
             SettingField::Host => args.host.clone(),
             SettingField::Path => args.path.clone(),
@@ -78,7 +91,7 @@ impl SettingField {
     }
 
     /// Parse `raw` and apply it to `args`. Returns an error message on failure.
-    pub fn apply(&self, raw: &str, args: &mut Args) -> Result<(), String> {
+    pub fn apply(&self, raw: &str, args: &mut AppConfig) -> Result<(), String> {
         let raw = raw.trim();
         match self {
             SettingField::Host => {
@@ -177,13 +190,15 @@ fn render_step_bar(app: &App, frame: &mut Frame, area: Rect) {
         } else {
             theme::hint_style()
         };
-        spans.push(Span::styled(format!(" {s} "), style));
+        spans.push(Span::styled(format!("  {s}  "), style));
         if i < steps.len() - 1 {
-            spans.push(Span::styled(" ›", theme::hint_style()));
+            spans.push(Span::styled("›", theme::hint_style()));
         }
     }
     let line = Line::from(spans);
-    let block = Block::default().borders(Borders::ALL);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::border_style());
     let para = Paragraph::new(line).block(block);
     frame.render_widget(para, area);
 }
@@ -194,10 +209,19 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
         .constraints([Constraint::Min(1), Constraint::Length(3)])
         .split(area);
 
+    let main_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(60),
+            Constraint::Percentage(40),
+        ])
+        .split(chunks[0]);
+
     let list_block = Block::default()
         .borders(Borders::ALL)
+        .border_style(theme::border_active_style())
         .title(" Cloudflare CIDR ranges (space toggle, A all, D none) ");
-    let inner = list_block.inner(chunks[0]);
+    let inner = list_block.inner(main_layout[0]);
     app.ranges_inner = Some(inner);
 
     let lines: Vec<Line> = app
@@ -205,42 +229,136 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, e)| {
-            let mark = if e.selected { "[x]" } else { "[ ]" };
+            let mark = if e.selected { "● [x]" } else { "○ [ ]" };
             let cursor = if i == app.cursor { "› " } else { "  " };
-            let base = if i == app.cursor {
+            let style = if i == app.cursor {
                 theme::highlight_style()
             } else if e.selected {
-                Style::default()
+                Style::default().fg(Color::LightCyan)
             } else {
                 theme::hint_style()
             };
-            Line::from(format!("{}{} {}", cursor, mark, e.cidr)).style(base)
+            Line::from(format!("{}{} {}", cursor, mark, e.cidr)).style(style)
         })
         .collect();
 
     let para = Paragraph::new(lines).block(list_block);
-    frame.render_widget(para, chunks[0]);
+    frame.render_widget(para, main_layout[0]);
 
-    let selected = app.cidr_candidates.iter().filter(|e| e.selected).count();
+    // Right Side Info Panel
+    let selected_count = app.cidr_candidates.iter().filter(|e| e.selected).count();
+    let total_ips = selected_count * app.config.sample_per_cidr;
+    let total_requests = total_ips * app.config.probes;
+
+    let info_text = vec![
+        Line::from(vec![
+            Span::styled(" RANGE SUMMARY ", theme::header_style()),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Selected Ranges: ", theme::title_style()),
+            Span::raw(format!("{} / {}", selected_count, app.cidr_candidates.len())),
+        ]),
+        Line::from(vec![
+            Span::styled("Sample per CIDR: ", theme::title_style()),
+            Span::raw(app.config.sample_per_cidr.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Total target IPs: ", theme::title_style()),
+            Span::raw(total_ips.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Total HTTP Probes: ", theme::title_style()),
+            Span::raw(total_requests.to_string()),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(" Quick Actions: ", theme::subtitle_style())),
+        Line::from(vec![
+            Span::styled("  A  ", theme::highlight_style()),
+            Span::raw("Select all CIDRs"),
+        ]),
+        Line::from(vec![
+            Span::styled("  D  ", theme::highlight_style()),
+            Span::raw("Deselect all CIDRs"),
+        ]),
+        Line::from(vec![
+            Span::styled("  a  ", theme::highlight_style()),
+            Span::raw("Add a custom CIDR range"),
+        ]),
+    ];
+
+    let info_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::border_style())
+        .title(" Selected Metrics ");
+    let info_para = Paragraph::new(info_text).block(info_block);
+    frame.render_widget(info_para, main_layout[1]);
+
+    // Input line at bottom
     let input_line = if app.custom_input_mode {
         let (before, after) = app
             .input_buffer
             .split_at(app.edit_caret.min(app.input_buffer.len()));
         format!("> {}{}_{}", before, after, "")
     } else {
-        "  press 'a' to add a custom CIDR   ".to_string()
+        "  press 'a' to add a custom CIDR range  ".to_string()
     };
-    let title = format!(" Add CIDR  ({} / {} selected) ", selected, app.cidr_candidates.len());
+    let title = " Add CIDR ";
     let input = Paragraph::new(input_line)
-        .block(Block::default().borders(Borders::ALL).title(title));
+        .block(Block::default().borders(Borders::ALL).border_style(if app.custom_input_mode { theme::border_active_style() } else { theme::border_style() }).title(title));
     frame.render_widget(input, chunks[1]);
 }
 
 fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Preset bar
+            Constraint::Min(1),    // Main parameters
+        ])
+        .split(area);
+
+    // Preset Bar
+    // Detect matching preset
+    let mut current_preset = "Custom";
+    if app.config.sample_per_cidr == 100 && app.config.probes == 8 && app.config.concurrency == 120 && app.config.timeout_ms == 2500 && app.config.connect_timeout_ms == 1000 && app.config.top == 50 {
+        current_preset = "Default [1]";
+    } else if app.config.sample_per_cidr == 50 && app.config.probes == 4 && app.config.concurrency == 200 && app.config.timeout_ms == 1500 && app.config.connect_timeout_ms == 500 && app.config.top == 25 {
+        current_preset = "Fast Scan [2]";
+    } else if app.config.sample_per_cidr == 200 && app.config.probes == 15 && app.config.concurrency == 80 && app.config.timeout_ms == 3500 && app.config.connect_timeout_ms == 1500 && app.config.top == 100 {
+        current_preset = "Thorough Scan [3]";
+    }
+
+    let preset_spans = vec![
+        Span::styled(" Quick Presets: ", theme::subtitle_style()),
+        Span::styled(" [1] Default ", if current_preset.contains("Default") { theme::highlight_style() } else { theme::hint_style() }),
+        Span::styled(" [2] Fast Scan ", if current_preset.contains("Fast") { theme::highlight_style() } else { theme::hint_style() }),
+        Span::styled(" [3] Thorough Scan ", if current_preset.contains("Thorough") { theme::highlight_style() } else { theme::hint_style() }),
+        Span::styled("  Current: ", theme::hint_style()),
+        Span::styled(current_preset, theme::title_style()),
+    ];
+
+    let preset_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::border_style())
+        .title(" Preset Configurations ");
+    let preset_para = Paragraph::new(Line::from(preset_spans)).block(preset_block);
+    frame.render_widget(preset_para, chunks[0]);
+
+    // Settings columns layout
+    let main_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(60),
+            Constraint::Percentage(40),
+        ])
+        .split(chunks[1]);
+
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_style(theme::border_active_style())
         .title(" Scan parameters (Enter edit, ↑/↓ step numeric) ");
-    let inner = block.inner(area);
+    let inner = block.inner(main_layout[0]);
     app.settings_inner = Some(inner);
 
     let lines: Vec<Line> = SettingField::ALL
@@ -251,7 +369,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
             let style = if i == app.cursor {
                 theme::highlight_style()
             } else {
-                Style::default()
+                Style::default().fg(Color::LightCyan)
             };
             let value = if app.edit_field == Some(i) {
                 let (before, after) = app
@@ -267,7 +385,36 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         .collect();
 
     let para = Paragraph::new(lines).block(block);
-    frame.render_widget(para, area);
+    frame.render_widget(para, main_layout[0]);
+
+    // Right Side Description Panel
+    let current_field = SettingField::ALL[app.cursor.min(SettingField::ALL.len() - 1)];
+    let desc_text = vec![
+        Line::from(vec![
+            Span::styled(format!(" {} ", current_field.label().to_uppercase()), theme::header_style()),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("Description:", theme::title_style())),
+        Line::from(""),
+    ];
+
+    let mut desc_para_lines = desc_text;
+    desc_para_lines.push(Line::from(current_field.description()));
+    desc_para_lines.push(Line::from(""));
+    desc_para_lines.push(Line::from(Span::styled("Keyboard Shortcut:", theme::subtitle_style())));
+    desc_para_lines.push(Line::from("  Press Enter to edit directly."));
+    if current_field.is_numeric() {
+        desc_para_lines.push(Line::from("  Use ↑/↓ arrows to increment/decrement values."));
+    }
+
+    let desc_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::border_style())
+        .title(" Field Context ");
+    let desc_widget = Paragraph::new(desc_para_lines)
+        .block(desc_block)
+        .wrap(Wrap { trim: true });
+    frame.render_widget(desc_widget, main_layout[1]);
 }
 
 fn render_review(app: &App, frame: &mut Frame, area: Rect) {
@@ -278,48 +425,101 @@ fn render_review(app: &App, frame: &mut Frame, area: Rect) {
         .map(|e| e.cidr.as_str())
         .collect();
 
-    let summary = vec![
+    let selected_count = selected.len();
+    let total_ips = selected_count * app.config.sample_per_cidr;
+    let total_probes = total_ips * app.config.probes;
+
+    // Ideal scan duration estimate
+    let ideal_seconds = (total_probes as f64 / app.config.concurrency as f64) * (app.config.timeout_ms as f64 / 2000.0);
+    let est_duration_str = if ideal_seconds < 60.0 {
+        format!("{:.1}s", ideal_seconds)
+    } else {
+        format!("{:02}:{:02}", (ideal_seconds / 60.0) as u64, (ideal_seconds % 60.0) as u64)
+    };
+
+    let main_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Percentage(50),
+        ])
+        .split(area);
+
+    let summary_left = vec![
         Line::from(vec![
-            Span::styled("Target host : ", theme::title_style()),
+            Span::styled(" TARGET SPECIFICATION ", theme::header_style()),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Hostname  : ", theme::title_style()),
             Span::raw(app.config.host.clone()),
         ]),
         Line::from(vec![
-            Span::styled("Probe path : ", theme::title_style()),
+            Span::styled("Probe Path: ", theme::title_style()),
             Span::raw(app.config.path.clone()),
         ]),
         Line::from(vec![
-            Span::styled("Ranges     : ", theme::title_style()),
-            Span::raw(format!("{} selected", selected.len())),
+            Span::styled("CIDR count: ", theme::title_style()),
+            Span::raw(format!("{} selected", selected_count)),
         ]),
-        Line::from(selected.iter().map(|c| format!("  • {c}")).collect::<Vec<_>>().join("\n")),
+        Line::from(""),
+        Line::from(selected.iter().take(8).map(|c| format!("  • {c}")).collect::<Vec<_>>().join("\n")),
+        Line::from(if selected_count > 8 { format!("  ... and {} more", selected_count - 8) } else { "".to_string() }),
+    ];
+
+    let summary_right = vec![
+        Line::from(vec![
+            Span::styled(" SCANNING PARAMETERS ", theme::header_style()),
+        ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Sample/CIDR: ", theme::title_style()),
+            Span::styled("Samples/CIDR: ", theme::title_style()),
             Span::raw(app.config.sample_per_cidr.to_string()),
-            Span::raw("   "),
-            Span::styled("Probes: ", theme::title_style()),
+        ]),
+        Line::from(vec![
+            Span::styled("Probes/IP   : ", theme::title_style()),
             Span::raw(app.config.probes.to_string()),
-            Span::raw("   "),
-            Span::styled("Concurrency: ", theme::title_style()),
+        ]),
+        Line::from(vec![
+            Span::styled("Concurrency : ", theme::title_style()),
             Span::raw(app.config.concurrency.to_string()),
         ]),
         Line::from(vec![
-            Span::styled("Timeout: ", theme::title_style()),
-            Span::raw(format!("{}ms", app.config.timeout_ms)),
-            Span::raw("   "),
-            Span::styled("Connect: ", theme::title_style()),
-            Span::raw(format!("{}ms", app.config.connect_timeout_ms)),
-            Span::raw("   "),
-            Span::styled("Top: ", theme::title_style()),
-            Span::raw(app.config.top.to_string()),
+            Span::styled("Timeout     : ", theme::title_style()),
+            Span::raw(format!("{}ms (connect: {}ms)", app.config.timeout_ms, app.config.connect_timeout_ms)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("ESTIMATES & WORKLOAD", theme::subtitle_style()),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Total IPs   : ", theme::title_style()),
+            Span::raw(total_ips.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Total Probes: ", theme::title_style()),
+            Span::raw(total_probes.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Est Duration: ", theme::title_style()),
+            Span::raw(format!("~{}", est_duration_str)),
         ]),
     ];
 
-    let block = Block::default()
+    let block_left = Block::default()
         .borders(Borders::ALL)
-        .title(" Review & start ");
-    let para = Paragraph::new(summary).block(block);
-    frame.render_widget(para, area);
+        .border_style(theme::border_style())
+        .title(" Target configuration ");
+    let para_left = Paragraph::new(summary_left).block(block_left);
+    frame.render_widget(para_left, main_layout[0]);
+
+    let block_right = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::border_style())
+        .title(" Scope & Workload ");
+    let para_right = Paragraph::new(summary_right).block(block_right);
+    frame.render_widget(para_right, main_layout[1]);
 }
 
 fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -367,7 +567,7 @@ fn render_hint(app: &App, frame: &mut Frame, area: Rect) {
             if app.edit_field.is_some() {
                 "type value • ←/→ move • ↑/↓ step • Enter confirm • Esc cancel"
             } else {
-                "↑/↓ move • Enter edit • → next • ? help"
+                "↑/↓ move • Enter edit • 1/2/3 presets • → next • ? help"
             }
         }
         WizardStep::Review => "Enter start • ← back • ? help",
@@ -406,6 +606,7 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
                         app.edit_caret = 0;
                         app.custom_input_mode = false;
                         app.toast(format!("Added {s}"));
+                        app.save_config();
                     }
                     Err(e) => app.toast(format!("Invalid CIDR '{s}': {e}")),
                 }
@@ -457,6 +658,7 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
         KeyCode::Char(' ') => {
             if let Some(e) = app.cidr_candidates.get_mut(app.cursor) {
                 e.selected = !e.selected;
+                app.save_config();
             }
         }
         KeyCode::Char('a') => {
@@ -468,11 +670,13 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
             for e in app.cidr_candidates.iter_mut() {
                 e.selected = true;
             }
+            app.save_config();
         }
         KeyCode::Char('d') | KeyCode::Char('D') => {
             for e in app.cidr_candidates.iter_mut() {
                 e.selected = false;
             }
+            app.save_config();
         }
         KeyCode::Right | KeyCode::Enter
             if (app.wizard_step as usize) < 2 => {
@@ -494,6 +698,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
                         app.edit_field = None;
                         app.edit_buffer.clear();
                         app.edit_caret = 0;
+                        app.save_config();
                     }
                     Err(e) => app.toast(format!("Invalid {}: {}", field.label(), e)),
                 }
@@ -561,6 +766,36 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
         }
         KeyCode::Enter => {
             app.start_edit(app.cursor);
+        }
+        KeyCode::Char('1') => {
+            app.config.sample_per_cidr = 100;
+            app.config.probes = 8;
+            app.config.concurrency = 120;
+            app.config.timeout_ms = 2500;
+            app.config.connect_timeout_ms = 1000;
+            app.config.top = 50;
+            app.toast("Preset Applied: Default");
+            app.save_config();
+        }
+        KeyCode::Char('2') => {
+            app.config.sample_per_cidr = 50;
+            app.config.probes = 4;
+            app.config.concurrency = 200;
+            app.config.timeout_ms = 1500;
+            app.config.connect_timeout_ms = 500;
+            app.config.top = 25;
+            app.toast("Preset Applied: Fast Scan");
+            app.save_config();
+        }
+        KeyCode::Char('3') => {
+            app.config.sample_per_cidr = 200;
+            app.config.probes = 15;
+            app.config.concurrency = 80;
+            app.config.timeout_ms = 3500;
+            app.config.connect_timeout_ms = 1500;
+            app.config.top = 100;
+            app.toast("Preset Applied: Thorough Scan");
+            app.save_config();
         }
         _ => {}
     }

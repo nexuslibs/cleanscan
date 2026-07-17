@@ -1,8 +1,8 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Style},
+    style::{Style, Modifier, Color},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Scrollbar, ScrollbarState, Table},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarState, Table},
     Frame,
 };
 
@@ -13,7 +13,7 @@ use crate::scanner::ProbeResult;
 const COLS: [&str; 9] = ["#", "IP", "OK", "Fail", "Avg", "P50", "P90", "P95", "Max"];
 const WIDTHS: [Constraint; 9] = [
     Constraint::Length(5),
-    Constraint::Length(34),
+    Constraint::Length(25),
     Constraint::Length(5),
     Constraint::Length(6),
     Constraint::Length(10),
@@ -28,15 +28,15 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(3), // Header
+            Constraint::Length(6), // Stats panel
+            Constraint::Min(1),    // Results table
+            Constraint::Length(3), // Footer
         ])
         .split(area);
 
     render_header(app, frame, chunks[0]);
-    render_progress(app, frame, chunks[1]);
+    render_stats_panel(app, frame, chunks[1]);
     render_table(app, frame, chunks[2]);
     render_footer(app, frame, chunks[3]);
 }
@@ -53,25 +53,34 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
         "SCANNING"
     };
 
-    let passed = app.results.len();
-    let total = app.total_targets;
-
     let spans = vec![
         Span::styled(
-            format!(" cleanscan v{} ", env!("CARGO_PKG_VERSION")),
+            format!(" CLEANSCAN v{} ", env!("CARGO_PKG_VERSION")),
             theme::header_style(),
         ),
         Span::styled(format!("│ {} ", status), theme::status_style(status)),
-        Span::raw(format!("│ {}/{} targets ", passed, total)),
-        Span::raw(format!("│ {} elapsed", elapsed_str)),
+        Span::raw(format!("│ Host: {} ", app.config.host)),
+        Span::raw(format!("│ Path: {} ", app.config.path)),
+        Span::styled(format!("│ elapsed {}", elapsed_str), theme::hint_style()),
     ];
     let line = Line::from(spans);
-    let block = Block::default().borders(Borders::ALL);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::border_style());
     let para = Paragraph::new(line).block(block);
     frame.render_widget(para, area);
 }
 
-fn render_progress(app: &App, frame: &mut Frame, area: Rect) {
+fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
+    let col_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+        ])
+        .split(area);
+
     let passed = app.results.len();
     let total = app.total_targets;
     let pct = if total > 0 {
@@ -80,27 +89,156 @@ fn render_progress(app: &App, frame: &mut Frame, area: Rect) {
         0
     };
 
-    let mut label = format!("{pct}%");
+    // Calculate rates and ETA
+    let mut rate_str = "~0.0/s".to_string();
+    let mut eta_str = "00:00".to_string();
     if !app.scan_complete && total > 0 && passed > 0 {
         let elapsed = app.start_time.elapsed().as_secs_f64();
         let rate = passed as f64 / elapsed.max(0.001);
         let remaining = total - passed;
         let eta = (remaining as f64 / rate.max(0.001)).max(0.0);
-        let eta_str = format!("{:02}:{:02}", eta as u64 / 60, eta as u64 % 60);
-        label = format!("{}  ETA {}  ~{:.0}/s", pct, eta_str, rate);
+        rate_str = format!("{:.1}/s", rate);
+        eta_str = format!("{:02}:{:02}", eta as u64 / 60, eta as u64 % 60);
     } else if app.scan_complete {
-        label = format!("{}  complete", pct);
+        rate_str = "Finished".to_string();
+        eta_str = "--:--".to_string();
     }
 
-    let gauge = Gauge::default()
-        .percent(pct)
-        .label(label)
-        .gauge_style(theme::good_style());
-    frame.render_widget(gauge, area);
+    // Success rate calculation
+    let mut total_probes_done = 0;
+    let mut total_probes_ok = 0;
+    for r in &app.results {
+        total_probes_done += r.ok + r.fail;
+        total_probes_ok += r.ok;
+    }
+    let success_rate = if total_probes_done > 0 {
+        (total_probes_ok as f64 / total_probes_done as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    // Panel 1: Progress & Success
+    let progress_lines = vec![
+        Line::from(vec![
+            Span::styled("Progress : ", theme::title_style()),
+            Span::raw(format!("{}/{} targets ({pct}%)", passed, total)),
+        ]),
+        Line::from(vec![
+            Span::styled("Success  : ", theme::title_style()),
+            Span::raw(format!("{:.1}% ({} ok, {} fail)", success_rate, total_probes_ok, total_probes_done - total_probes_ok)),
+        ]),
+        Line::from(vec![
+            Span::styled("Speed/ETA: ", theme::title_style()),
+            Span::raw(format!("{} • ETA {}", rate_str, eta_str)),
+        ]),
+    ];
+    let block_p1 = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::border_style())
+        .title(" Progress & Workers ");
+    frame.render_widget(Paragraph::new(progress_lines).block(block_p1), col_chunks[0]);
+
+    // Panel 2: Latency summary
+    let ok_results: Vec<&ProbeResult> = app.results.iter().filter(|r| r.ok > 0).collect();
+    let best_ip_str = if let Some(best) = ok_results.iter().min_by(|a, b| a.avg.partial_cmp(&b.avg).unwrap()) {
+        format!("{} ({:.1}ms)", best.ip, best.avg * 1000.0)
+    } else {
+        "None".to_string()
+    };
+
+    let avg_latency = if !ok_results.is_empty() {
+        ok_results.iter().map(|r| r.avg).sum::<f64>() / ok_results.len() as f64
+    } else {
+        0.0
+    };
+
+    let median_latency = if !ok_results.is_empty() {
+        let mut p50s: Vec<f64> = ok_results.iter().map(|r| r.p50).collect();
+        p50s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        p50s[p50s.len() / 2]
+    } else {
+        0.0
+    };
+
+    let latency_lines = vec![
+        Line::from(vec![
+            Span::styled("Fastest Edge: ", theme::title_style()),
+            Span::raw(best_ip_str),
+        ]),
+        Line::from(vec![
+            Span::styled("Avg Latency : ", theme::title_style()),
+            Span::raw(format!("{:.1}ms", avg_latency * 1000.0)),
+        ]),
+        Line::from(vec![
+            Span::styled("Median (p50): ", theme::title_style()),
+            Span::raw(format!("{:.1}ms", median_latency * 1000.0)),
+        ]),
+    ];
+    let block_p2 = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::border_style())
+        .title(" Latency Metrics ");
+    frame.render_widget(Paragraph::new(latency_lines).block(block_p2), col_chunks[1]);
+
+    // Panel 3: Latency Distribution Bar Chart
+    let total_ok = ok_results.len();
+    let (mut exc, mut gd, mut fr, mut pr) = (0, 0, 0, 0);
+    for r in &ok_results {
+        let ms = r.avg * 1000.0;
+        if ms < 80.0 {
+            exc += 1;
+        } else if ms < 150.0 {
+            gd += 1;
+        } else if ms < 250.0 {
+            fr += 1;
+        } else {
+            pr += 1;
+        }
+    }
+
+    let make_bar = |count: usize| -> String {
+        if total_ok == 0 {
+            return String::new();
+        }
+        let pct = count as f64 / total_ok as f64;
+        let bar_len = (pct * 8.0).round() as usize;
+        "█".repeat(bar_len)
+    };
+
+    let distribution_lines = vec![
+        Line::from(vec![
+            Span::styled("  <80ms : ", theme::good_style()),
+            Span::raw(format!("{:<8} ", make_bar(exc))),
+            Span::styled(format!("{exc}"), theme::hint_style()),
+        ]),
+        Line::from(vec![
+            Span::styled(" 80-150 : ", theme::warn_style()),
+            Span::raw(format!("{:<8} ", make_bar(gd))),
+            Span::styled(format!("{gd}"), theme::hint_style()),
+        ]),
+        Line::from(vec![
+            Span::styled("150-250 : ", theme::title_style()),
+            Span::raw(format!("{:<8} ", make_bar(fr))),
+            Span::styled(format!("{fr}"), theme::hint_style()),
+        ]),
+        Line::from(vec![
+            Span::styled("  >250  : ", theme::bad_style()),
+            Span::raw(format!("{:<8} ", make_bar(pr))),
+            Span::styled(format!("{pr}"), theme::hint_style()),
+        ]),
+    ];
+    let block_p3 = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::border_style())
+        .title(" Latency Spread ");
+    frame.render_widget(Paragraph::new(distribution_lines).block(block_p3), col_chunks[2]);
 }
 
 fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" Results ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme::border_active_style())
+        .title(" Results ");
     let inner = block.inner(area);
     let header_rect = Rect {
         x: inner.x,
@@ -170,16 +308,25 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
         .enumerate()
         .map(|(i, r)| {
             let rank = start + i + 1;
-            let fail_style = if r.fail > 0 {
-                theme::bad_style()
+            
+            // Highlight rank 1 (fastest IP) to make it look premium
+            let is_first = rank == 1;
+            let (ip_text, rank_text) = if is_first {
+                (format!("★ {}", r.ip), format!(" {rank}"))
             } else {
-                Style::default()
+                (r.ip.clone(), rank.to_string())
             };
+            
+            let mut base_style = Style::default();
+            if is_first {
+                base_style = base_style.fg(Color::LightCyan).add_modifier(Modifier::BOLD);
+            }
+
             Row::new(vec![
-                Cell::from(rank.to_string()),
-                Cell::from(r.ip.clone()),
-                Cell::from(r.ok.to_string()),
-                Cell::from(r.fail.to_string()).style(fail_style),
+                Cell::from(rank_text).style(base_style),
+                Cell::from(ip_text).style(base_style),
+                Cell::from(r.ok.to_string()).style(base_style),
+                Cell::from(r.fail.to_string()).style(if r.fail > 0 { theme::bad_style() } else { base_style }),
                 Cell::from(fmt_ms(r.avg)).style(theme::latency_style(r.avg * 1000.0)),
                 Cell::from(fmt_ms(r.p50)).style(theme::latency_style(r.p50 * 1000.0)),
                 Cell::from(fmt_ms(r.p90)).style(theme::latency_style(r.p90 * 1000.0)),

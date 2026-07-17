@@ -20,7 +20,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::{scanner::ProbeResult, Args};
+use crate::scanner::ProbeResult;
+use crate::config::AppConfig;
 use crate::tui::wizard::SettingField;
 
 /// Which top-level screen the TUI is showing.
@@ -60,7 +61,7 @@ pub struct CidrEntry {
 /// Central application state shared across all screens.
 pub struct App {
     /// Editable scan parameters; drive the scan when launched from the wizard.
-    pub config: Args,
+    pub config: AppConfig,
     pub screen: Screen,
     pub wizard_step: WizardStep,
     pub cidr_candidates: Vec<CidrEntry>,
@@ -102,17 +103,36 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(args: Arc<Args>, has_cli_targets: bool, paused: Arc<AtomicBool>) -> Self {
-        let cidr_candidates = crate::scanner::DEFAULT_CLOUDFLARE_CIDRS
+    pub fn new(config: AppConfig, has_cli_targets: bool, paused: Arc<AtomicBool>) -> Self {
+        let mut cidr_candidates = Vec::new();
+        
+        let default_set: std::collections::HashSet<String> = crate::scanner::DEFAULT_CLOUDFLARE_CIDRS
             .iter()
-            .map(|c| CidrEntry {
-                cidr: c.to_string(),
-                selected: true,
-            })
+            .map(|s| s.to_string())
             .collect();
 
+        // Populate candidates from defaults
+        for c in crate::scanner::DEFAULT_CLOUDFLARE_CIDRS {
+            let selected = config.selected_cidrs.is_empty() || config.selected_cidrs.contains(&c.to_string());
+            cidr_candidates.push(CidrEntry {
+                cidr: c.to_string(),
+                selected,
+            });
+        }
+
+        // Add custom ones from config
+        for c in &config.custom_cidrs {
+            if !default_set.contains(c) {
+                let selected = config.selected_cidrs.contains(c);
+                cidr_candidates.push(CidrEntry {
+                    cidr: c.clone(),
+                    selected,
+                });
+            }
+        }
+
         Self {
-            config: (*args).clone(),
+            config,
             screen: if has_cli_targets {
                 Screen::Scanning
             } else {
@@ -147,6 +167,32 @@ impl App {
             confirm_quit: false,
             pending_start: false,
         }
+    }
+
+    pub fn save_config(&self) {
+        let default_set: std::collections::HashSet<String> = crate::scanner::DEFAULT_CLOUDFLARE_CIDRS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let mut custom_cidrs = Vec::new();
+        for candidate in &self.cidr_candidates {
+            if !default_set.contains(&candidate.cidr) {
+                custom_cidrs.push(candidate.cidr.clone());
+            }
+        }
+
+        let selected_cidrs: Vec<String> = self.cidr_candidates
+            .iter()
+            .filter(|e| e.selected)
+            .map(|e| e.cidr.clone())
+            .collect();
+
+        let mut current_config = self.config.clone();
+        current_config.custom_cidrs = custom_cidrs;
+        current_config.selected_cidrs = selected_cidrs;
+
+        let _ = crate::config::save_config(&current_config);
     }
 
     /// Switch to the scanning dashboard once targets are known. Resets per-scan state.
@@ -244,10 +290,10 @@ impl App {
     ) {
         let style = if focused {
             Style::default()
-                .fg(Color::Green)
+                .fg(Color::Magenta)
                 .add_modifier(ratatui::style::Modifier::BOLD)
         } else {
-            theme::title_style()
+            theme::header_style()
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -319,10 +365,10 @@ pub fn centered(area: Rect, percent_w: u16, percent_h: u16) -> Rect {
 }
 
 /// Run the full TUI loop.
-pub fn run_tui(args: Args) -> anyhow::Result<()> {
-    let has_cli_targets = args.ips.is_some() || !args.cidr.is_empty();
+pub fn run_tui(config: AppConfig, cli_cidr: Vec<String>, cli_ips: Option<String>) -> anyhow::Result<()> {
+    let has_cli_targets = cli_ips.is_some() || !cli_cidr.is_empty();
 
-    let args_arc = Arc::new(args);
+    let config_arc = Arc::new(config);
     let (tx, rx) = std::sync::mpsc::channel::<ProbeResult>();
     let paused = Arc::new(AtomicBool::new(false));
     let cancel = Arc::new(AtomicBool::new(false));
@@ -331,11 +377,11 @@ pub fn run_tui(args: Args) -> anyhow::Result<()> {
     // Enable mouse interaction for the whole session.
     let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
     let _guard = RestoreGuard;
-    let mut app = App::new(args_arc.clone(), has_cli_targets, paused.clone());
+    let mut app = App::new((*config_arc).clone(), has_cli_targets, paused.clone());
 
     let spawn_scanner =
-        |targets: Vec<String>, scan_args: Arc<Args>| -> std::thread::JoinHandle<()> {
-            let scanner_args = scan_args;
+        |targets: Vec<String>, scan_config: Arc<AppConfig>| -> std::thread::JoinHandle<()> {
+            let scanner_config = scan_config;
             let scanner_paused = paused.clone();
             let scanner_cancel = cancel.clone();
             let scanner_tx = tx.clone();
@@ -349,7 +395,7 @@ pub fn run_tui(args: Args) -> anyhow::Result<()> {
                 };
                 rt.block_on(crate::scanner::run_scan(
                     targets,
-                    scanner_args,
+                    scanner_config,
                     scanner_tx,
                     scanner_cancel,
                     scanner_paused,
@@ -361,16 +407,16 @@ pub fn run_tui(args: Args) -> anyhow::Result<()> {
 
     // CLI-provided targets start scanning immediately (legacy behavior).
     if has_cli_targets {
-        let targets = crate::scanner::collect_targets(&args_arc)?;
+        let targets = crate::scanner::collect_targets(&config_arc, &cli_cidr, &cli_ips)?;
         let total = targets.len();
-        scanner = Some(spawn_scanner(targets, args_arc.clone()));
+        scanner = Some(spawn_scanner(targets, config_arc.clone()));
         app.begin_scan(total);
     }
 
     // Launch a scan from the wizard's (possibly edited) configuration.
     let start_wizard_scan = |app: &mut App,
                              scanner: &mut Option<std::thread::JoinHandle<()>>,
-                             spawn_scanner: &dyn Fn(Vec<String>, Arc<Args>) -> std::thread::JoinHandle<()>| {
+                             spawn_scanner: &dyn Fn(Vec<String>, Arc<AppConfig>) -> std::thread::JoinHandle<()>| {
         let cidrs: Vec<String> = app
             .cidr_candidates
             .iter()
@@ -384,12 +430,11 @@ pub fn run_tui(args: Args) -> anyhow::Result<()> {
         match crate::scanner::collect_from_cidrs(&cidrs, app.config.sample_per_cidr) {
             Ok(targets) => {
                 let total = targets.len();
-                let scan_args = Arc::new(Args {
-                    cli: false,
+                let scan_config = Arc::new(AppConfig {
                     host: app.config.host.clone(),
                     path: app.config.path.clone(),
-                    ips: None,
-                    cidr: Vec::new(),
+                    custom_cidrs: app.config.custom_cidrs.clone(),
+                    selected_cidrs: app.config.selected_cidrs.clone(),
                     sample_per_cidr: app.config.sample_per_cidr,
                     probes: app.config.probes,
                     concurrency: app.config.concurrency,
@@ -397,7 +442,7 @@ pub fn run_tui(args: Args) -> anyhow::Result<()> {
                     connect_timeout_ms: app.config.connect_timeout_ms,
                     top: app.config.top,
                 });
-                *scanner = Some(spawn_scanner(targets, scan_args));
+                *scanner = Some(spawn_scanner(targets, scan_config));
                 app.begin_scan(total);
             }
             Err(e) => app.toast(format!("Error: {e}")),
@@ -590,6 +635,7 @@ impl App {
                                     if !self.custom_input_mode {
                                         self.cidr_candidates[idx].selected =
                                             !self.cidr_candidates[idx].selected;
+                                        self.save_config();
                                     }
                                 }
                             }
@@ -598,10 +644,11 @@ impl App {
                         if let Some(inner) = self.settings_inner {
                             if point_in(inner, p) && self.edit_field.is_none() {
                                 let idx = (m.row - inner.y) as usize;
+                                // Offset check since preset bar is at the top (idx 0 is preset bar, settings start after)
                                 let last = SettingField::ALL.len();
-                                if idx < last {
-                                    self.cursor = idx;
-                                    self.start_edit(idx);
+                                if idx > 0 && (idx - 1) < last {
+                                    self.cursor = idx - 1;
+                                    self.start_edit(idx - 1);
                                 }
                             }
                         }
