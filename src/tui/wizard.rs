@@ -1,15 +1,15 @@
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Style, Color},
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
 
+use crate::config::AppConfig;
 use crate::tui::theme;
 use crate::tui::{App, ButtonAction, WizardStep};
-use crate::config::AppConfig;
 
 /// Identifies an editable scan parameter on the settings step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,42 +107,54 @@ impl SettingField {
                 args.path = raw.to_string();
             }
             SettingField::SamplePerCidr => {
-                let v = raw.parse::<usize>().map_err(|_| "invalid number".to_string())?;
+                let v = raw
+                    .parse::<usize>()
+                    .map_err(|_| "invalid number".to_string())?;
                 if v == 0 {
                     return Err("must be at least 1".to_string());
                 }
                 args.sample_per_cidr = v;
             }
             SettingField::Probes => {
-                let v = raw.parse::<usize>().map_err(|_| "invalid number".to_string())?;
+                let v = raw
+                    .parse::<usize>()
+                    .map_err(|_| "invalid number".to_string())?;
                 if v == 0 {
                     return Err("must be at least 1".to_string());
                 }
                 args.probes = v;
             }
             SettingField::Concurrency => {
-                let v = raw.parse::<usize>().map_err(|_| "invalid number".to_string())?;
+                let v = raw
+                    .parse::<usize>()
+                    .map_err(|_| "invalid number".to_string())?;
                 if v == 0 {
                     return Err("must be at least 1".to_string());
                 }
                 args.concurrency = v;
             }
             SettingField::TimeoutMs => {
-                let v = raw.parse::<u64>().map_err(|_| "invalid number".to_string())?;
+                let v = raw
+                    .parse::<u64>()
+                    .map_err(|_| "invalid number".to_string())?;
                 if v == 0 {
                     return Err("must be at least 1".to_string());
                 }
                 args.timeout_ms = v;
             }
             SettingField::ConnectTimeoutMs => {
-                let v = raw.parse::<u64>().map_err(|_| "invalid number".to_string())?;
+                let v = raw
+                    .parse::<u64>()
+                    .map_err(|_| "invalid number".to_string())?;
                 if v == 0 {
                     return Err("must be at least 1".to_string());
                 }
                 args.connect_timeout_ms = v;
             }
             SettingField::Top => {
-                let v = raw.parse::<usize>().map_err(|_| "invalid number".to_string())?;
+                let v = raw
+                    .parse::<usize>()
+                    .map_err(|_| "invalid number".to_string())?;
                 if v == 0 {
                     return Err("must be at least 1".to_string());
                 }
@@ -211,10 +223,7 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
 
     let main_layout = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(60),
-            Constraint::Percentage(40),
-        ])
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(chunks[0]);
 
     let list_block = Block::default()
@@ -251,13 +260,15 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
     let total_requests = total_ips * app.config.probes;
 
     let info_text = vec![
-        Line::from(vec![
-            Span::styled(" RANGE SUMMARY ", theme::header_style()),
-        ]),
+        Line::from(vec![Span::styled(" RANGE SUMMARY ", theme::header_style())]),
         Line::from(""),
         Line::from(vec![
             Span::styled("Selected Ranges: ", theme::title_style()),
-            Span::raw(format!("{} / {}", selected_count, app.cidr_candidates.len())),
+            Span::raw(format!(
+                "{} / {}",
+                selected_count,
+                app.cidr_candidates.len()
+            )),
         ]),
         Line::from(vec![
             Span::styled("Sample per CIDR: ", theme::title_style()),
@@ -304,8 +315,16 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
         "  press 'a' to add a custom CIDR range  ".to_string()
     };
     let title = " Add CIDR ";
-    let input = Paragraph::new(input_line)
-        .block(Block::default().borders(Borders::ALL).border_style(if app.custom_input_mode { theme::border_active_style() } else { theme::border_style() }).title(title));
+    let input = Paragraph::new(input_line).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(if app.custom_input_mode {
+                theme::border_active_style()
+            } else {
+                theme::border_style()
+            })
+            .title(title),
+    );
     frame.render_widget(input, chunks[1]);
 }
 
@@ -321,19 +340,58 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     // Preset Bar
     // Detect matching preset
     let mut current_preset = "Custom";
-    if app.config.sample_per_cidr == 100 && app.config.probes == 8 && app.config.concurrency == 120 && app.config.timeout_ms == 2500 && app.config.connect_timeout_ms == 1000 && app.config.top == 50 {
+    if app.config.sample_per_cidr == 100
+        && app.config.probes == 8
+        && app.config.concurrency == 120
+        && app.config.timeout_ms == 2500
+        && app.config.connect_timeout_ms == 1000
+        && app.config.top == 50
+    {
         current_preset = "Default [1]";
-    } else if app.config.sample_per_cidr == 50 && app.config.probes == 4 && app.config.concurrency == 200 && app.config.timeout_ms == 1500 && app.config.connect_timeout_ms == 500 && app.config.top == 25 {
+    } else if app.config.sample_per_cidr == 50
+        && app.config.probes == 4
+        && app.config.concurrency == 200
+        && app.config.timeout_ms == 1500
+        && app.config.connect_timeout_ms == 500
+        && app.config.top == 25
+    {
         current_preset = "Fast Scan [2]";
-    } else if app.config.sample_per_cidr == 200 && app.config.probes == 15 && app.config.concurrency == 80 && app.config.timeout_ms == 3500 && app.config.connect_timeout_ms == 1500 && app.config.top == 100 {
+    } else if app.config.sample_per_cidr == 200
+        && app.config.probes == 15
+        && app.config.concurrency == 80
+        && app.config.timeout_ms == 3500
+        && app.config.connect_timeout_ms == 1500
+        && app.config.top == 100
+    {
         current_preset = "Thorough Scan [3]";
     }
 
     let preset_spans = vec![
         Span::styled(" Quick Presets: ", theme::subtitle_style()),
-        Span::styled(" [1] Default ", if current_preset.contains("Default") { theme::highlight_style() } else { theme::hint_style() }),
-        Span::styled(" [2] Fast Scan ", if current_preset.contains("Fast") { theme::highlight_style() } else { theme::hint_style() }),
-        Span::styled(" [3] Thorough Scan ", if current_preset.contains("Thorough") { theme::highlight_style() } else { theme::hint_style() }),
+        Span::styled(
+            " [1] Default ",
+            if current_preset.contains("Default") {
+                theme::highlight_style()
+            } else {
+                theme::hint_style()
+            },
+        ),
+        Span::styled(
+            " [2] Fast Scan ",
+            if current_preset.contains("Fast") {
+                theme::highlight_style()
+            } else {
+                theme::hint_style()
+            },
+        ),
+        Span::styled(
+            " [3] Thorough Scan ",
+            if current_preset.contains("Thorough") {
+                theme::highlight_style()
+            } else {
+                theme::hint_style()
+            },
+        ),
         Span::styled("  Current: ", theme::hint_style()),
         Span::styled(current_preset, theme::title_style()),
     ];
@@ -348,10 +406,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     // Settings columns layout
     let main_layout = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(60),
-            Constraint::Percentage(40),
-        ])
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(chunks[1]);
 
     let block = Block::default()
@@ -390,9 +445,10 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     // Right Side Description Panel
     let current_field = SettingField::ALL[app.cursor.min(SettingField::ALL.len() - 1)];
     let desc_text = vec![
-        Line::from(vec![
-            Span::styled(format!(" {} ", current_field.label().to_uppercase()), theme::header_style()),
-        ]),
+        Line::from(vec![Span::styled(
+            format!(" {} ", current_field.label().to_uppercase()),
+            theme::header_style(),
+        )]),
         Line::from(""),
         Line::from(Span::styled("Description:", theme::title_style())),
         Line::from(""),
@@ -401,10 +457,15 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     let mut desc_para_lines = desc_text;
     desc_para_lines.push(Line::from(current_field.description()));
     desc_para_lines.push(Line::from(""));
-    desc_para_lines.push(Line::from(Span::styled("Keyboard Shortcut:", theme::subtitle_style())));
+    desc_para_lines.push(Line::from(Span::styled(
+        "Keyboard Shortcut:",
+        theme::subtitle_style(),
+    )));
     desc_para_lines.push(Line::from("  Press Enter to edit directly."));
     if current_field.is_numeric() {
-        desc_para_lines.push(Line::from("  Use ↑/↓ arrows to increment/decrement values."));
+        desc_para_lines.push(Line::from(
+            "  Use ↑/↓ arrows to increment/decrement values.",
+        ));
     }
 
     let desc_block = Block::default()
@@ -430,25 +491,28 @@ fn render_review(app: &App, frame: &mut Frame, area: Rect) {
     let total_probes = total_ips * app.config.probes;
 
     // Ideal scan duration estimate
-    let ideal_seconds = (total_probes as f64 / app.config.concurrency as f64) * (app.config.timeout_ms as f64 / 2000.0);
+    let ideal_seconds = (total_probes as f64 / app.config.concurrency as f64)
+        * (app.config.timeout_ms as f64 / 2000.0);
     let est_duration_str = if ideal_seconds < 60.0 {
         format!("{:.1}s", ideal_seconds)
     } else {
-        format!("{:02}:{:02}", (ideal_seconds / 60.0) as u64, (ideal_seconds % 60.0) as u64)
+        format!(
+            "{:02}:{:02}",
+            (ideal_seconds / 60.0) as u64,
+            (ideal_seconds % 60.0) as u64
+        )
     };
 
     let main_layout = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
-        ])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
     let summary_left = vec![
-        Line::from(vec![
-            Span::styled(" TARGET SPECIFICATION ", theme::header_style()),
-        ]),
+        Line::from(vec![Span::styled(
+            " TARGET SPECIFICATION ",
+            theme::header_style(),
+        )]),
         Line::from(""),
         Line::from(vec![
             Span::styled("Hostname  : ", theme::title_style()),
@@ -463,14 +527,26 @@ fn render_review(app: &App, frame: &mut Frame, area: Rect) {
             Span::raw(format!("{} selected", selected_count)),
         ]),
         Line::from(""),
-        Line::from(selected.iter().take(8).map(|c| format!("  • {c}")).collect::<Vec<_>>().join("\n")),
-        Line::from(if selected_count > 8 { format!("  ... and {} more", selected_count - 8) } else { "".to_string() }),
+        Line::from(
+            selected
+                .iter()
+                .take(8)
+                .map(|c| format!("  • {c}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        Line::from(if selected_count > 8 {
+            format!("  ... and {} more", selected_count - 8)
+        } else {
+            "".to_string()
+        }),
     ];
 
     let summary_right = vec![
-        Line::from(vec![
-            Span::styled(" SCANNING PARAMETERS ", theme::header_style()),
-        ]),
+        Line::from(vec![Span::styled(
+            " SCANNING PARAMETERS ",
+            theme::header_style(),
+        )]),
         Line::from(""),
         Line::from(vec![
             Span::styled("Samples/CIDR: ", theme::title_style()),
@@ -486,12 +562,16 @@ fn render_review(app: &App, frame: &mut Frame, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("Timeout     : ", theme::title_style()),
-            Span::raw(format!("{}ms (connect: {}ms)", app.config.timeout_ms, app.config.connect_timeout_ms)),
+            Span::raw(format!(
+                "{}ms (connect: {}ms)",
+                app.config.timeout_ms, app.config.connect_timeout_ms
+            )),
         ]),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("ESTIMATES & WORKLOAD", theme::subtitle_style()),
-        ]),
+        Line::from(vec![Span::styled(
+            "ESTIMATES & WORKLOAD",
+            theme::subtitle_style(),
+        )]),
         Line::from(""),
         Line::from(vec![
             Span::styled("Total IPs   : ", theme::title_style()),
@@ -616,23 +696,19 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
                 app.input_buffer.clear();
                 app.edit_caret = 0;
             }
-            KeyCode::Backspace
-                if app.edit_caret > 0 => {
-                    app.edit_caret -= 1;
-                    app.input_buffer.remove(app.edit_caret);
-                }
-            KeyCode::Delete
-                if app.edit_caret < app.input_buffer.len() => {
-                    app.input_buffer.remove(app.edit_caret);
-                }
-            KeyCode::Left
-                if app.edit_caret > 0 => {
-                    app.edit_caret -= 1;
-                }
-            KeyCode::Right
-                if app.edit_caret < app.input_buffer.len() => {
-                    app.edit_caret += 1;
-                }
+            KeyCode::Backspace if app.edit_caret > 0 => {
+                app.edit_caret -= 1;
+                app.input_buffer.remove(app.edit_caret);
+            }
+            KeyCode::Delete if app.edit_caret < app.input_buffer.len() => {
+                app.input_buffer.remove(app.edit_caret);
+            }
+            KeyCode::Left if app.edit_caret > 0 => {
+                app.edit_caret -= 1;
+            }
+            KeyCode::Right if app.edit_caret < app.input_buffer.len() => {
+                app.edit_caret += 1;
+            }
             KeyCode::Home => app.edit_caret = 0,
             KeyCode::End => app.edit_caret = app.input_buffer.len(),
             KeyCode::Char(c) => {
@@ -645,10 +721,9 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
     }
 
     match code {
-        KeyCode::Up | KeyCode::Char('k')
-            if app.cursor > 0 => {
-                app.cursor -= 1;
-            }
+        KeyCode::Up | KeyCode::Char('k') if app.cursor > 0 => {
+            app.cursor -= 1;
+        }
         KeyCode::Down | KeyCode::Char('j') => {
             let last = app.cidr_candidates.len().saturating_sub(1);
             if app.cursor < last {
@@ -678,11 +753,10 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
             }
             app.save_config();
         }
-        KeyCode::Right | KeyCode::Enter
-            if (app.wizard_step as usize) < 2 => {
-                app.wizard_step = WizardStep::Settings;
-                app.cursor = 0;
-            }
+        KeyCode::Right | KeyCode::Enter if (app.wizard_step as usize) < 2 => {
+            app.wizard_step = WizardStep::Settings;
+            app.cursor = 0;
+        }
         _ => {}
     }
 }
@@ -692,43 +766,41 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
         let i = app.edit_field.unwrap();
         let field = SettingField::ALL[i];
         match code {
-            KeyCode::Enter => {
-                match field.apply(&app.edit_buffer, &mut app.config) {
-                    Ok(()) => {
-                        app.edit_field = None;
-                        app.edit_buffer.clear();
-                        app.edit_caret = 0;
-                        app.save_config();
-                    }
-                    Err(e) => app.toast(format!("Invalid {}: {}", field.label(), e)),
+            KeyCode::Enter => match field.apply(&app.edit_buffer, &mut app.config) {
+                Ok(()) => {
+                    app.edit_field = None;
+                    app.edit_buffer.clear();
+                    app.edit_caret = 0;
+                    app.save_config();
                 }
-            }
+                Err(e) => app.toast(format!("Invalid {}: {}", field.label(), e)),
+            },
             KeyCode::Esc => {
                 app.edit_field = None;
                 app.edit_buffer.clear();
                 app.edit_caret = 0;
             }
-            KeyCode::Backspace
-                if app.edit_caret > 0 => {
-                    app.edit_caret -= 1;
-                    app.edit_buffer.remove(app.edit_caret);
-                }
-            KeyCode::Delete
-                if app.edit_caret < app.edit_buffer.len() => {
-                    app.edit_buffer.remove(app.edit_caret);
-                }
-            KeyCode::Left
-                if app.edit_caret > 0 => {
-                    app.edit_caret -= 1;
-                }
-            KeyCode::Right
-                if app.edit_caret < app.edit_buffer.len() => {
-                    app.edit_caret += 1;
-                }
+            KeyCode::Backspace if app.edit_caret > 0 => {
+                app.edit_caret -= 1;
+                app.edit_buffer.remove(app.edit_caret);
+            }
+            KeyCode::Delete if app.edit_caret < app.edit_buffer.len() => {
+                app.edit_buffer.remove(app.edit_caret);
+            }
+            KeyCode::Left if app.edit_caret > 0 => {
+                app.edit_caret -= 1;
+            }
+            KeyCode::Right if app.edit_caret < app.edit_buffer.len() => {
+                app.edit_caret += 1;
+            }
             KeyCode::Home => app.edit_caret = 0,
             KeyCode::End => app.edit_caret = app.edit_buffer.len(),
             KeyCode::Up | KeyCode::Down if field.is_numeric() => {
-                let delta = if code == KeyCode::Up { field.step() } else { -field.step() };
+                let delta = if code == KeyCode::Up {
+                    field.step()
+                } else {
+                    -field.step()
+                };
                 if let Ok(v) = app.edit_buffer.parse::<i64>() {
                     let nv = (v + delta).max(1);
                     app.edit_buffer = nv.to_string();
@@ -745,21 +817,19 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
     }
 
     match code {
-        KeyCode::Up | KeyCode::Char('k')
-            if app.cursor > 0 => {
-                app.cursor -= 1;
-            }
+        KeyCode::Up | KeyCode::Char('k') if app.cursor > 0 => {
+            app.cursor -= 1;
+        }
         KeyCode::Down | KeyCode::Char('j') => {
             let last = SettingField::ALL.len().saturating_sub(1);
             if app.cursor < last {
                 app.cursor += 1;
             }
         }
-        KeyCode::Right
-            if (app.wizard_step as usize) < 2 => {
-                app.wizard_step = WizardStep::Review;
-                app.cursor = 0;
-            }
+        KeyCode::Right if (app.wizard_step as usize) < 2 => {
+            app.wizard_step = WizardStep::Review;
+            app.cursor = 0;
+        }
         KeyCode::Left | KeyCode::Esc => {
             app.wizard_step = WizardStep::Ranges;
             app.cursor = 0;

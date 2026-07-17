@@ -132,7 +132,11 @@ fn add_ip_or_cidr(s: &str, out: &mut BTreeSet<String>, sample_per_cidr: usize) -
     Ok(())
 }
 
-pub fn collect_targets(config: &AppConfig, cli_cidrs: &[String], cli_ips: &Option<String>) -> Result<Vec<String>> {
+pub fn collect_targets(
+    config: &AppConfig,
+    cli_cidrs: &[String],
+    cli_ips: &Option<String>,
+) -> Result<Vec<String>> {
     let mut targets = BTreeSet::new();
 
     if let Some(path) = cli_ips {

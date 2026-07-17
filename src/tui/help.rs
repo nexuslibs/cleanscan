@@ -1,6 +1,6 @@
 use ratatui::{
     layout::Rect,
-    style::{Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
@@ -33,10 +33,7 @@ fn key(keys: &str, desc: &str) -> Line<'static> {
 
 fn wizard_lines(step: WizardStep) -> Vec<Line<'static>> {
     let mut v = vec![
-        Line::from(Span::styled(
-            " Wizard navigation",
-            theme::header_style(),
-        )),
+        Line::from(Span::styled(" Wizard navigation", theme::header_style())),
         key("↑ / ↓  or  k / j", "Move cursor through the list"),
         key("→  or  Enter", "Go to the next step"),
         key("←  or  Esc", "Go back to the previous step"),
@@ -46,7 +43,10 @@ fn wizard_lines(step: WizardStep) -> Vec<Line<'static>> {
     ];
     match step {
         WizardStep::Ranges => {
-            v.push(Line::from(Span::styled(" Step 1 — CIDR ranges", theme::header_style())));
+            v.push(Line::from(Span::styled(
+                " Step 1 — CIDR ranges",
+                theme::header_style(),
+            )));
             v.push(key("space", "Toggle the highlighted range on/off"));
             v.push(key("A", "Select all ranges"));
             v.push(key("D", "Deselect all ranges"));

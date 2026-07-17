@@ -1,7 +1,7 @@
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use serde::{Serialize, Deserialize};
-use anyhow::Result;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AppConfig {

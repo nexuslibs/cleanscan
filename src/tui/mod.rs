@@ -20,8 +20,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::scanner::ProbeResult;
 use crate::config::AppConfig;
+use crate::scanner::ProbeResult;
 use crate::tui::wizard::SettingField;
 
 /// Which top-level screen the TUI is showing.
@@ -105,15 +105,17 @@ pub struct App {
 impl App {
     pub fn new(config: AppConfig, has_cli_targets: bool, paused: Arc<AtomicBool>) -> Self {
         let mut cidr_candidates = Vec::new();
-        
-        let default_set: std::collections::HashSet<String> = crate::scanner::DEFAULT_CLOUDFLARE_CIDRS
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+
+        let default_set: std::collections::HashSet<String> =
+            crate::scanner::DEFAULT_CLOUDFLARE_CIDRS
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
 
         // Populate candidates from defaults
         for c in crate::scanner::DEFAULT_CLOUDFLARE_CIDRS {
-            let selected = config.selected_cidrs.is_empty() || config.selected_cidrs.contains(&c.to_string());
+            let selected =
+                config.selected_cidrs.is_empty() || config.selected_cidrs.contains(&c.to_string());
             cidr_candidates.push(CidrEntry {
                 cidr: c.to_string(),
                 selected,
@@ -170,10 +172,11 @@ impl App {
     }
 
     pub fn save_config(&self) {
-        let default_set: std::collections::HashSet<String> = crate::scanner::DEFAULT_CLOUDFLARE_CIDRS
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let default_set: std::collections::HashSet<String> =
+            crate::scanner::DEFAULT_CLOUDFLARE_CIDRS
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
 
         let mut custom_cidrs = Vec::new();
         for candidate in &self.cidr_candidates {
@@ -182,7 +185,8 @@ impl App {
             }
         }
 
-        let selected_cidrs: Vec<String> = self.cidr_candidates
+        let selected_cidrs: Vec<String> = self
+            .cidr_candidates
             .iter()
             .filter(|e| e.selected)
             .map(|e| e.cidr.clone())
@@ -242,9 +246,21 @@ impl App {
     pub fn natural_cmp(a: &ProbeResult, b: &ProbeResult) -> std::cmp::Ordering {
         a.fail
             .cmp(&b.fail)
-            .then_with(|| a.p95.partial_cmp(&b.p95).unwrap_or(std::cmp::Ordering::Equal))
-            .then_with(|| a.max.partial_cmp(&b.max).unwrap_or(std::cmp::Ordering::Equal))
-            .then_with(|| a.avg.partial_cmp(&b.avg).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| {
+                a.p95
+                    .partial_cmp(&b.p95)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                a.max
+                    .partial_cmp(&b.max)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                a.avg
+                    .partial_cmp(&b.avg)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     }
 
     /// Results sorted for display according to the active sort column.
@@ -260,11 +276,26 @@ impl App {
                 1 => a.ip.cmp(&b.ip),
                 2 => a.ok.cmp(&b.ok),
                 3 => a.fail.cmp(&b.fail),
-                4 => a.avg.partial_cmp(&b.avg).unwrap_or(std::cmp::Ordering::Equal),
-                5 => a.p50.partial_cmp(&b.p50).unwrap_or(std::cmp::Ordering::Equal),
-                6 => a.p90.partial_cmp(&b.p90).unwrap_or(std::cmp::Ordering::Equal),
-                7 => a.p95.partial_cmp(&b.p95).unwrap_or(std::cmp::Ordering::Equal),
-                8 => a.max.partial_cmp(&b.max).unwrap_or(std::cmp::Ordering::Equal),
+                4 => a
+                    .avg
+                    .partial_cmp(&b.avg)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                5 => a
+                    .p50
+                    .partial_cmp(&b.p50)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                6 => a
+                    .p90
+                    .partial_cmp(&b.p90)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                7 => a
+                    .p95
+                    .partial_cmp(&b.p95)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                8 => a
+                    .max
+                    .partial_cmp(&b.max)
+                    .unwrap_or(std::cmp::Ordering::Equal),
                 _ => std::cmp::Ordering::Equal,
             };
             if self.sort_asc {
@@ -365,7 +396,11 @@ pub fn centered(area: Rect, percent_w: u16, percent_h: u16) -> Rect {
 }
 
 /// Run the full TUI loop.
-pub fn run_tui(config: AppConfig, cli_cidr: Vec<String>, cli_ips: Option<String>) -> anyhow::Result<()> {
+pub fn run_tui(
+    config: AppConfig,
+    cli_cidr: Vec<String>,
+    cli_ips: Option<String>,
+) -> anyhow::Result<()> {
     let has_cli_targets = cli_ips.is_some() || !cli_cidr.is_empty();
 
     let config_arc = Arc::new(config);
@@ -416,7 +451,10 @@ pub fn run_tui(config: AppConfig, cli_cidr: Vec<String>, cli_ips: Option<String>
     // Launch a scan from the wizard's (possibly edited) configuration.
     let start_wizard_scan = |app: &mut App,
                              scanner: &mut Option<std::thread::JoinHandle<()>>,
-                             spawn_scanner: &dyn Fn(Vec<String>, Arc<AppConfig>) -> std::thread::JoinHandle<()>| {
+                             spawn_scanner: &dyn Fn(
+        Vec<String>,
+        Arc<AppConfig>,
+    ) -> std::thread::JoinHandle<()>| {
         let cidrs: Vec<String> = app
             .cidr_candidates
             .iter()
@@ -571,10 +609,9 @@ impl App {
                 }
             }
             KeyCode::Char('s') | KeyCode::Char('S') => self.save(),
-            KeyCode::Up
-                if self.scroll > 0 => {
-                    self.scroll -= 1;
-                }
+            KeyCode::Up if self.scroll > 0 => {
+                self.scroll -= 1;
+            }
             KeyCode::Down => self.scroll += 1,
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
             KeyCode::PageDown => self.scroll += 10,
@@ -596,10 +633,12 @@ impl App {
                     if self.cursor > 0 {
                         self.cursor -= 1;
                     }
-                } else if self.wizard_step == WizardStep::Settings && self.edit_field.is_none()
-                    && self.cursor > 0 {
-                        self.cursor -= 1;
-                    }
+                } else if self.wizard_step == WizardStep::Settings
+                    && self.edit_field.is_none()
+                    && self.cursor > 0
+                {
+                    self.cursor -= 1;
+                }
             }
             MouseEventKind::ScrollDown => {
                 if self.screen == Screen::Scanning {

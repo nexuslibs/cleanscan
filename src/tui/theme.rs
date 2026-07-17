@@ -13,8 +13,7 @@ pub fn title_style() -> Style {
 }
 
 pub fn subtitle_style() -> Style {
-    Style::default()
-        .fg(Color::Blue)
+    Style::default().fg(Color::Blue)
 }
 
 pub fn hint_style() -> Style {
@@ -43,7 +42,9 @@ pub fn status_style(code: &str) -> Style {
     match code {
         "DONE" => good_style().add_modifier(Modifier::BOLD),
         "PAUSED" => warn_style().add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD),
+        _ => Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD),
     }
 }
 
@@ -65,4 +66,3 @@ pub fn latency_style(ms: f64) -> Style {
         bad_style()
     }
 }
-

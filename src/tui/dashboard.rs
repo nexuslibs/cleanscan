@@ -1,14 +1,14 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Style, Modifier, Color},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarState, Table},
     Frame,
 };
 
+use crate::scanner::ProbeResult;
 use crate::tui::theme;
 use crate::tui::{App, ButtonAction};
-use crate::scanner::ProbeResult;
 
 const COLS: [&str; 9] = ["#", "IP", "OK", "Fail", "Avg", "P50", "P90", "P95", "Max"];
 const WIDTHS: [Constraint; 9] = [
@@ -43,7 +43,11 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
 
 fn render_header(app: &App, frame: &mut Frame, area: Rect) {
     let elapsed = app.start_time.elapsed();
-    let elapsed_str = format!("{:02}:{:02}", elapsed.as_secs() / 60, elapsed.as_secs() % 60);
+    let elapsed_str = format!(
+        "{:02}:{:02}",
+        elapsed.as_secs() / 60,
+        elapsed.as_secs() % 60
+    );
 
     let status = if app.scan_complete {
         "DONE"
@@ -125,7 +129,12 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("Success  : ", theme::title_style()),
-            Span::raw(format!("{:.1}% ({} ok, {} fail)", success_rate, total_probes_ok, total_probes_done - total_probes_ok)),
+            Span::raw(format!(
+                "{:.1}% ({} ok, {} fail)",
+                success_rate,
+                total_probes_ok,
+                total_probes_done - total_probes_ok
+            )),
         ]),
         Line::from(vec![
             Span::styled("Speed/ETA: ", theme::title_style()),
@@ -136,11 +145,17 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
         .borders(Borders::ALL)
         .border_style(theme::border_style())
         .title(" Progress & Workers ");
-    frame.render_widget(Paragraph::new(progress_lines).block(block_p1), col_chunks[0]);
+    frame.render_widget(
+        Paragraph::new(progress_lines).block(block_p1),
+        col_chunks[0],
+    );
 
     // Panel 2: Latency summary
     let ok_results: Vec<&ProbeResult> = app.results.iter().filter(|r| r.ok > 0).collect();
-    let best_ip_str = if let Some(best) = ok_results.iter().min_by(|a, b| a.avg.partial_cmp(&b.avg).unwrap()) {
+    let best_ip_str = if let Some(best) = ok_results
+        .iter()
+        .min_by(|a, b| a.avg.partial_cmp(&b.avg).unwrap())
+    {
         format!("{} ({:.1}ms)", best.ip, best.avg * 1000.0)
     } else {
         "None".to_string()
@@ -231,7 +246,10 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
         .borders(Borders::ALL)
         .border_style(theme::border_style())
         .title(" Latency Spread ");
-    frame.render_widget(Paragraph::new(distribution_lines).block(block_p3), col_chunks[2]);
+    frame.render_widget(
+        Paragraph::new(distribution_lines).block(block_p3),
+        col_chunks[2],
+    );
 }
 
 fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -308,7 +326,7 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
         .enumerate()
         .map(|(i, r)| {
             let rank = start + i + 1;
-            
+
             // Highlight rank 1 (fastest IP) to make it look premium
             let is_first = rank == 1;
             let (ip_text, rank_text) = if is_first {
@@ -316,7 +334,7 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
             } else {
                 (r.ip.clone(), rank.to_string())
             };
-            
+
             let mut base_style = Style::default();
             if is_first {
                 base_style = base_style.fg(Color::LightCyan).add_modifier(Modifier::BOLD);
@@ -326,7 +344,11 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
                 Cell::from(rank_text).style(base_style),
                 Cell::from(ip_text).style(base_style),
                 Cell::from(r.ok.to_string()).style(base_style),
-                Cell::from(r.fail.to_string()).style(if r.fail > 0 { theme::bad_style() } else { base_style }),
+                Cell::from(r.fail.to_string()).style(if r.fail > 0 {
+                    theme::bad_style()
+                } else {
+                    base_style
+                }),
                 Cell::from(fmt_ms(r.avg)).style(theme::latency_style(r.avg * 1000.0)),
                 Cell::from(fmt_ms(r.p50)).style(theme::latency_style(r.p50 * 1000.0)),
                 Cell::from(fmt_ms(r.p90)).style(theme::latency_style(r.p90 * 1000.0)),
@@ -336,9 +358,7 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
         })
         .collect();
 
-    let table = Table::new(rows, WIDTHS)
-        .header(header)
-        .block(block);
+    let table = Table::new(rows, WIDTHS).header(header).block(block);
     frame.render_widget(table, area);
 
     // Scrollbar reflects position within the displayed (top) results.
