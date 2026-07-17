@@ -66,6 +66,25 @@ cleanscan --cli --cidr 188.114.96.0/20 --top 20
 
 ### TUI controls
 
+When `cleanscan` is run with no `--cidr` / `--ips`, it opens a CIDR
+selection screen first. Built-in Cloudflare ranges are listed and pre-selected;
+toggle the ones you want and press `Enter` to start.
+
+**Selection screen**
+
+| Key            | Action                                  |
+|----------------|-----------------------------------------|
+| `↑` / `↓` (`k`/`j`) | Move the cursor through the CIDR list |
+| `space`        | Toggle selection of the highlighted CIDR |
+| `a`            | Add a custom CIDR via the inline text field |
+| `Enter`        | Start the scan with the selected CIDRs  |
+| `q`            | Quit                                    |
+
+While typing a custom CIDR (`a`), `char` appends, `Backspace` deletes,
+`Enter` confirms, and `Esc` cancels.
+
+**Scanning screen**
+
 | Key       | Action                          |
 |-----------|---------------------------------|
 | `q`       | Quit                            |

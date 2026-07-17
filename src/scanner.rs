@@ -17,6 +17,27 @@ use tokio::sync::Semaphore;
 
 use crate::Args;
 
+/// Built-in list of common Cloudflare edge CIDR ranges offered for selection
+/// in the TUI when no targets are supplied on the command line.
+pub const DEFAULT_CLOUDFLARE_CIDRS: &[&str] = &[
+    "188.114.96.0/20",
+    "104.16.0.0/13",
+    "104.24.0.0/14",
+    "172.64.0.0/13",
+    "162.158.0.0/15",
+    "198.41.128.0/17",
+    "173.245.48.0/20",
+    "103.21.244.0/22",
+    "103.22.200.0/22",
+    "103.31.4.0/22",
+    "131.0.72.0/22",
+    "141.101.64.0/18",
+    "108.162.192.0/18",
+    "190.93.240.0/20",
+    "197.234.240.0/22",
+    "198.41.192.0/23",
+];
+
 #[derive(Debug, Clone)]
 pub struct ProbeResult {
     pub ip: String,
@@ -128,6 +149,24 @@ pub fn collect_targets(args: &Args) -> Result<Vec<String>> {
     if targets.is_empty() {
         return Err(anyhow!(
             "no targets. Use --ips /path/to/file or --cidr 188.114.96.0/20"
+        ));
+    }
+
+    Ok(targets.into_iter().collect())
+}
+
+/// Build a target set from an explicit list of CIDR strings (used by the TUI
+/// CIDR selection screen). Each CIDR is sampled as in `collect_targets`.
+pub fn collect_from_cidrs(cidrs: &[String], sample_per_cidr: usize) -> Result<Vec<String>> {
+    let mut targets = BTreeSet::new();
+
+    for cidr in cidrs {
+        add_ip_or_cidr(cidr, &mut targets, sample_per_cidr)?;
+    }
+
+    if targets.is_empty() {
+        return Err(anyhow!(
+            "no targets. Select at least one CIDR to scan."
         ));
     }
 

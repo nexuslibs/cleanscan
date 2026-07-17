@@ -7,6 +7,8 @@ use std::{
 };
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ipnet::IpNet;
+use std::str::FromStr;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style, Stylize},
@@ -17,8 +19,28 @@ use ratatui::{
 
 use crate::{scanner::ProbeResult, Args};
 
+/// Which screen the TUI is currently showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// CIDR selection screen shown before a scan when no targets are given.
+    Setup,
+    /// Live scanning dashboard.
+    Scanning,
+}
+
+/// A selectable CIDR candidate in the setup screen.
+struct CidrEntry {
+    cidr: String,
+    selected: bool,
+}
+
 pub struct App {
     args: Arc<Args>,
+    phase: Phase,
+    cidr_candidates: Vec<CidrEntry>,
+    cursor: usize,
+    input_mode: bool,
+    input_buffer: String,
     results: Vec<ProbeResult>,
     total_targets: usize,
     pub scan_complete: bool,
@@ -29,17 +51,45 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(args: Arc<Args>, total_targets: usize, paused: Arc<AtomicBool>) -> Self {
+    pub fn new(args: Arc<Args>, has_cli_targets: bool, paused: Arc<AtomicBool>) -> Self {
+        let cidr_candidates = crate::scanner::DEFAULT_CLOUDFLARE_CIDRS
+            .iter()
+            .map(|c| CidrEntry {
+                cidr: c.to_string(),
+                selected: true,
+            })
+            .collect();
+
         Self {
             args,
+            phase: if has_cli_targets {
+                Phase::Scanning
+            } else {
+                Phase::Setup
+            },
+            cidr_candidates,
+            cursor: 0,
+            input_mode: false,
+            input_buffer: String::new(),
             results: Vec::new(),
-            total_targets,
+            total_targets: 0,
             scan_complete: false,
             should_quit: false,
             paused,
             message: None,
             start_time: Instant::now(),
         }
+    }
+
+    /// Switch from the setup screen to the scanning dashboard once targets are
+    /// known. Resets per-scan state.
+    pub fn begin_scan(&mut self, total: usize) {
+        self.phase = Phase::Scanning;
+        self.total_targets = total;
+        self.scan_complete = false;
+        self.results.clear();
+        self.message = None;
+        self.start_time = Instant::now();
     }
 
     pub fn add_result(&mut self, result: ProbeResult) {
@@ -66,6 +116,11 @@ impl App {
     }
 
     pub fn render(&self, frame: &mut Frame) {
+        if self.phase == Phase::Setup {
+            self.render_setup(frame, frame.area());
+            return;
+        }
+
         let area = frame.area();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -81,6 +136,69 @@ impl App {
         self.render_progress(frame, chunks[1]);
         self.render_table(frame, chunks[2]);
         self.render_footer(frame, chunks[3]);
+    }
+
+    fn render_setup(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+        let title_line = Line::from(format!(
+            " cleanscan v{} — Select CIDRs to scan ",
+            env!("CARGO_PKG_VERSION")
+        ));
+        let block = Block::default().borders(Borders::ALL);
+        let paragraph = Paragraph::new(title_line)
+            .block(block)
+            .style(Style::default().fg(Color::Cyan));
+        frame.render_widget(paragraph, chunks[0]);
+
+        let items: Vec<Line> = self
+            .cidr_candidates
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let mark = if e.selected { "[x]" } else { "[ ]" };
+                let cursor = if i == self.cursor { "> " } else { "  " };
+                let style = if i == self.cursor {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                };
+                Line::from(format!("{}{} {}", cursor, mark, e.cidr)).style(style)
+            })
+            .collect();
+
+        let list = Paragraph::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" CIDRs (space toggle, a add, Enter start, q quit) "),
+        );
+        frame.render_widget(list, chunks[1]);
+
+        let input_line = if self.input_mode {
+            format!("> {}_", self.input_buffer)
+        } else {
+            "  press 'a' to add a custom CIDR".to_string()
+        };
+        let input = Paragraph::new(input_line).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Add CIDR "),
+        );
+        frame.render_widget(input, chunks[2]);
+
+        let text = self.message.clone().unwrap_or_else(|| {
+            " ↑/↓ move • space toggle • a add • Enter start scan • q quit ".to_string()
+        });
+        let footer = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(footer, chunks[3]);
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -181,6 +299,103 @@ impl App {
         frame.render_widget(paragraph, area);
     }
 
+    /// Handle a key press while on the setup screen.
+    ///
+    /// Returns `Some(cidrs)` when the user confirms a selection that should be
+    /// scanned; the caller is responsible for building targets and starting the
+    /// scan. Returns `None` otherwise.
+    pub fn handle_setup_key(&mut self, key: KeyCode) -> Option<Vec<String>> {
+        if self.input_mode {
+            match key {
+                KeyCode::Enter => {
+                    let s = self.input_buffer.trim().to_string();
+                    if s.is_empty() {
+                        self.input_mode = false;
+                        self.input_buffer.clear();
+                        return None;
+                    }
+                    match IpNet::from_str(&s) {
+                        Ok(_) => {
+                            self.cidr_candidates.push(CidrEntry {
+                                cidr: s.clone(),
+                                selected: true,
+                            });
+                            self.input_buffer.clear();
+                            self.input_mode = false;
+                            self.message = Some(format!("Added {}", s));
+                        }
+                        Err(e) => {
+                            self.message = Some(format!("Invalid CIDR '{}': {}", s, e));
+                        }
+                    }
+                    None
+                }
+                KeyCode::Esc => {
+                    self.input_mode = false;
+                    self.input_buffer.clear();
+                    None
+                }
+                KeyCode::Backspace => {
+                    self.input_buffer.pop();
+                    None
+                }
+                KeyCode::Char(c) => {
+                    self.input_buffer.push(c);
+                    None
+                }
+                _ => None,
+            }
+        } else {
+            match key {
+                KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    self.should_quit = true;
+                    None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if self.cursor > 0 {
+                        self.cursor -= 1;
+                    }
+                    None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if !self.cidr_candidates.is_empty()
+                        && self.cursor < self.cidr_candidates.len() - 1
+                    {
+                        self.cursor += 1;
+                    }
+                    None
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(e) = self.cidr_candidates.get_mut(self.cursor) {
+                        e.selected = !e.selected;
+                    }
+                    None
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    self.input_mode = true;
+                    self.input_buffer.clear();
+                    None
+                }
+                KeyCode::Enter => {
+                    let selected: Vec<String> = self
+                        .cidr_candidates
+                        .iter()
+                        .filter(|e| e.selected)
+                        .map(|e| e.cidr.clone())
+                        .collect();
+                    if selected.is_empty() {
+                        self.message =
+                            Some("Select at least one CIDR (space) before starting.".to_string());
+                        None
+                    } else {
+                        Some(selected)
+                    }
+                }
+                _ => None,
+            }
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyCode) -> bool {
         match key {
             KeyCode::Char('q') | KeyCode::Char('Q') => {
@@ -233,40 +448,53 @@ impl App {
 
 /// Run the full TUI loop.
 pub fn run_tui(args: Args) -> anyhow::Result<()> {
-    let targets = crate::scanner::collect_targets(&args)?;
-    let total = targets.len();
+    let has_cli_targets = args.ips.is_some() || !args.cidr.is_empty();
 
-    let (tx, rx) = std::sync::mpsc::channel::<ProbeResult>();
     let args_arc = Arc::new(args);
-
+    let (tx, rx) = std::sync::mpsc::channel::<ProbeResult>();
     let paused = Arc::new(AtomicBool::new(false));
     let cancel = Arc::new(AtomicBool::new(false));
-
-    // Spawn scanner on a background thread with its own tokio runtime
-    let scanner_args = args_arc.clone();
-    let scanner_paused = paused.clone();
-    let scanner_cancel = cancel.clone();
-    let scanner = std::thread::spawn(move || {
-        let rt = match tokio::runtime::Runtime::new() {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("failed to create tokio runtime: {e}");
-                return;
-            }
-        };
-        rt.block_on(crate::scanner::run_scan(
-            targets,
-            scanner_args,
-            tx,
-            scanner_cancel,
-            scanner_paused,
-        ));
-    });
 
     let mut terminal = ratatui::init();
     // Ensure the terminal is always restored, even on early error returns.
     let _guard = RestoreGuard;
-    let mut app = App::new(args_arc, total, paused);
+    let mut app = App::new(args_arc.clone(), has_cli_targets, paused.clone());
+
+    // Spawns the background scanner thread for a concrete target list, using a
+    // fresh tokio runtime. The thread is only created once targets are known
+    // (immediately for CLI targets, or after the setup screen confirms).
+    let spawn_scanner = |targets: Vec<String>| -> std::thread::JoinHandle<()> {
+        let scanner_args = args_arc.clone();
+        let scanner_paused = paused.clone();
+        let scanner_cancel = cancel.clone();
+        let scanner_tx = tx.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("failed to create tokio runtime: {e}");
+                    return;
+                }
+            };
+            rt.block_on(crate::scanner::run_scan(
+                targets,
+                scanner_args,
+                scanner_tx,
+                scanner_cancel,
+                scanner_paused,
+            ));
+        })
+    };
+
+    let mut scanner: Option<std::thread::JoinHandle<()>> = None;
+
+    // CLI-provided targets start scanning immediately (legacy behavior).
+    if has_cli_targets {
+        let targets = crate::scanner::collect_targets(&args_arc)?;
+        let total = targets.len();
+        scanner = Some(spawn_scanner(targets));
+        app.begin_scan(total);
+    }
 
     let mut run = || -> anyhow::Result<()> {
         loop {
@@ -276,7 +504,9 @@ pub fn run_tui(args: Args) -> anyhow::Result<()> {
             }
 
             // Check if the scanner thread has finished
-            if !app.scan_complete && scanner.is_finished() {
+            if !app.scan_complete
+                && scanner.as_ref().is_some_and(|s| s.is_finished())
+            {
                 // Drain one more time to catch any results sent just before thread exit
                 while let Ok(r) = rx.try_recv() {
                     app.add_result(r);
@@ -289,8 +519,26 @@ pub fn run_tui(args: Args) -> anyhow::Result<()> {
             // Handle keyboard input (non-blocking poll)
             if crossterm::event::poll(std::time::Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press && !app.handle_key(key.code) {
-                        break;
+                    if key.kind == KeyEventKind::Press {
+                        if app.phase == Phase::Setup {
+                            if let Some(cidrs) = app.handle_setup_key(key.code) {
+                                match crate::scanner::collect_from_cidrs(
+                                    &cidrs,
+                                    args_arc.sample_per_cidr,
+                                ) {
+                                    Ok(targets) => {
+                                        let total = targets.len();
+                                        scanner = Some(spawn_scanner(targets));
+                                        app.begin_scan(total);
+                                    }
+                                    Err(e) => {
+                                        app.message = Some(format!("Error: {e}"))
+                                    }
+                                }
+                            }
+                        } else if !app.handle_key(key.code) {
+                            break;
+                        }
                     }
                 }
             }
@@ -307,7 +555,9 @@ pub fn run_tui(args: Args) -> anyhow::Result<()> {
     // Signal cancellation so the scanner stops scheduling/awaiting probes and
     // joins promptly on quit.
     cancel.store(true, Ordering::Relaxed);
-    let _ = scanner.join();
+    if let Some(s) = scanner {
+        let _ = s.join();
+    }
     result
 }
 
