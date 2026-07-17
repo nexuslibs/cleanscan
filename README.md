@@ -76,12 +76,37 @@ toggle the ones you want and press `Enter` to start.
 |----------------|-----------------------------------------|
 | `↑` / `↓` (`k`/`j`) | Move the cursor through the CIDR list |
 | `space`        | Toggle selection of the highlighted CIDR |
+| `A`            | Select **all** CIDRs                    |
+| `D`            | Deselect **all** CIDRs                  |
 | `a`            | Add a custom CIDR via the inline text field |
+| `c`            | Open the **settings** screen to tweak scan parameters |
 | `Enter`        | Start the scan with the selected CIDRs  |
 | `q`            | Quit                                    |
 
 While typing a custom CIDR (`a`), `char` appends, `Backspace` deletes,
 `Enter` confirms, and `Esc` cancels.
+
+**Settings screen**
+
+Reached from the selection screen with `c`. Every scan parameter exposed by
+the CLI flags can be edited here. Navigation mirrors the selection screen:
+
+| Key            | Action                                  |
+|----------------|-----------------------------------------|
+| `↑` / `↓` (`k`/`j`) | Move the cursor through the parameters |
+| `Enter`        | Edit the highlighted parameter          |
+| `char`         | While editing, append to the value      |
+| `Backspace`    | While editing, delete a character       |
+| `Enter`        | While editing, confirm the new value    |
+| `Esc`          | While editing, cancel; otherwise return to the selection screen |
+| `b`            | Return to the selection screen          |
+| `q`            | Quit                                    |
+
+The following parameters are editable, with the same meaning as their CLI
+counterparts: `Host` (`--host`), `Path` (`--path`), `Sample per CIDR`
+(`--sample-per-cidr`), `Probes` (`--probes`), `Concurrency` (`--concurrency`),
+`Timeout (ms)` (`--timeout-ms`), `Connect timeout (ms)` (`--connect-timeout-ms`),
+and `Top results` (`--top`).
 
 **Scanning screen**
 

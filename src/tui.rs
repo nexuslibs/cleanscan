@@ -24,8 +24,114 @@ use crate::{scanner::ProbeResult, Args};
 enum Phase {
     /// CIDR selection screen shown before a scan when no targets are given.
     Setup,
+    /// Scan parameter configuration screen, reached from the setup screen.
+    Settings,
     /// Live scanning dashboard.
     Scanning,
+}
+
+/// Identifies an editable scan parameter on the settings screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingField {
+    Host,
+    Path,
+    SamplePerCidr,
+    Probes,
+    Concurrency,
+    TimeoutMs,
+    ConnectTimeoutMs,
+    Top,
+}
+
+impl SettingField {
+    /// All settings fields in display order.
+    const ALL: [SettingField; 8] = [
+        SettingField::Host,
+        SettingField::Path,
+        SettingField::SamplePerCidr,
+        SettingField::Probes,
+        SettingField::Concurrency,
+        SettingField::TimeoutMs,
+        SettingField::ConnectTimeoutMs,
+        SettingField::Top,
+    ];
+
+    fn label(&self) -> &'static str {
+        match self {
+            SettingField::Host => "Host",
+            SettingField::Path => "Path",
+            SettingField::SamplePerCidr => "Sample per CIDR",
+            SettingField::Probes => "Probes",
+            SettingField::Concurrency => "Concurrency",
+            SettingField::TimeoutMs => "Timeout (ms)",
+            SettingField::ConnectTimeoutMs => "Connect timeout (ms)",
+            SettingField::Top => "Top results",
+        }
+    }
+
+    /// Current value of this field as an editable string.
+    fn value_string(&self, args: &Args) -> String {
+        match self {
+            SettingField::Host => args.host.clone(),
+            SettingField::Path => args.path.clone(),
+            SettingField::SamplePerCidr => args.sample_per_cidr.to_string(),
+            SettingField::Probes => args.probes.to_string(),
+            SettingField::Concurrency => args.concurrency.to_string(),
+            SettingField::TimeoutMs => args.timeout_ms.to_string(),
+            SettingField::ConnectTimeoutMs => args.connect_timeout_ms.to_string(),
+            SettingField::Top => args.top.to_string(),
+        }
+    }
+
+    /// Parse `raw` and apply it to `args`. Returns an error message on failure.
+    fn apply(&self, raw: &str, args: &mut Args) -> Result<(), String> {
+        let raw = raw.trim();
+        match self {
+            SettingField::Host => {
+                if raw.is_empty() {
+                    return Err("host must not be empty".to_string());
+                }
+                args.host = raw.to_string();
+            }
+            SettingField::Path => {
+                if raw.is_empty() {
+                    return Err("path must not be empty".to_string());
+                }
+                args.path = raw.to_string();
+            }
+            SettingField::SamplePerCidr => {
+                args.sample_per_cidr = raw
+                    .parse::<usize>()
+                    .map_err(|_| "invalid number".to_string())?;
+            }
+            SettingField::Probes => {
+                args.probes = raw
+                    .parse::<usize>()
+                    .map_err(|_| "invalid number".to_string())?;
+            }
+            SettingField::Concurrency => {
+                args.concurrency = raw
+                    .parse::<usize>()
+                    .map_err(|_| "invalid number".to_string())?;
+            }
+            SettingField::TimeoutMs => {
+                args.timeout_ms = raw
+                    .parse::<u64>()
+                    .map_err(|_| "invalid number".to_string())?;
+            }
+            SettingField::ConnectTimeoutMs => {
+                args.connect_timeout_ms = raw
+                    .parse::<u64>()
+                    .map_err(|_| "invalid number".to_string())?;
+            }
+            SettingField::Top => {
+                args.top = raw
+                    .parse::<usize>()
+                    .map_err(|_| "invalid number".to_string())?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A selectable CIDR candidate in the setup screen.
@@ -35,12 +141,16 @@ struct CidrEntry {
 }
 
 pub struct App {
-    args: Arc<Args>,
+    /// Editable scan parameters; changes here drive the scan when launched from
+    /// the setup screen.
+    config: Args,
     phase: Phase,
     cidr_candidates: Vec<CidrEntry>,
     cursor: usize,
     input_mode: bool,
     input_buffer: String,
+    /// Index of the settings field currently being edited, if any.
+    edit_field: Option<usize>,
     results: Vec<ProbeResult>,
     total_targets: usize,
     pub scan_complete: bool,
@@ -61,7 +171,7 @@ impl App {
             .collect();
 
         Self {
-            args,
+            config: (*args).clone(),
             phase: if has_cli_targets {
                 Phase::Scanning
             } else {
@@ -71,6 +181,7 @@ impl App {
             cursor: 0,
             input_mode: false,
             input_buffer: String::new(),
+            edit_field: None,
             results: Vec::new(),
             total_targets: 0,
             scan_complete: false,
@@ -118,6 +229,11 @@ impl App {
     pub fn render(&self, frame: &mut Frame) {
         if self.phase == Phase::Setup {
             self.render_setup(frame, frame.area());
+            return;
+        }
+
+        if self.phase == Phase::Settings {
+            self.render_settings(frame, frame.area());
             return;
         }
 
@@ -178,7 +294,7 @@ impl App {
         let list = Paragraph::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" CIDRs (space toggle, a add, Enter start, q quit) "),
+                .title(" CIDRs (space toggle, A all, D none, c config, Enter start, q quit) "),
         );
         frame.render_widget(list, chunks[1]);
 
@@ -195,7 +311,74 @@ impl App {
         frame.render_widget(input, chunks[2]);
 
         let text = self.message.clone().unwrap_or_else(|| {
-            " ↑/↓ move • space toggle • a add • Enter start scan • q quit ".to_string()
+            " ↑/↓ move • space toggle • A select all • D deselect all • a add • c configure • Enter start • q quit ".to_string()
+        });
+        let footer = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(footer, chunks[3]);
+    }
+
+    fn render_settings(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+        let title_line = Line::from(format!(
+            " cleanscan v{} — Scan settings ",
+            env!("CARGO_PKG_VERSION")
+        ));
+        let block = Block::default().borders(Borders::ALL);
+        let paragraph = Paragraph::new(title_line)
+            .block(block)
+            .style(Style::default().fg(Color::Cyan));
+        frame.render_widget(paragraph, chunks[0]);
+
+        let items: Vec<Line> = SettingField::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let cursor = if i == self.cursor { "> " } else { "  " };
+                let style = if i == self.cursor {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                };
+                Line::from(format!(
+                    "{}{:20} {}",
+                    cursor,
+                    f.label(),
+                    f.value_string(&self.config)
+                ))
+                .style(style)
+            })
+            .collect();
+
+        let list = Paragraph::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Settings (↑/↓ move, Enter edit, Esc/b back, q quit) "),
+        );
+        frame.render_widget(list, chunks[1]);
+
+        let input_line = if self.input_mode {
+            format!("> {}_", self.input_buffer)
+        } else {
+            "  press Enter to edit the highlighted setting".to_string()
+        };
+        let input = Paragraph::new(input_line).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Edit "),
+        );
+        frame.render_widget(input, chunks[2]);
+
+        let text = self.message.clone().unwrap_or_else(|| {
+            " ↑/↓ move • Enter edit • Esc/b back to CIDR selection • q quit ".to_string()
         });
         let footer = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
         frame.render_widget(footer, chunks[3]);
@@ -248,7 +431,7 @@ impl App {
     fn render_table(&self, frame: &mut Frame, area: Rect) {
         // Reserve 3 rows for header + top/bottom borders
         let max_rows = (area.height.max(4) - 3) as usize;
-        let display_count = self.args.top.min(max_rows);
+        let display_count = self.config.top.min(max_rows);
         let show_results: Vec<_> = self.results.iter().take(display_count).collect();
 
         let header = Row::new(vec!["#", "IP", "OK", "Fail", "Avg", "P50", "P95", "Max"])
@@ -371,9 +554,27 @@ impl App {
                     }
                     None
                 }
-                KeyCode::Char('a') | KeyCode::Char('A') => {
+                KeyCode::Char('a') => {
                     self.input_mode = true;
                     self.input_buffer.clear();
+                    None
+                }
+                KeyCode::Char('A') => {
+                    for e in self.cidr_candidates.iter_mut() {
+                        e.selected = true;
+                    }
+                    None
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') => {
+                    for e in self.cidr_candidates.iter_mut() {
+                        e.selected = false;
+                    }
+                    None
+                }
+                KeyCode::Char('c') | KeyCode::Char('C') => {
+                    self.phase = Phase::Settings;
+                    self.cursor = 0;
+                    self.message = None;
                     None
                 }
                 KeyCode::Enter => {
@@ -393,6 +594,77 @@ impl App {
                 }
                 _ => None,
             }
+        }
+    }
+
+    /// Handle a key press while on the settings screen. Updates `self.config`
+    /// in place. Never returns a value; the scan is only launched from the
+    /// setup screen.
+    pub fn handle_settings_key(&mut self, key: KeyCode) {
+        if self.input_mode {
+            match key {
+                KeyCode::Enter => {
+                    if let Some(i) = self.edit_field {
+                        let field = SettingField::ALL[i];
+                        match field.apply(&self.input_buffer, &mut self.config) {
+                            Ok(()) => {
+                                self.input_mode = false;
+                                self.input_buffer.clear();
+                                self.edit_field = None;
+                                self.message = None;
+                            }
+                            Err(e) => {
+                                self.message = Some(format!("Invalid {}: {}", field.label(), e));
+                            }
+                        }
+                    }
+                }
+                KeyCode::Esc => {
+                    self.input_mode = false;
+                    self.input_buffer.clear();
+                    self.edit_field = None;
+                    self.message = None;
+                }
+                KeyCode::Backspace => {
+                    self.input_buffer.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.input_buffer.push(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key {
+            KeyCode::Char('q') | KeyCode::Char('Q') => {
+                self.should_quit = true;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.cursor > 0 {
+                    self.cursor -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let last = SettingField::ALL.len().saturating_sub(1);
+                if self.cursor < last {
+                    self.cursor += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(field) = SettingField::ALL.get(self.cursor) {
+                    self.edit_field = Some(self.cursor);
+                    self.input_buffer = field.value_string(&self.config);
+                    self.input_mode = true;
+                    self.message = None;
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('B') => {
+                self.phase = Phase::Setup;
+                self.cursor = 0;
+                self.message = None;
+            }
+            _ => {}
         }
     }
 
@@ -461,10 +733,11 @@ pub fn run_tui(args: Args) -> anyhow::Result<()> {
     let mut app = App::new(args_arc.clone(), has_cli_targets, paused.clone());
 
     // Spawns the background scanner thread for a concrete target list, using a
-    // fresh tokio runtime. The thread is only created once targets are known
-    // (immediately for CLI targets, or after the setup screen confirms).
-    let spawn_scanner = |targets: Vec<String>| -> std::thread::JoinHandle<()> {
-        let scanner_args = args_arc.clone();
+    // fresh tokio runtime. `scan_args` carries the (possibly TUI-edited) scan
+    // parameters. The thread is only created once targets are known (immediately
+    // for CLI targets, or after the setup screen confirms).
+    let spawn_scanner = |targets: Vec<String>, scan_args: Arc<Args>| -> std::thread::JoinHandle<()> {
+        let scanner_args = scan_args;
         let scanner_paused = paused.clone();
         let scanner_cancel = cancel.clone();
         let scanner_tx = tx.clone();
@@ -492,7 +765,7 @@ pub fn run_tui(args: Args) -> anyhow::Result<()> {
     if has_cli_targets {
         let targets = crate::scanner::collect_targets(&args_arc)?;
         let total = targets.len();
-        scanner = Some(spawn_scanner(targets));
+        scanner = Some(spawn_scanner(targets, args_arc.clone()));
         app.begin_scan(total);
     }
 
@@ -524,11 +797,24 @@ pub fn run_tui(args: Args) -> anyhow::Result<()> {
                             if let Some(cidrs) = app.handle_setup_key(key.code) {
                                 match crate::scanner::collect_from_cidrs(
                                     &cidrs,
-                                    args_arc.sample_per_cidr,
+                                    app.config.sample_per_cidr,
                                 ) {
                                     Ok(targets) => {
                                         let total = targets.len();
-                                        scanner = Some(spawn_scanner(targets));
+                                        let scan_args = Arc::new(Args {
+                                            cli: false,
+                                            host: app.config.host.clone(),
+                                            path: app.config.path.clone(),
+                                            ips: None,
+                                            cidr: Vec::new(),
+                                            sample_per_cidr: app.config.sample_per_cidr,
+                                            probes: app.config.probes,
+                                            concurrency: app.config.concurrency,
+                                            timeout_ms: app.config.timeout_ms,
+                                            connect_timeout_ms: app.config.connect_timeout_ms,
+                                            top: app.config.top,
+                                        });
+                                        scanner = Some(spawn_scanner(targets, scan_args));
                                         app.begin_scan(total);
                                     }
                                     Err(e) => {
@@ -536,6 +822,8 @@ pub fn run_tui(args: Args) -> anyhow::Result<()> {
                                     }
                                 }
                             }
+                        } else if app.phase == Phase::Settings {
+                            app.handle_settings_key(key.code);
                         } else if !app.handle_key(key.code) {
                             break;
                         }
