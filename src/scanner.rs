@@ -4,6 +4,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
     sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -44,11 +45,14 @@ fn random_ip_from_net(net: IpNet) -> Option<IpAddr> {
         IpNet::V4(v4) => {
             let network = u32::from(v4.network());
             let broadcast = u32::from(v4.broadcast());
+            let prefix = v4.prefix_len();
+            let host_bits = 32u32.saturating_sub(prefix as u32);
+            let size: u32 = if host_bits >= 32 { u32::MAX } else { 1u32 << host_bits };
 
-            let (start, end) = if broadcast > network + 1 {
-                (network + 1, broadcast - 1)
-            } else {
+            let (start, end) = if size <= 2 {
                 (network, broadcast)
+            } else {
+                (network + 1, broadcast - 1)
             };
 
             if start > end {
@@ -155,7 +159,13 @@ async fn probe_once(client: &Client, url: &str) -> Option<f64> {
     Some(start.elapsed().as_secs_f64())
 }
 
-async fn test_ip(ip: String, args: Arc<Args>, sem: Arc<Semaphore>) -> ProbeResult {
+async fn test_ip(
+    ip: String,
+    args: Arc<Args>,
+    sem: Arc<Semaphore>,
+    cancel: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+) -> ProbeResult {
     let url = format!("https://{}{}", args.host, args.path);
     let client = match client_for_ip(&args.host, &ip, &args) {
         Ok(c) => c,
@@ -177,6 +187,18 @@ async fn test_ip(ip: String, args: Arc<Args>, sem: Arc<Semaphore>) -> ProbeResul
     let mut futs = FuturesUnordered::new();
 
     for _ in 0..args.probes {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        while paused.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let permit = sem.clone().acquire_owned().await.unwrap();
         let c = client.clone();
         let u = url.clone();
@@ -220,20 +242,29 @@ async fn test_ip(ip: String, args: Arc<Args>, sem: Arc<Semaphore>) -> ProbeResul
 }
 
 /// Run the full scan over `targets`, sending each result through `tx`.
+/// `cancel` stops scheduling new probes/targets, and `paused` halts probe
+/// scheduling until cleared.
 pub async fn run_scan(
     targets: Vec<String>,
     args: Arc<Args>,
     tx: std::sync::mpsc::Sender<ProbeResult>,
+    cancel: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 ) {
     let sem = Arc::new(Semaphore::new(args.concurrency));
     let mut tasks = FuturesUnordered::new();
 
     for ip in targets {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let tx = tx.clone();
         let args = args.clone();
         let sem = sem.clone();
+        let cancel = cancel.clone();
+        let paused = paused.clone();
         tasks.push(tokio::spawn(async move {
-            let result = test_ip(ip, args, sem).await;
+            let result = test_ip(ip, args, sem, cancel, paused).await;
             let _ = tx.send(result);
         }));
     }

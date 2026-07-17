@@ -3,6 +3,7 @@ mod tui;
 
 use clap::Parser;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
 
@@ -55,7 +56,11 @@ pub struct Args {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    if args.concurrency == 0 {
+        args.concurrency = 1;
+    }
 
     if args.cli {
         cli_mode(args)
@@ -77,7 +82,13 @@ fn cli_mode(args: Args) -> Result<()> {
     let args_arc = Arc::new(args.clone());
 
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(scanner::run_scan(targets, args_arc, tx));
+    rt.block_on(scanner::run_scan(
+        targets,
+        args_arc,
+        tx,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    ));
 
     let mut results: Vec<scanner::ProbeResult> = rx.iter().collect();
 

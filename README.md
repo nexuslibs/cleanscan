@@ -36,7 +36,8 @@ bash -c 'curl -sSfL https://raw.githubusercontent.com/nexuslibs/cleanscan/main/i
 ```
 
 The script detects your OS/architecture, downloads the matching tarball,
-verifies its SHA256 checksum, and installs `cleanscan` to `/usr/local/bin`
+verifies its SHA256 checksum (and aborts on download failure, missing tooling,
+or mismatch), and installs `cleanscan` to `/usr/local/bin`
 (falls back to `~/.local/bin` if that is not writable). It prints a note if the
 install directory is not already on your `PATH`.
 

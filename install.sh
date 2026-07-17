@@ -94,29 +94,29 @@ curl -fSL "$TARBALL_URL" -o "$TMP/$ASSET" \
        (is there a release built for target '$TARGET'?)"
 
 # ---------------------------------------------------------------------------
-# Verify checksum (best-effort)
+# Verify checksum (fail-closed)
 # ---------------------------------------------------------------------------
-if curl -fSL "$SHA_URL" -o "$TMP/$ASSET_SHA" 2>/dev/null; then
-  EXPECTED="$(cat "$TMP/$ASSET_SHA" | tr -d '[:space:]')"
-  ACTUAL=""
-  if command -v sha256sum >/dev/null 2>&1; then
-    ACTUAL="$(sha256sum "$TMP/$ASSET" | cut -d' ' -f1)"
-  elif command -v shasum >/dev/null 2>&1; then
-    ACTUAL="$(shasum -a 256 "$TMP/$ASSET" | cut -d' ' -f1)"
-  fi
-  if [ -n "$ACTUAL" ]; then
-    if [ "$ACTUAL" = "$EXPECTED" ]; then
-      info "Checksum verified"
-    else
-      err "checksum mismatch for $ASSET
+EXPECTED="$(curl -fSL "$SHA_URL" 2>/dev/null | tr -d '[:space:]')" \
+  || err "checksum download failed: $SHA_URL"
+
+if [ -z "$EXPECTED" ] || ! printf '%s' "$EXPECTED" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+  err "invalid checksum format from $SHA_URL (expected 64-character hex)"
+fi
+
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL="$(sha256sum "$TMP/$ASSET" | cut -d' ' -f1)"
+elif command -v shasum >/dev/null 2>&1; then
+  ACTUAL="$(shasum -a 256 "$TMP/$ASSET" | cut -d' ' -f1)"
+else
+  err "no sha256 tool (sha256sum/shasum) available to verify $ASSET"
+fi
+
+if [ "$ACTUAL" = "$EXPECTED" ]; then
+  info "Checksum verified"
+else
+  err "checksum mismatch for $ASSET
        expected: $EXPECTED
        actual:   $ACTUAL"
-    fi
-  else
-    info "No sha256 tool available; skipping verification"
-  fi
-else
-  info "No checksum file published; skipping verification"
 fi
 
 # ---------------------------------------------------------------------------

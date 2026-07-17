@@ -2,6 +2,7 @@ use std::{
     fs,
     io::{self, Write},
     sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -22,19 +23,21 @@ pub struct App {
     total_targets: usize,
     pub scan_complete: bool,
     pub should_quit: bool,
-    paused: bool,
+    paused: Arc<AtomicBool>,
+    message: Option<String>,
     start_time: Instant,
 }
 
 impl App {
-    pub fn new(args: Arc<Args>, total_targets: usize) -> Self {
+    pub fn new(args: Arc<Args>, total_targets: usize, paused: Arc<AtomicBool>) -> Self {
         Self {
             args,
             results: Vec::new(),
             total_targets,
             scan_complete: false,
             should_quit: false,
-            paused: false,
+            paused,
+            message: None,
             start_time: Instant::now(),
         }
     }
@@ -90,7 +93,7 @@ impl App {
 
         let status = if self.scan_complete {
             "DONE"
-        } else if self.paused {
+        } else if self.paused.load(Ordering::Relaxed) {
             "PAUSED"
         } else {
             "SCANNING"
@@ -173,7 +176,11 @@ impl App {
         } else {
             " [q] quit  [p] pause/resume"
         };
-        let paragraph = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
+        let message = self
+            .message
+            .as_deref()
+            .unwrap_or(text);
+        let paragraph = Paragraph::new(message).style(Style::default().fg(Color::DarkGray));
         frame.render_widget(paragraph, area);
     }
 
@@ -184,11 +191,16 @@ impl App {
                 false
             }
             KeyCode::Char('p') | KeyCode::Char(' ') => {
-                self.paused = !self.paused;
+                let next = !self.paused.load(Ordering::Relaxed);
+                self.paused.store(next, Ordering::Relaxed);
+                self.message = None;
                 true
             }
             KeyCode::Char('s') if self.scan_complete => {
-                let _ = self.save_to_file();
+                match self.save_to_file() {
+                    Ok(name) => self.message = Some(format!("Results saved to {name}")),
+                    Err(e) => self.message = Some(format!("Save failed: {e}")),
+                }
                 true
             }
             _ => true,
@@ -230,8 +242,13 @@ pub fn run_tui(args: Args) -> anyhow::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel::<ProbeResult>();
     let args_arc = Arc::new(args);
 
+    let paused = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(AtomicBool::new(false));
+
     // Spawn scanner on a background thread with its own tokio runtime
     let scanner_args = args_arc.clone();
+    let scanner_paused = paused.clone();
+    let scanner_cancel = cancel.clone();
     let scanner = std::thread::spawn(move || {
         let rt = match tokio::runtime::Runtime::new() {
             Ok(r) => r,
@@ -240,44 +257,68 @@ pub fn run_tui(args: Args) -> anyhow::Result<()> {
                 return;
             }
         };
-        rt.block_on(crate::scanner::run_scan(targets, scanner_args, tx));
+        rt.block_on(crate::scanner::run_scan(
+            targets,
+            scanner_args,
+            tx,
+            scanner_cancel,
+            scanner_paused,
+        ));
     });
 
     let mut terminal = ratatui::init();
-    let mut app = App::new(args_arc, total);
+    // Ensure the terminal is always restored, even on early error returns.
+    let _guard = RestoreGuard;
+    let mut app = App::new(args_arc, total, paused);
 
-    loop {
-        // Drain available results from the scanner
-        while let Ok(r) = rx.try_recv() {
-            app.add_result(r);
-        }
-
-        // Check if the scanner thread has finished
-        if !app.scan_complete && scanner.is_finished() {
-            // Drain one more time to catch any results sent just before thread exit
+    let mut run = || -> anyhow::Result<()> {
+        loop {
+            // Drain available results from the scanner
             while let Ok(r) = rx.try_recv() {
                 app.add_result(r);
             }
-            app.scan_complete = true;
-        }
 
-        terminal.draw(|f| app.render(f))?;
+            // Check if the scanner thread has finished
+            if !app.scan_complete && scanner.is_finished() {
+                // Drain one more time to catch any results sent just before thread exit
+                while let Ok(r) = rx.try_recv() {
+                    app.add_result(r);
+                }
+                app.scan_complete = true;
+            }
 
-        // Handle keyboard input (non-blocking poll)
-        if crossterm::event::poll(std::time::Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press && !app.handle_key(key.code) {
-                    break;
+            terminal.draw(|f| app.render(f))?;
+
+            // Handle keyboard input (non-blocking poll)
+            if crossterm::event::poll(std::time::Duration::from_millis(100))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press && !app.handle_key(key.code) {
+                        break;
+                    }
                 }
             }
-        }
 
-        if app.should_quit {
-            break;
+            if app.should_quit {
+                break;
+            }
         }
-    }
+        Ok(())
+    };
 
-    ratatui::restore();
+    let result = run();
+
+    // Signal cancellation so the scanner stops scheduling/awaiting probes and
+    // joins promptly on quit.
+    cancel.store(true, Ordering::Relaxed);
     let _ = scanner.join();
-    Ok(())
+    result
+}
+
+/// Restores the terminal when dropped, guaranteeing cleanup on every exit path.
+struct RestoreGuard;
+
+impl Drop for RestoreGuard {
+    fn drop(&mut self) {
+        ratatui::restore();
+    }
 }
