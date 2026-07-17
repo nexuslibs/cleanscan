@@ -8,7 +8,6 @@ use std::{
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ipnet::IpNet;
-use std::str::FromStr;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style, Stylize},
@@ -16,6 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, Paragraph, Row, Table},
     Frame,
 };
+use std::str::FromStr;
 
 use crate::{scanner::ProbeResult, Args};
 
@@ -303,11 +303,8 @@ impl App {
         } else {
             "  press 'a' to add a custom CIDR".to_string()
         };
-        let input = Paragraph::new(input_line).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Add CIDR "),
-        );
+        let input = Paragraph::new(input_line)
+            .block(Block::default().borders(Borders::ALL).title(" Add CIDR "));
         frame.render_widget(input, chunks[2]);
 
         let text = self.message.clone().unwrap_or_else(|| {
@@ -370,11 +367,8 @@ impl App {
         } else {
             "  press Enter to edit the highlighted setting".to_string()
         };
-        let input = Paragraph::new(input_line).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Edit "),
-        );
+        let input = Paragraph::new(input_line)
+            .block(Block::default().borders(Borders::ALL).title(" Edit "));
         frame.render_widget(input, chunks[2]);
 
         let text = self.message.clone().unwrap_or_else(|| {
@@ -736,28 +730,29 @@ pub fn run_tui(args: Args) -> anyhow::Result<()> {
     // fresh tokio runtime. `scan_args` carries the (possibly TUI-edited) scan
     // parameters. The thread is only created once targets are known (immediately
     // for CLI targets, or after the setup screen confirms).
-    let spawn_scanner = |targets: Vec<String>, scan_args: Arc<Args>| -> std::thread::JoinHandle<()> {
-        let scanner_args = scan_args;
-        let scanner_paused = paused.clone();
-        let scanner_cancel = cancel.clone();
-        let scanner_tx = tx.clone();
-        std::thread::spawn(move || {
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("failed to create tokio runtime: {e}");
-                    return;
-                }
-            };
-            rt.block_on(crate::scanner::run_scan(
-                targets,
-                scanner_args,
-                scanner_tx,
-                scanner_cancel,
-                scanner_paused,
-            ));
-        })
-    };
+    let spawn_scanner =
+        |targets: Vec<String>, scan_args: Arc<Args>| -> std::thread::JoinHandle<()> {
+            let scanner_args = scan_args;
+            let scanner_paused = paused.clone();
+            let scanner_cancel = cancel.clone();
+            let scanner_tx = tx.clone();
+            std::thread::spawn(move || {
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("failed to create tokio runtime: {e}");
+                        return;
+                    }
+                };
+                rt.block_on(crate::scanner::run_scan(
+                    targets,
+                    scanner_args,
+                    scanner_tx,
+                    scanner_cancel,
+                    scanner_paused,
+                ));
+            })
+        };
 
     let mut scanner: Option<std::thread::JoinHandle<()>> = None;
 
@@ -777,9 +772,7 @@ pub fn run_tui(args: Args) -> anyhow::Result<()> {
             }
 
             // Check if the scanner thread has finished
-            if !app.scan_complete
-                && scanner.as_ref().is_some_and(|s| s.is_finished())
-            {
+            if !app.scan_complete && scanner.as_ref().is_some_and(|s| s.is_finished()) {
                 // Drain one more time to catch any results sent just before thread exit
                 while let Ok(r) = rx.try_recv() {
                     app.add_result(r);
@@ -817,9 +810,7 @@ pub fn run_tui(args: Args) -> anyhow::Result<()> {
                                         scanner = Some(spawn_scanner(targets, scan_args));
                                         app.begin_scan(total);
                                     }
-                                    Err(e) => {
-                                        app.message = Some(format!("Error: {e}"))
-                                    }
+                                    Err(e) => app.message = Some(format!("Error: {e}")),
                                 }
                             }
                         } else if app.phase == Phase::Settings {

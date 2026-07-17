@@ -165,9 +165,7 @@ pub fn collect_from_cidrs(cidrs: &[String], sample_per_cidr: usize) -> Result<Ve
     }
 
     if targets.is_empty() {
-        return Err(anyhow!(
-            "no targets. Select at least one CIDR to scan."
-        ));
+        return Err(anyhow!("no targets. Select at least one CIDR to scan."));
     }
 
     Ok(targets.into_iter().collect())
