@@ -158,20 +158,32 @@ the TUI and are not edited in this screen.
 | `Enter`   | Open full details for the selected IP |
 | `↑` / `↓` | Select a result IP |
 | `c`       | Copy the selected IP to the clipboard |
+| `f`       | Include failed targets for diagnosis |
+| `r`       | Re-run the identical sampled target set |
+| `n`       | Generate a new sample with the same settings |
+| `m`       | Export runs for comparison |
 | `/`       | Open the command palette |
 | `?`       | Open contextual help (close with `?`, `Esc`, or `q`) |
 
 **Speed-test screen**
 
-After latency scanning completes, press `t` to select successful IPs. `Tab`
-moves focus through each control individually (the IP list, the three direction
-buttons, select-all/clear, and start/back), and `Enter` activates whichever
-control is focused. The currently chosen direction is always shown as a filled
-button so selection and focus never look alike. Shortcuts: `Space` toggles the
-highlighted IP, `a` / `x` select-all / clear, and `d` / `u` / `b` set the
-download / upload / both direction. Results report throughput in Mbps for each
-direction. Press `c` to copy the selected IP and `Esc` to return to the latency
-dashboard.
+After latency scanning completes, press `t` to select speed-test targets. The
+screen lists every scanned IP with its `READY`, `DEGRADED`, or `FAILED` status,
+average latency, p95 latency, and negotiated protocol. Failed targets remain
+visible for diagnosis but cannot be selected for a bandwidth test. The default
+order is fastest average latency first; click a column header to sort, or press
+`s` to reverse the current order.
+
+Press `/` to search by IP, status, or protocol. `Enter` accepts the search and
+`Esc` clears it before leaving search mode. `Tab` moves focus through each
+control individually (the target list, the three direction buttons,
+select-all/clear, and start/back), and `Enter` activates whichever control is
+focused. The currently chosen direction is always shown as a filled button so
+selection and focus never look alike. Shortcuts: `Space` toggles the
+highlighted eligible IP, `a` / `x` select-all / clear, and `d` / `u` / `b` set
+the download / upload / both direction. Results report throughput in Mbps for
+each direction. Press `c` to copy the selected IP and `Esc` to return to the
+latency dashboard.
 
 ### CLI options
 
@@ -188,17 +200,34 @@ dashboard.
 | `--timeout-ms`         | `2500`           | Request timeout (ms)                             |
 | `--connect-timeout-ms` | `1000`           | Connect timeout (ms)                             |
 | `--top`                | `50`             | Number of top results to display                 |
+| `--seed`               | random           | Reproducible CIDR sampling seed                 |
+| `--targets-file`       | —                | Exact target list for a reproducible run        |
+| `--format`             | `tsv`            | CLI output format: `tsv`, `json`, or `ndjson`   |
+| `--output`             | stdout           | Write CLI output to a file                     |
+| `--min-success-rate`   | —                | Minimum per-target success rate threshold       |
+| `--max-p95-ms`         | —                | Maximum per-target p95 latency threshold        |
+| `--fail-if-no-healthy-target` | off         | Fail if no target meets thresholds              |
 
 ## Output
 
-Only IPs with at least one successful probe are shown. Probes are scheduled one
+All sampled IPs are shown, including targets with no successful probes. Probes are scheduled one
 at a time per IP: successful IPs receive priority for their remaining probes,
 unexplored IPs are preferred over IPs that have failed, and original order is
-used as a deterministic tie-breaker. CLI results are ranked by failure count
-(ascending), then `p95`, `max`, and `avg` latency (all ascending). Each row reports `ok`/`fail` counts and `avg`,
+used as a deterministic tie-breaker. CLI results are ranked by success rate
+(descending), then `p95` and average latency (ascending). Each row reports `ok`/`fail` counts and `avg`,
 `p50`, `p90`, `p95`, and `max` latency in seconds, followed by individual
 successful probe samples in the `samples` column. Only the top `N` rows are
 printed, where `N` is controlled by `--top`.
+
+Completed scans show a decision summary with READY, DEGRADED, and FAILED
+counts, a recommended target, backups, success rate, p95 latency, and
+confidence. The selected-IP details modal supports `1`–`5` / `Tab` tabs for
+overview, failure diagnostics, latency distribution, speed context, and
+latency map.
+
+The Review screen shows the random seed and exact deduplicated target count.
+Press `s` for a new sample or `c` to save the exact targets to
+`cleanscan_targets_<seed>.txt`.
 
 The TUI displays the same latency statistics. Its save action writes the top
 successful results to a timestamped
@@ -207,7 +236,9 @@ successful results to a timestamped
 CIDR ranges are sampled randomly, so overlapping samples may produce fewer
 unique targets than `sample-per-cidr` suggests. Each probe is an HTTPS request
 to the configured host and path, using the candidate IP for the connection
-while retaining the hostname for TLS SNI and the Host header.
+while retaining the hostname for TLS SNI and the Host header. Results are
+ranked by success rate first, then p95 and average latency; failures include
+categorized diagnostics in the details view and machine-readable output.
 
 Speed tests use the same direct-IP connection behavior. The default endpoints
 are `/speed-test/100mb.bin` for downloads and `/speed-test/upload` for uploads;

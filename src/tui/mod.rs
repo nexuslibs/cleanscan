@@ -9,6 +9,7 @@ pub mod wizard;
 pub use widgets::{ButtonKind, ToastKind};
 
 use std::{
+    collections::HashSet,
     fs,
     io::{self, Write},
     sync::atomic::{AtomicBool, Ordering},
@@ -21,7 +22,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     symbols::border::ROUNDED,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, ListState, Paragraph},
     Frame,
 };
 
@@ -211,6 +212,10 @@ pub struct App {
     pub edit_caret: usize,
     pub results: Vec<ProbeResult>,
     pub total_targets: usize,
+    /// Exact sampled targets shown in the review screen and used for the run.
+    pub preview_targets: Vec<String>,
+    pub last_targets: Vec<String>,
+    pub scan_seed: u64,
     pub scan_complete: bool,
     pub should_quit: bool,
     pub paused: Arc<AtomicBool>,
@@ -222,11 +227,14 @@ pub struct App {
     pub result_cursor: usize,
     /// Scroll offset into the wizard CIDR list.
     pub ranges_scroll: usize,
+    pub ranges_list_state: ListState,
     /// Scroll offset into the wizard settings list.
     pub settings_scroll: usize,
+    pub settings_list_state: ListState,
     /// Currently sorted column index in the results table (natural order = 0).
     pub sort_col: usize,
     pub sort_asc: bool,
+    pub show_failures: bool,
     pub result_column_visibility: [bool; 10],
     pub column_picker_cursor: usize,
     pub start_time: Instant,
@@ -255,14 +263,21 @@ pub struct App {
     /// Speed-select list inner rect + first visible index, for mouse hit-testing.
     pub speed_list_inner: Option<Rect>,
     pub speed_list_start: usize,
+    pub speed_table_header: Option<Rect>,
+    pub speed_table_col_bounds: Vec<(u16, u16)>,
     /// Set when a quit was requested while a scan is running; a second 'q'
     /// confirms the exit. Any other key clears it.
     pub confirm_quit: bool,
     /// Set when the wizard's Start action fires; the run loop performs the spawn.
     pub pending_start: bool,
+    pub rescan_targets: Option<Vec<String>>,
     pub speed_targets: Vec<String>,
     pub speed_selected: std::collections::HashSet<String>,
     pub speed_cursor: usize,
+    pub speed_query: String,
+    pub speed_search_mode: bool,
+    pub speed_sort_col: usize,
+    pub speed_sort_asc: bool,
     pub speed_direction: SpeedDirection,
     pub speed_results: Vec<SpeedResult>,
     pub speed_result_cursor: usize,
@@ -279,8 +294,12 @@ pub struct App {
     pub show_column_picker: bool,
     pub command_query: String,
     pub command_cursor: usize,
+    pub command_list_state: ListState,
+    pub column_picker_list_state: ListState,
     /// Full statistics drawer for the currently selected latency result.
     pub show_result_details: bool,
+    pub detail_tab: usize,
+    explicit_target_source: Option<(Vec<String>, Option<String>)>,
 }
 
 impl App {
@@ -373,6 +392,7 @@ impl App {
     }
 
     pub fn new(config: AppConfig, has_cli_targets: bool, paused: Arc<AtomicBool>) -> Self {
+        let scan_seed = config.seed;
         let mut cidr_candidates = Vec::new();
 
         let default_set: std::collections::HashSet<String> =
@@ -419,6 +439,9 @@ impl App {
             edit_caret: 0,
             results: Vec::new(),
             total_targets: 0,
+            preview_targets: Vec::new(),
+            last_targets: Vec::new(),
+            scan_seed,
             scan_complete: false,
             should_quit: false,
             paused,
@@ -428,9 +451,12 @@ impl App {
             scroll: 0,
             result_cursor: 0,
             ranges_scroll: 0,
+            ranges_list_state: ListState::default(),
             settings_scroll: 0,
+            settings_list_state: ListState::default(),
             sort_col: 0,
             sort_asc: true,
+            show_failures: false,
             result_column_visibility: [true; 10],
             column_picker_cursor: 0,
             start_time: Instant::now(),
@@ -450,11 +476,18 @@ impl App {
             table_col_indices: Vec::new(),
             speed_list_inner: None,
             speed_list_start: 0,
+            speed_table_header: None,
+            speed_table_col_bounds: Vec::new(),
             confirm_quit: false,
             pending_start: false,
+            rescan_targets: None,
             speed_targets: Vec::new(),
             speed_selected: std::collections::HashSet::new(),
             speed_cursor: 0,
+            speed_query: String::new(),
+            speed_search_mode: false,
+            speed_sort_col: 2,
+            speed_sort_asc: true,
             speed_direction: SpeedDirection::Both,
             speed_results: Vec::new(),
             speed_result_cursor: 0,
@@ -468,7 +501,11 @@ impl App {
             show_column_picker: false,
             command_query: String::new(),
             command_cursor: 0,
+            command_list_state: ListState::default(),
+            column_picker_list_state: ListState::default(),
             show_result_details: false,
+            detail_tab: 0,
+            explicit_target_source: None,
         }
     }
 
@@ -536,6 +573,7 @@ impl App {
         self.focus_index = 0;
         self.focus_target = FocusTarget::Table;
         self.show_result_details = false;
+        self.detail_tab = 0;
         self.total_targets = total;
         self.scan_complete = false;
         self.results.clear();
@@ -543,12 +581,121 @@ impl App {
         self.result_cursor = 0;
         self.sort_col = 0;
         self.sort_asc = true;
+        self.show_failures = false;
         self.message = None;
         self.message_time = None;
         self.start_time = Instant::now();
         self.throughput.clear();
         self.last_tp_instant = Instant::now();
         self.last_tp_count = 0;
+    }
+
+    pub fn set_scan_targets(&mut self, targets: Vec<String>) {
+        self.last_targets = targets.clone();
+        self.preview_targets = targets;
+    }
+
+    pub fn invalidate_preview(&mut self) {
+        self.preview_targets.clear();
+    }
+
+    pub fn refresh_preview(&mut self) {
+        let result = self.collect_preview(self.scan_seed);
+        match result {
+            Ok(targets) => {
+                self.preview_targets = targets;
+                self.toast_success(format!("Generated {} targets", self.preview_targets.len()));
+            }
+            Err(error) => self.toast_error(format!("Preview failed: {error}")),
+        }
+    }
+
+    fn collect_preview(&self, seed: u64) -> anyhow::Result<Vec<String>> {
+        if let Some((cidrs, ips)) = &self.explicit_target_source {
+            crate::scanner::collect_targets_with_seed(&self.config, cidrs, ips, seed)
+        } else {
+            let cidrs: Vec<String> = self
+                .cidr_candidates
+                .iter()
+                .filter(|entry| entry.selected)
+                .map(|entry| entry.cidr.clone())
+                .collect();
+            crate::scanner::collect_from_cidrs_with_seed(&cidrs, self.config.sample_per_cidr, seed)
+        }
+    }
+
+    pub fn regenerate_preview(&mut self) {
+        let seed = rand::random();
+        match self.collect_preview(seed) {
+            Ok(targets) => {
+                self.scan_seed = seed;
+                self.config.seed = seed;
+                self.preview_targets = targets;
+                self.toast_success(format!("Generated {} targets", self.preview_targets.len()));
+            }
+            Err(error) => self.toast_error(format!("Preview failed: {error}")),
+        }
+    }
+
+    pub fn set_explicit_target_source(&mut self, cidrs: Vec<String>, ips: Option<String>) {
+        self.explicit_target_source = Some((cidrs, ips));
+    }
+
+    fn regenerate_explicit_preview(&mut self) -> bool {
+        if self.explicit_target_source.is_none() {
+            return false;
+        }
+        let seed = rand::random();
+        match self.collect_preview(seed) {
+            Ok(targets) => {
+                self.scan_seed = seed;
+                self.config.seed = seed;
+                self.preview_targets = targets;
+                self.toast_success(format!("Generated {} targets", self.preview_targets.len()));
+                true
+            }
+            Err(error) => {
+                self.toast_error(format!("Preview failed: {error}"));
+                false
+            }
+        }
+    }
+
+    pub fn save_target_manifest(&mut self) {
+        if self.preview_targets.is_empty() {
+            self.toast_warn("No sampled targets available");
+            return;
+        }
+        let base = format!("cleanscan_targets_{}.txt", self.scan_seed);
+        let content = self.preview_targets.join("\n") + "\n";
+        let mut selected = base.clone();
+        let mut suffix = 1;
+        loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&selected)
+            {
+                Ok(mut file) => match file.write_all(content.as_bytes()) {
+                    Ok(()) => {
+                        self.toast_success(format!("Targets saved to {selected}"));
+                        break;
+                    }
+                    Err(error) => {
+                        self.toast_error(format!("Target save failed: {error}"));
+                        break;
+                    }
+                },
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    selected = format!("cleanscan_targets_{}_{}.txt", self.scan_seed, suffix);
+                    suffix += 1;
+                }
+                Err(error) => {
+                    self.toast_error(format!("Target save failed: {error}"));
+                    break;
+                }
+            }
+        }
     }
 
     pub fn add_result(&mut self, result: ProbeResult) {
@@ -590,6 +737,10 @@ impl App {
         self.toast_kind(msg, ToastKind::Success);
     }
 
+    pub fn toast_info(&mut self, msg: impl Into<String>) {
+        self.toast_kind(msg, ToastKind::Info);
+    }
+
     pub fn toast_warn(&mut self, msg: impl Into<String>) {
         self.toast_kind(msg, ToastKind::Warn);
     }
@@ -621,8 +772,9 @@ impl App {
 
     /// Natural ranking used as the default results order.
     pub fn natural_cmp(a: &ProbeResult, b: &ProbeResult) -> std::cmp::Ordering {
-        a.fail
-            .cmp(&b.fail)
+        b.success_rate
+            .partial_cmp(&a.success_rate)
+            .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| {
                 a.p95
                     .partial_cmp(&b.p95)
@@ -642,7 +794,11 @@ impl App {
 
     /// Results sorted for display according to the active sort column.
     pub fn sorted_results(&self) -> Vec<&ProbeResult> {
-        let mut v: Vec<&ProbeResult> = self.results.iter().filter(|r| r.ok > 0).collect();
+        let mut v: Vec<&ProbeResult> = self
+            .results
+            .iter()
+            .filter(|r| self.show_failures || r.ok > 0)
+            .collect();
         if self.sort_col == 0 {
             v.sort_by(|a, b| {
                 let ord = Self::natural_cmp(a, b);
@@ -659,7 +815,10 @@ impl App {
             let ord = match self.sort_col {
                 1 => a.ip.cmp(&b.ip),
                 2 => a.ok.cmp(&b.ok),
-                3 => a.fail.cmp(&b.fail),
+                3 => a
+                    .success_rate
+                    .partial_cmp(&b.success_rate)
+                    .unwrap_or(std::cmp::Ordering::Equal),
                 4 => a
                     .avg
                     .partial_cmp(&b.avg)
@@ -776,6 +935,53 @@ impl App {
         Ok(filename)
     }
 
+    fn save_comparison_to_file(&self) -> Result<String, io::Error> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let base = format!("cleanscan_comparison_{ts}");
+        let mut suffix = 0usize;
+        let (filename, mut file) = loop {
+            let candidate = if suffix == 0 {
+                format!("{base}.json")
+            } else {
+                format!("{base}_{suffix}.json")
+            };
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => break (candidate, file),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => suffix += 1,
+                Err(e) => return Err(e),
+            }
+        };
+
+        let snapshot = serde_json::json!({
+            "seed": self.scan_seed,
+            "targets": self.last_targets,
+            "results": self.results,
+        });
+        let content = serde_json::to_vec_pretty(&snapshot)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        file.write_all(&content)?;
+        file.write_all(b"\n")?;
+        Ok(filename)
+    }
+
+    pub fn export_comparison(&mut self) {
+        if !self.scan_complete {
+            self.toast_warn("Scan still running — wait for it to finish before exporting");
+            return;
+        }
+        match self.save_comparison_to_file() {
+            Ok(name) => self.toast_success(format!("Comparison saved to {name}")),
+            Err(e) => self.toast_error(format!("Comparison export failed: {e}")),
+        }
+    }
+
     /// Save results to a TSV file (only meaningful when the scan is done).
     pub fn save(&mut self) {
         if !self.scan_complete {
@@ -822,9 +1028,18 @@ pub fn run_tui(
     config: AppConfig,
     cli_cidr: Vec<String>,
     cli_ips: Option<String>,
+    explicit_seed: Option<u64>,
 ) -> anyhow::Result<()> {
     let has_cli_targets = cli_ips.is_some() || !cli_cidr.is_empty();
 
+    let mut config = config;
+    config.seed = explicit_seed.unwrap_or_else(|| {
+        if config.seed == 0 {
+            rand::random()
+        } else {
+            config.seed
+        }
+    });
     let config_arc = Arc::new(config);
     let (tx, rx) = std::sync::mpsc::channel::<ProbeResult>();
     let (speed_tx, speed_rx) = std::sync::mpsc::channel::<SpeedResult>();
@@ -836,6 +1051,9 @@ pub fn run_tui(
     let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
     let _guard = RestoreGuard;
     let mut app = App::new((*config_arc).clone(), has_cli_targets, paused.clone());
+    if has_cli_targets {
+        app.set_explicit_target_source(cli_cidr.clone(), cli_ips.clone());
+    }
 
     let spawn_scanner = |targets: Vec<String>,
                          scan_config: Arc<AppConfig>|
@@ -892,8 +1110,14 @@ pub fn run_tui(
         if app.config.host.is_empty() {
             app.toast_warn("Set a Host before starting the scan");
         } else {
-            let targets = crate::scanner::collect_targets(&config_arc, &cli_cidr, &cli_ips)?;
+            let targets = crate::scanner::collect_targets_with_seed(
+                &config_arc,
+                &cli_cidr,
+                &cli_ips,
+                app.scan_seed,
+            )?;
             let total = targets.len();
+            app.set_scan_targets(targets.clone());
             scanner = Some(spawn_scanner(targets, config_arc.clone()));
             app.begin_scan(total);
         }
@@ -907,13 +1131,14 @@ pub fn run_tui(
             Vec<String>,
             Arc<AppConfig>,
         ) -> std::thread::JoinHandle<Result<(), String>>| {
+            let exact_targets = app.rescan_targets.take();
             let cidrs: Vec<String> = app
                 .cidr_candidates
                 .iter()
                 .filter(|e| e.selected)
                 .map(|e| e.cidr.clone())
                 .collect();
-            if cidrs.is_empty() {
+            if exact_targets.is_none() && cidrs.is_empty() {
                 app.toast_warn("Select at least one CIDR (space) before starting");
                 return;
             }
@@ -921,7 +1146,18 @@ pub fn run_tui(
                 app.toast_warn("Set a Host before starting the scan");
                 return;
             }
-            match crate::scanner::collect_from_cidrs(&cidrs, app.config.sample_per_cidr) {
+            let targets = if let Some(targets) = exact_targets {
+                Ok(targets)
+            } else if app.preview_targets.is_empty() {
+                crate::scanner::collect_from_cidrs_with_seed(
+                    &cidrs,
+                    app.config.sample_per_cidr,
+                    app.scan_seed,
+                )
+            } else {
+                Ok(app.preview_targets.clone())
+            };
+            match targets {
                 Ok(targets) => {
                     let total = targets.len();
                     let scan_config = Arc::new(AppConfig {
@@ -936,12 +1172,14 @@ pub fn run_tui(
                         timeout_ms: app.config.timeout_ms,
                         connect_timeout_ms: app.config.connect_timeout_ms,
                         top: app.config.top,
+                        seed: app.config.seed,
                         download_path: app.config.download_path.clone(),
                         upload_path: app.config.upload_path.clone(),
                         speed_payload_bytes: app.config.speed_payload_bytes,
                         speed_repetitions: app.config.speed_repetitions,
                         speed_timeout_ms: app.config.speed_timeout_ms,
                     });
+                    app.set_scan_targets(targets.clone());
                     *scanner = Some(spawn_scanner(targets, scan_config));
                     app.begin_scan(total);
                 }
@@ -1029,6 +1267,12 @@ pub fn run_tui(
                 app.last_tp_instant = Instant::now();
             }
 
+            if app.screen == Screen::Wizard
+                && app.wizard_step == WizardStep::Review
+                && app.preview_targets.is_empty()
+            {
+                app.refresh_preview();
+            }
             terminal.draw(|f| app.render(f))?;
 
             if event::poll(Duration::from_millis(100))? {
@@ -1163,6 +1407,12 @@ impl App {
         if self.show_result_details {
             match code {
                 KeyCode::Esc | KeyCode::Char('q') => self.show_result_details = false,
+                KeyCode::Tab => self.detail_tab = (self.detail_tab + 1) % 5,
+                KeyCode::Char('1') => self.detail_tab = 0,
+                KeyCode::Char('2') => self.detail_tab = 1,
+                KeyCode::Char('3') => self.detail_tab = 2,
+                KeyCode::Char('4') => self.detail_tab = 3,
+                KeyCode::Char('5') => self.detail_tab = 4,
                 KeyCode::Char('c') => self.activate_action(Action::CopyIp),
                 KeyCode::Char('e') => self.activate_action(Action::Export),
                 KeyCode::Char('t') if self.scan_complete => {
@@ -1171,6 +1421,11 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+
+        if self.screen == Screen::SpeedSelect && self.speed_search_mode {
+            self.handle_speed_select_key(code);
             return;
         }
 
@@ -1191,6 +1446,10 @@ impl App {
         match code {
             KeyCode::Char('?') => {
                 self.show_help = !self.show_help;
+                return;
+            }
+            KeyCode::Char('/') if self.screen == Screen::SpeedSelect => {
+                self.speed_search_mode = true;
                 return;
             }
             KeyCode::Char('/') => {
@@ -1301,6 +1560,8 @@ impl App {
         self.table_col_bounds.clear();
         self.table_col_indices.clear();
         self.speed_list_inner = None;
+        self.speed_table_header = None;
+        self.speed_table_col_bounds.clear();
 
         match self.screen {
             Screen::Wizard => wizard::render(self, frame, frame.area()),
@@ -1330,10 +1591,10 @@ impl App {
         }
     }
 
-    fn render_column_picker(&self, frame: &mut Frame, area: Rect) {
+    fn render_column_picker(&mut self, frame: &mut Frame, area: Rect) {
         let popup = centered(area, 56, 46);
         let inner = widgets::modal(frame, area, popup, " Result columns ");
-        let lines = dashboard::RESULT_COLUMNS
+        let items = dashboard::RESULT_COLUMNS
             .iter()
             .enumerate()
             .map(|(index, name)| {
@@ -1347,14 +1608,26 @@ impl App {
                 } else {
                     ratatui::style::Style::default()
                 };
-                Line::from(format!(" {marker} {name:<8}")).style(style)
+                ratatui::widgets::ListItem::new(
+                    Line::from(format!(" {marker} {name:<8}")).style(style),
+                )
             })
             .collect::<Vec<_>>();
         let body = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(1), Constraint::Length(2)])
             .split(inner);
-        frame.render_widget(Paragraph::new(lines), body[0]);
+        self.column_picker_list_state = self
+            .column_picker_list_state
+            .with_offset(0)
+            .with_selected(Some(self.column_picker_cursor));
+        frame.render_stateful_widget(
+            ratatui::widgets::List::new(items)
+                .highlight_style(theme::row_selected_style())
+                .highlight_symbol("› "),
+            body[0],
+            &mut self.column_picker_list_state,
+        );
         frame.render_widget(
             Paragraph::new("↑/↓ move • Space toggle • Esc close").style(theme::hint_style()),
             body[1],
@@ -1370,26 +1643,26 @@ impl App {
         let start = self
             .command_cursor
             .saturating_sub(visible.saturating_sub(1));
-        let list = actions
+        let items = actions
             .iter()
             .enumerate()
-            .skip(start)
-            .take(visible)
             .map(|(i, action)| {
                 let style = if i == self.command_cursor {
                     theme::row_selected_style()
                 } else {
                     ratatui::style::Style::default()
                 };
-                Line::from(vec![
-                    Span::styled(format!(" {:<24}", action.label()), style),
-                    Span::styled(
-                        format!(" {:<6}", action.shortcut()),
-                        theme::highlight_style(),
-                    ),
-                    Span::styled(action.description(), theme::hint_style()),
-                ])
-                .style(style)
+                ratatui::widgets::ListItem::new(
+                    Line::from(vec![
+                        Span::styled(format!(" {:<24}", action.label()), style),
+                        Span::styled(
+                            format!(" {:<6}", action.shortcut()),
+                            theme::highlight_style(),
+                        ),
+                        Span::styled(action.description(), theme::hint_style()),
+                    ])
+                    .style(style),
+                )
             })
             .collect::<Vec<_>>();
         let chunks = Layout::default()
@@ -1404,7 +1677,18 @@ impl App {
             Paragraph::new(format!(" /{}", self.command_query)).style(theme::title_style()),
             chunks[0],
         );
-        frame.render_widget(Paragraph::new(list), chunks[1]);
+        self.command_list_state = self.command_list_state.with_offset(start).with_selected(
+            actions
+                .get(self.command_cursor)
+                .map(|_| self.command_cursor),
+        );
+        frame.render_stateful_widget(
+            ratatui::widgets::List::new(items)
+                .highlight_style(theme::row_selected_style())
+                .highlight_symbol("› "),
+            chunks[1],
+            &mut self.command_list_state,
+        );
         frame.render_widget(
             Paragraph::new("↑/↓ navigate • Enter run • Esc close").style(theme::hint_style()),
             chunks[2],
@@ -1414,10 +1698,22 @@ impl App {
     fn render_speed_confirm(&mut self, frame: &mut Frame, area: Rect) {
         let popup = centered(area, 58, 32);
         let inner = widgets::modal(frame, area, popup, " Start bandwidth test? ");
+        let directions = match self.speed_direction {
+            SpeedDirection::Download | SpeedDirection::Upload => 1,
+            SpeedDirection::Both => 2,
+        } as u64;
+        let estimated_bytes = self.speed_selected.len() as u64
+            * self.config.speed_payload_bytes
+            * directions
+            * self.config.speed_repetitions as u64;
         let lines = vec![
             Line::from(Span::styled(
                 format!("{} IPs selected", self.speed_selected.len()),
                 theme::title_style(),
+            )),
+            Line::from(format!(
+                "Estimated minimum transfer: {:.2} GB",
+                estimated_bytes as f64 / 1_000_000_000.0
             )),
             Line::from("This may transfer significant data."),
             Line::from("Enter / y to continue • Esc / n to cancel"),
@@ -1488,6 +1784,43 @@ impl App {
 
     fn handle_scan_key(&mut self, code: KeyCode) {
         match code {
+            KeyCode::Char('r') if self.scan_complete => {
+                if self.last_targets.is_empty() {
+                    self.toast_warn("No previous target manifest available");
+                } else {
+                    self.rescan_targets = Some(self.last_targets.clone());
+                    self.pending_start = true;
+                    self.toast_info("Re-running the identical target set");
+                }
+            }
+            KeyCode::Char('n') if self.scan_complete => {
+                let generated = if self.explicit_target_source.is_some() {
+                    self.regenerate_explicit_preview()
+                } else {
+                    self.regenerate_preview();
+                    !self.preview_targets.is_empty()
+                };
+                if generated {
+                    self.rescan_targets = Some(self.preview_targets.clone());
+                    self.pending_start = true;
+                }
+            }
+            KeyCode::Char('m') if self.scan_complete => {
+                self.export_comparison();
+            }
+            KeyCode::Char('f') => {
+                self.show_failures = !self.show_failures;
+                self.result_cursor = 0;
+                self.scroll = 0;
+                self.toast_kind(
+                    if self.show_failures {
+                        "Showing all targets, including failures"
+                    } else {
+                        "Showing successful targets"
+                    },
+                    ToastKind::Info,
+                );
+            }
             KeyCode::Char('v') => self.activate_action(Action::ConfigureColumns),
             KeyCode::Char('p') => self.activate_action(Action::PauseResume),
             KeyCode::Char('e') => self.activate_action(Action::Export),
@@ -1540,12 +1873,14 @@ impl App {
         self.speed_targets = self
             .results
             .iter()
-            .filter(|result| result.ok > 0)
             .map(|result| result.ip.clone())
             .collect();
-        self.speed_targets.sort();
         self.speed_selected.clear();
         self.speed_cursor = 0;
+        self.speed_query.clear();
+        self.speed_search_mode = false;
+        self.speed_sort_col = 2;
+        self.speed_sort_asc = true;
         self.speed_direction = SpeedDirection::Both;
         self.speed_results.clear();
         self.speed_complete = false;
@@ -1555,17 +1890,122 @@ impl App {
         self.screen = Screen::SpeedSelect;
     }
 
+    fn speed_status(result: &ProbeResult) -> &'static str {
+        if result.ok == 0 {
+            "FAILED"
+        } else if result.fail == 0 {
+            "READY"
+        } else {
+            "DEGRADED"
+        }
+    }
+
+    fn speed_optional_latency_cmp(a: Option<f64>, b: Option<f64>) -> std::cmp::Ordering {
+        match (a, b) {
+            (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    }
+
+    fn speed_visible_indices(&self) -> Vec<usize> {
+        let query = self.speed_query.to_ascii_lowercase();
+        let speed_targets: HashSet<&str> = self.speed_targets.iter().map(String::as_str).collect();
+        let mut indices: Vec<usize> = self
+            .results
+            .iter()
+            .enumerate()
+            .filter(|(_, result)| speed_targets.contains(result.ip.as_str()))
+            .filter(|(_, result)| {
+                query.is_empty()
+                    || result.ip.to_ascii_lowercase().contains(&query)
+                    || result.protocol.to_ascii_lowercase().contains(&query)
+                    || Self::speed_status(result)
+                        .to_ascii_lowercase()
+                        .contains(&query)
+            })
+            .map(|(index, _)| index)
+            .collect();
+
+        indices.sort_by(|left, right| {
+            let a = &self.results[*left];
+            let b = &self.results[*right];
+            let ordering = match self.speed_sort_col {
+                0 => a.ip.cmp(&b.ip),
+                1 => Self::speed_status(a).cmp(Self::speed_status(b)),
+                2 => Self::speed_optional_latency_cmp(
+                    (a.ok > 0).then_some(a.avg),
+                    (b.ok > 0).then_some(b.avg),
+                ),
+                3 => Self::speed_optional_latency_cmp(
+                    (a.ok > 0).then_some(a.p95),
+                    (b.ok > 0).then_some(b.p95),
+                ),
+                4 => a.protocol.cmp(&b.protocol),
+                _ => std::cmp::Ordering::Equal,
+            };
+            let ordering = ordering
+                .then_with(|| a.protocol.cmp(&b.protocol))
+                .then_with(|| a.ip.cmp(&b.ip));
+            if self.speed_sort_asc {
+                ordering
+            } else {
+                ordering.reverse()
+            }
+        });
+        indices
+    }
+
     fn handle_speed_select_key(&mut self, code: KeyCode) {
+        if self.speed_search_mode {
+            match code {
+                KeyCode::Esc => {
+                    if self.speed_query.is_empty() {
+                        self.speed_search_mode = false;
+                    } else {
+                        self.speed_query.clear();
+                        self.speed_cursor = 0;
+                        self.scroll = 0;
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.speed_query.pop();
+                    self.speed_cursor = 0;
+                    self.scroll = 0;
+                }
+                KeyCode::Enter => self.speed_search_mode = false,
+                KeyCode::Char(c) => {
+                    self.speed_query.push(c);
+                    self.speed_cursor = 0;
+                    self.scroll = 0;
+                }
+                _ => {}
+            }
+            return;
+        }
         match code {
+            KeyCode::Char('/') => {
+                self.speed_search_mode = true;
+            }
             KeyCode::Char(' ') => {
-                if let Some(ip) = self.speed_targets.get(self.speed_cursor).cloned() {
-                    if !self.speed_selected.insert(ip.clone()) {
-                        self.speed_selected.remove(&ip);
+                if let Some(index) = self.speed_visible_indices().get(self.speed_cursor).copied() {
+                    let result = &self.results[index];
+                    if result.ok > 0 {
+                        let ip = result.ip.clone();
+                        if !self.speed_selected.insert(ip.clone()) {
+                            self.speed_selected.remove(&ip);
+                        }
                     }
                 }
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                self.speed_selected = self.speed_targets.iter().cloned().collect();
+                self.speed_selected = self
+                    .results
+                    .iter()
+                    .filter(|result| result.ok > 0)
+                    .map(|result| result.ip.clone())
+                    .collect();
             }
             KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.speed_selected.clear()
@@ -1578,14 +2018,15 @@ impl App {
             }
             KeyCode::Char('b') | KeyCode::Char('B') => self.speed_direction = SpeedDirection::Both,
             KeyCode::Up if self.speed_cursor > 0 => self.speed_cursor -= 1,
-            KeyCode::Down if self.speed_cursor + 1 < self.speed_targets.len() => {
+            KeyCode::Down if self.speed_cursor + 1 < self.speed_visible_indices().len() => {
                 self.speed_cursor += 1
             }
             KeyCode::PageUp => self.speed_cursor = self.speed_cursor.saturating_sub(10),
             KeyCode::PageDown => {
-                self.speed_cursor =
-                    (self.speed_cursor + 10).min(self.speed_targets.len().saturating_sub(1))
+                self.speed_cursor = (self.speed_cursor + 10)
+                    .min(self.speed_visible_indices().len().saturating_sub(1))
             }
+            KeyCode::Char('s') => self.speed_sort_asc = !self.speed_sort_asc,
             KeyCode::Enter => self.speed_select_activate_focused(),
             KeyCode::Esc => self.screen = Screen::Scanning,
             _ => {}
@@ -1600,7 +2041,14 @@ impl App {
             1 => self.speed_direction = SpeedDirection::Download,
             2 => self.speed_direction = SpeedDirection::Upload,
             3 => self.speed_direction = SpeedDirection::Both,
-            4 => self.speed_selected = self.speed_targets.iter().cloned().collect(),
+            4 => {
+                self.speed_selected = self
+                    .results
+                    .iter()
+                    .filter(|result| result.ok > 0)
+                    .map(|result| result.ip.clone())
+                    .collect()
+            }
             5 => self.speed_selected.clear(),
             7 => self.screen = Screen::Scanning,
             _ => {
@@ -1716,7 +2164,7 @@ impl App {
                     self.speed_result_cursor = (self.speed_result_cursor + 1).min(max);
                     self.scroll = self.scroll.max(self.speed_result_cursor);
                 } else if self.screen == Screen::SpeedSelect {
-                    let last = self.speed_targets.len().saturating_sub(1);
+                    let last = self.speed_visible_indices().len().saturating_sub(1);
                     self.speed_cursor = (self.speed_cursor + 1).min(last);
                 } else if self.wizard_step == WizardStep::Ranges && !self.custom_input_mode {
                     let last = self.cidr_candidates.len().saturating_sub(1);
@@ -1752,6 +2200,7 @@ impl App {
                                     if !self.custom_input_mode {
                                         self.cidr_candidates[idx].selected =
                                             !self.cidr_candidates[idx].selected;
+                                        self.invalidate_preview();
                                         self.save_config();
                                     }
                                 }
@@ -1786,13 +2235,42 @@ impl App {
                         }
                     }
                 } else if self.screen == Screen::SpeedSelect {
+                    if let Some(header) = self.speed_table_header {
+                        if point_in(header, p) {
+                            if let Some(column) = col_at(&self.speed_table_col_bounds, m.column) {
+                                let Some(sort_col) = (match column {
+                                    1 => Some(0),
+                                    2 => Some(1),
+                                    3 => Some(2),
+                                    4 => Some(3),
+                                    5 => Some(4),
+                                    _ => None,
+                                }) else {
+                                    return;
+                                };
+                                if sort_col == self.speed_sort_col {
+                                    self.speed_sort_asc = !self.speed_sort_asc;
+                                } else {
+                                    self.speed_sort_col = sort_col;
+                                    self.speed_sort_asc = true;
+                                }
+                                self.speed_cursor = 0;
+                                self.scroll = 0;
+                            }
+                            return;
+                        }
+                    }
                     if let Some(inner) = self.speed_list_inner {
                         if point_in(inner, p) {
-                            let idx = self.speed_list_start + (m.row - inner.y) as usize;
-                            if let Some(ip) = self.speed_targets.get(idx).cloned() {
-                                self.speed_cursor = idx;
-                                if !self.speed_selected.insert(ip.clone()) {
-                                    self.speed_selected.remove(&ip);
+                            let row = self.speed_list_start + (m.row - inner.y) as usize;
+                            if let Some(index) = self.speed_visible_indices().get(row).copied() {
+                                let result = &self.results[index];
+                                self.speed_cursor = row;
+                                if result.ok > 0 {
+                                    let ip = result.ip.clone();
+                                    if !self.speed_selected.insert(ip.clone()) {
+                                        self.speed_selected.remove(&ip);
+                                    }
                                 }
                             }
                         }
@@ -1851,7 +2329,12 @@ impl App {
             ButtonAction::ConfirmQuit => self.should_quit = true,
             ButtonAction::CancelQuit => self.confirm_quit = false,
             ButtonAction::SpeedAll => {
-                self.speed_selected = self.speed_targets.iter().cloned().collect();
+                self.speed_selected = self
+                    .results
+                    .iter()
+                    .filter(|result| result.ok > 0)
+                    .map(|result| result.ip.clone())
+                    .collect();
             }
             ButtonAction::SpeedClear => self.speed_selected.clear(),
             ButtonAction::SpeedDirDownload => self.speed_direction = SpeedDirection::Download,
@@ -1908,6 +2391,9 @@ mod tests {
             p95,
             max: p95,
             samples: vec![p95],
+            failures: Vec::new(),
+            success_rate: 1.0 / (1 + fail) as f64,
+            score: 1.0 / p95.max(0.001),
         }
     }
 
@@ -1968,6 +2454,62 @@ mod tests {
         app.show_help = false;
         app.confirm_quit = true;
         draw(&mut app, 120, 36);
+    }
+
+    #[test]
+    fn detail_tabs_and_visualizations_render_including_empty_samples() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(3);
+        app.show_failures = true;
+        let mut sampled = result("10.0.0.1", 0, 0.05);
+        sampled.samples = vec![0.04, 0.06, 0.05, 0.08];
+        app.add_result(sampled);
+        let mut empty = result("10.0.0.2", 2, 0.2);
+        empty.ok = 0;
+        empty.samples.clear();
+        app.add_result(empty);
+        app.scan_complete = true;
+        app.show_result_details = true;
+
+        for tab in 0..5 {
+            app.detail_tab = tab;
+            draw(&mut app, 120, 40);
+        }
+        app.result_cursor = 1;
+        app.detail_tab = 2;
+        draw(&mut app, 120, 40);
+    }
+
+    #[test]
+    fn list_widgets_track_selection_and_scroll_for_wizard_and_overlays() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.cursor = app.cidr_candidates.len().saturating_sub(1);
+        draw(&mut app, 120, 36);
+        assert_eq!(app.ranges_list_state.selected(), Some(app.cursor));
+        assert!(app.ranges_list_state.offset() <= app.cursor);
+
+        app.wizard_step = WizardStep::Settings;
+        app.cursor = 0;
+        draw(&mut app, 120, 36);
+        assert_eq!(app.settings_list_state.selected(), Some(1));
+
+        app.open_command_palette();
+        draw(&mut app, 120, 36);
+        assert_eq!(app.command_list_state.selected(), Some(0));
+
+        app.show_command_palette = false;
+        app.show_column_picker = true;
+        app.column_picker_cursor = 9;
+        draw(&mut app, 120, 36);
+        assert_eq!(app.column_picker_list_state.selected(), Some(9));
     }
 
     #[test]
@@ -2095,6 +2637,97 @@ mod tests {
         app.focus_index = 7;
         app.speed_select_activate_focused();
         assert_eq!(app.screen, Screen::Scanning);
+    }
+
+    #[test]
+    fn speed_selection_shows_failed_targets_but_select_all_excludes_them() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut failed = result("192.0.2.2", 1, 0.2);
+        failed.ok = 0;
+        failed.samples.clear();
+        app.results = vec![failed, result("192.0.2.1", 0, 0.03)];
+        app.open_speed_selection();
+
+        let visible = app.speed_visible_indices();
+        assert_eq!(visible.len(), 2);
+        assert_eq!(App::speed_status(&app.results[visible[0]]), "READY");
+        app.speed_cursor = 1;
+        app.handle_speed_select_key(KeyCode::Char(' '));
+        assert!(app.speed_selected.is_empty());
+        app.focus_index = 4;
+        app.speed_select_activate_focused();
+        assert_eq!(
+            app.speed_selected,
+            ["192.0.2.1".to_string()].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn speed_selection_filters_by_ip_status_and_protocol() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut failed = result("192.0.2.2", 1, 0.2);
+        failed.ok = 0;
+        failed.protocol = "h3".to_string();
+        app.results = vec![result("192.0.2.1", 0, 0.03), failed];
+        app.open_speed_selection();
+
+        app.speed_query = "192.0.2.2".to_string();
+        assert_eq!(app.speed_visible_indices().len(), 1);
+        app.speed_query = "failed".to_string();
+        assert_eq!(app.speed_visible_indices().len(), 1);
+        app.speed_query = "h3".to_string();
+        assert_eq!(app.speed_visible_indices().len(), 1);
+    }
+
+    #[test]
+    fn speed_selection_sorts_latency_then_protocol_then_ip() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut a = result("192.0.2.3", 0, 0.05);
+        a.protocol = "h3".to_string();
+        let mut b = result("192.0.2.1", 0, 0.05);
+        b.protocol = "h2".to_string();
+        let c = result("192.0.2.2", 0, 0.01);
+        app.results = vec![a, b, c];
+        app.open_speed_selection();
+
+        let ips = |app: &App| {
+            app.speed_visible_indices()
+                .into_iter()
+                .map(|index| app.results[index].ip.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ips(&app), vec!["192.0.2.2", "192.0.2.1", "192.0.2.3"]);
+        app.speed_sort_asc = false;
+        assert_eq!(ips(&app), vec!["192.0.2.3", "192.0.2.1", "192.0.2.2"]);
+    }
+
+    #[test]
+    fn speed_selection_keeps_selection_when_filtering_and_sorting() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.results = vec![result("192.0.2.1", 0, 0.03), result("192.0.2.2", 0, 0.01)];
+        app.open_speed_selection();
+        app.speed_selected.insert("192.0.2.1".to_string());
+        app.speed_query = "192.0.2.2".to_string();
+        app.speed_sort_asc = false;
+        assert!(app.speed_selected.contains("192.0.2.1"));
+        app.speed_query.clear();
+        assert!(app.speed_selected.contains("192.0.2.1"));
     }
 
     #[test]

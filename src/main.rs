@@ -29,6 +29,10 @@ pub struct Args {
     #[arg(long)]
     pub ips: Option<String>,
 
+    /// File containing the exact target list for a reproducible run
+    #[arg(long)]
+    pub targets_file: Option<String>,
+
     /// CIDR to sample. Can be repeated
     #[arg(long)]
     pub cidr: Vec<String>,
@@ -56,6 +60,30 @@ pub struct Args {
     /// Print only top N results
     #[arg(long)]
     pub top: Option<usize>,
+
+    /// Reproducible sampling seed
+    #[arg(long)]
+    pub seed: Option<u64>,
+
+    /// Output format in CLI mode
+    #[arg(long, default_value = "tsv", value_parser = ["tsv", "json", "ndjson"])]
+    pub format: String,
+
+    /// Write CLI results to a file instead of stdout
+    #[arg(long)]
+    pub output: Option<String>,
+
+    /// Minimum per-target probe success rate required for a healthy run
+    #[arg(long)]
+    pub min_success_rate: Option<f64>,
+
+    /// Maximum recommended p95 latency in milliseconds
+    #[arg(long)]
+    pub max_p95_ms: Option<f64>,
+
+    /// Exit with an error when no target meets the configured thresholds
+    #[arg(long)]
+    pub fail_if_no_healthy_target: bool,
 }
 
 fn main() -> Result<()> {
@@ -86,19 +114,52 @@ fn main() -> Result<()> {
     if let Some(top) = args.top {
         config.top = top;
     }
+    if let Some(seed) = args.seed {
+        config.seed = seed;
+    }
 
     normalize_config(&mut config);
 
-    if config.host.is_empty() && (args.cli || args.ips.is_some() || !args.cidr.is_empty()) {
+    if let Some(min) = args.min_success_rate {
+        if !min.is_finite() || !(0.0..=1.0).contains(&min) {
+            anyhow::bail!("--min-success-rate must be a finite value between 0.0 and 1.0");
+        }
+    }
+    if let Some(max) = args.max_p95_ms {
+        if !max.is_finite() || max < 0.0 {
+            anyhow::bail!("--max-p95-ms must be a finite, non-negative value");
+        }
+    }
+
+    if args.targets_file.is_some() && (args.ips.is_some() || !args.cidr.is_empty()) {
+        anyhow::bail!("--targets-file cannot be combined with --ips or --cidr");
+    }
+    if !args.cli && args.targets_file.is_some() {
+        anyhow::bail!("--targets-file requires --cli");
+    }
+    if config.host.is_empty()
+        && (args.cli || args.ips.is_some() || args.targets_file.is_some() || !args.cidr.is_empty())
+    {
         anyhow::bail!(
             "no host configured — pass --host <domain> or set a host in the TUI settings"
         );
     }
 
     if args.cli {
-        cli_mode(config, args.cidr, args.ips)
+        cli_mode(
+            config,
+            args.cidr,
+            args.ips,
+            args.targets_file,
+            &args.format,
+            args.output.as_deref(),
+            args.min_success_rate,
+            args.max_p95_ms,
+            args.fail_if_no_healthy_target,
+            args.seed,
+        )
     } else {
-        tui::run_tui(config, args.cidr, args.ips)
+        tui::run_tui(config, args.cidr, args.ips, args.seed)
     }
 }
 
@@ -114,8 +175,24 @@ fn normalize_config(config: &mut AppConfig) {
     }
 }
 
-fn cli_mode(config: AppConfig, cidr: Vec<String>, ips: Option<String>) -> Result<()> {
-    let targets = scanner::collect_targets(&config, &cidr, &ips)?;
+#[allow(clippy::too_many_arguments)]
+fn cli_mode(
+    config: AppConfig,
+    cidr: Vec<String>,
+    ips: Option<String>,
+    targets_file: Option<String>,
+    format: &str,
+    output: Option<&str>,
+    min_success_rate: Option<f64>,
+    max_p95_ms: Option<f64>,
+    fail_if_no_healthy_target: bool,
+    seed: Option<u64>,
+) -> Result<()> {
+    let targets = if let Some(path) = targets_file {
+        scanner::load_ip_manifest(&path)?
+    } else {
+        scanner::collect_targets_with_optional_seed(&config, &cidr, &ips, seed)?
+    };
     let total = targets.len();
 
     eprintln!(
@@ -135,7 +212,10 @@ fn cli_mode(config: AppConfig, cidr: Vec<String>, ips: Option<String>) -> Result
         Arc::new(AtomicBool::new(false)),
     ));
 
-    let mut results: Vec<scanner::ProbeResult> = rx.iter().filter(|r| r.ok > 0).collect();
+    // Keep fully failed targets in machine-readable output so callers can
+    // inspect their categorized diagnostics and distinguish them from targets
+    // that were never sampled.
+    let mut results: Vec<scanner::ProbeResult> = rx.iter().collect();
 
     results.sort_by(|a, b| {
         a.fail
@@ -145,30 +225,75 @@ fn cli_mode(config: AppConfig, cidr: Vec<String>, ips: Option<String>) -> Result
             .then_with(|| a.avg.partial_cmp(&b.avg).unwrap())
     });
 
-    println!("rank\tip\tprotocol\tok\tfail\tavg\tp50\tp90\tp95\tmax\tsamples");
+    results.sort_by(|a, b| {
+        b.success_rate
+            .partial_cmp(&a.success_rate)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                a.p95
+                    .partial_cmp(&b.p95)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                a.avg
+                    .partial_cmp(&b.avg)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    let healthy = results.iter().any(|result| {
+        result.ok > 0
+            && min_success_rate.is_none_or(|min| result.success_rate >= min)
+            && max_p95_ms.is_none_or(|max| result.p95 * 1000.0 <= max)
+    });
+    let health_error = fail_if_no_healthy_target && !healthy;
 
-    for (i, r) in results.iter().take(config.top).enumerate() {
-        let samples = r
-            .samples
+    let rows = results.iter().take(config.top).collect::<Vec<_>>();
+    let rendered = match format {
+        "json" => serde_json::to_string_pretty(&rows)?,
+        "ndjson" => rows
             .iter()
-            .map(|x| format!("{:.3}", x))
-            .collect::<Vec<_>>()
-            .join(",");
+            .map(serde_json::to_string)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .join("\n"),
+        _ => {
+            let mut text = String::from("rank\tip\tprotocol\tok\tfail\tsuccess_rate\tconfidence\tavg\tp50\tp90\tp95\tmax\tsamples\tfailures\n");
+            for (i, r) in rows.iter().enumerate() {
+                let samples = r
+                    .samples
+                    .iter()
+                    .map(|x| format!("{:.3}", x))
+                    .collect::<Vec<_>>()
+                    .join(",");
 
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}",
-            i + 1,
-            r.ip,
-            r.protocol,
-            r.ok,
-            r.fail,
-            r.avg,
-            r.p50,
-            r.p90,
-            r.p95,
-            r.max,
-            samples
-        );
+                text.push_str(&format!(
+                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\n",
+                    i + 1,
+                    r.ip,
+                    r.protocol,
+                    r.ok,
+                    r.fail,
+                    r.success_rate,
+                    scanner::result_confidence(r),
+                    r.avg,
+                    r.p50,
+                    r.p90,
+                    r.p95,
+                    r.max,
+                    samples,
+                    r.failures.join(",")
+                ));
+            }
+            text
+        }
+    };
+    if let Some(path) = output {
+        std::fs::write(path, rendered)?;
+    } else {
+        println!("{rendered}");
+    }
+
+    if health_error {
+        anyhow::bail!("no target met the configured health thresholds");
     }
 
     Ok(())

@@ -13,6 +13,8 @@ pub struct AppConfig {
     pub timeout_ms: u64,
     pub connect_timeout_ms: u64,
     pub top: usize,
+    #[serde(default)]
+    pub seed: u64,
     #[serde(default = "default_download_path")]
     pub download_path: String,
     #[serde(default = "default_upload_path")]
@@ -61,6 +63,7 @@ impl Default for AppConfig {
             timeout_ms: 2500,
             connect_timeout_ms: 1000,
             top: 50,
+            seed: 0,
             download_path: default_download_path(),
             upload_path: default_upload_path(),
             speed_payload_bytes: default_speed_payload_bytes(),

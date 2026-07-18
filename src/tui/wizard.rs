@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Wrap},
+    widgets::{List, ListItem, Paragraph, Wrap},
     Frame,
 };
 
@@ -168,7 +168,7 @@ impl SettingField {
             .clamp(1, self.max_value())
     }
 
-    /// Adjust this numeric field directly in the application config.
+    #[allow(dead_code)]
     fn nudge_config(&self, args: &mut AppConfig, direction: i64) {
         let value = self.value_string(args).parse::<i64>().unwrap_or(1);
         let value = self.nudged_value(value, direction);
@@ -378,25 +378,12 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
     let inner = list_block.inner(main_layout[0]);
     app.ranges_inner = Some(inner);
 
-    let visible = inner.height as usize;
-    let max_scroll = app.cidr_candidates.len().saturating_sub(visible);
-    if app.cursor < app.ranges_scroll {
-        app.ranges_scroll = app.cursor;
-    } else if app.cursor >= app.ranges_scroll.saturating_add(visible) {
-        app.ranges_scroll = app.cursor + 1 - visible;
-    }
-    app.ranges_scroll = app.ranges_scroll.min(max_scroll);
-    let start = app.ranges_scroll;
-
-    let lines: Vec<Line> = app
+    let items: Vec<ListItem> = app
         .cidr_candidates
         .iter()
         .enumerate()
-        .skip(start)
-        .take(visible)
         .map(|(i, e)| {
             let mark = if e.selected { "☑" } else { "☐" };
-            let cursor = if i == app.cursor { "› " } else { "  " };
             let style = if i == app.cursor {
                 theme::row_selected_style()
             } else if e.selected {
@@ -404,12 +391,22 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
             } else {
                 theme::hint_style()
             };
-            Line::from(format!("{}{} {}", cursor, mark, e.cidr)).style(style)
+            ListItem::new(Line::from(format!("{} {}", mark, e.cidr)).style(style))
         })
         .collect();
-
-    let para = Paragraph::new(lines).block(list_block);
-    frame.render_widget(para, main_layout[0]);
+    app.ranges_list_state = app
+        .ranges_list_state
+        .with_offset(app.ranges_scroll)
+        .with_selected((!app.cidr_candidates.is_empty()).then_some(app.cursor));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(list_block)
+            .highlight_style(theme::row_selected_style())
+            .highlight_symbol("› "),
+        main_layout[0],
+        &mut app.ranges_list_state,
+    );
+    app.ranges_scroll = app.ranges_list_state.offset();
 
     // Right Side Info Panel
     let selected_count = app.cidr_candidates.iter().filter(|e| e.selected).count();
@@ -570,7 +567,6 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         for _ in 0..count {
             let i = field_idx;
             let f = SettingField::ALL[i];
-            let cursor = if i == app.cursor { "› " } else { "  " };
             let style = if i == app.cursor {
                 theme::row_selected_style()
             } else {
@@ -585,30 +581,30 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
                 f.value_string(&app.config)
             };
             let label = format!("{:20}", f.label());
-            lines.push(Line::from(format!("{}{} = {}", cursor, label, value)).style(style));
+            lines.push(Line::from(format!("{} = {}", label, value)).style(style));
             row_map.push(Some(i));
             field_idx += 1;
         }
     }
 
-    let visible = inner.height as usize;
-    let cursor_row = row_map
-        .iter()
-        .position(|field| *field == Some(app.cursor))
-        .unwrap_or(0);
-    let max_scroll = lines.len().saturating_sub(visible);
-    if cursor_row < app.settings_scroll {
-        app.settings_scroll = cursor_row;
-    } else if visible > 0 && cursor_row >= app.settings_scroll + visible {
-        app.settings_scroll = cursor_row + 1 - visible;
-    }
-    app.settings_scroll = app.settings_scroll.min(max_scroll);
-    let start = app.settings_scroll.min(lines.len());
-    let end = (start + visible).min(lines.len());
+    let items = lines.into_iter().map(ListItem::new).collect::<Vec<_>>();
+    let selected_row = row_map.iter().position(|field| *field == Some(app.cursor));
+    app.settings_list_state = app
+        .settings_list_state
+        .with_offset(app.settings_scroll)
+        .with_selected(selected_row);
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(block)
+            .highlight_style(theme::row_selected_style())
+            .highlight_symbol("› "),
+        main_layout[0],
+        &mut app.settings_list_state,
+    );
+    app.settings_scroll = app.settings_list_state.offset();
+    let start = app.settings_scroll.min(row_map.len());
+    let end = (start + inner.height as usize).min(row_map.len());
     app.settings_row_map = row_map[start..end].to_vec();
-
-    let para = Paragraph::new(lines[start..end].to_vec()).block(block);
-    frame.render_widget(para, main_layout[0]);
 
     // Right Side Description Panel
     let current_field = SettingField::ALL[app.cursor.min(SettingField::ALL.len() - 1)];
@@ -644,16 +640,21 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     frame.render_widget(desc_widget, main_layout[1]);
 }
 
-fn render_review(app: &App, frame: &mut Frame, area: Rect) {
-    let selected: Vec<&str> = app
+fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
+    let selected: Vec<String> = app
         .cidr_candidates
         .iter()
         .filter(|e| e.selected)
-        .map(|e| e.cidr.as_str())
+        .map(|e| e.cidr.clone())
         .collect();
 
     let selected_count = selected.len();
-    let total_ips = selected_count.saturating_mul(app.config.sample_per_cidr);
+    let preview_ready = !app.preview_targets.is_empty();
+    let total_ips = if app.preview_targets.is_empty() {
+        selected_count.saturating_mul(app.config.sample_per_cidr)
+    } else {
+        app.preview_targets.len()
+    };
     let total_probes = total_ips.saturating_mul(app.config.probes);
 
     // Ideal scan duration estimate
@@ -749,6 +750,27 @@ fn render_review(app: &App, frame: &mut Frame, area: Rect) {
             Span::styled("Est Duration: ", theme::title_style()),
             Span::raw(format!("~{}", est_duration_str)),
         ]),
+        Line::from(vec![
+            Span::styled("Seed        : ", theme::title_style()),
+            Span::raw(app.scan_seed.to_string()),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            if !preview_ready {
+                "Unavailable: target preview could not be generated"
+            } else if app.config.concurrency > 500 {
+                "Warning: very high concurrency may trigger rate limits"
+            } else if total_ips > 10_000 {
+                "Warning: large target set; this scan may take significant time"
+            } else {
+                "Ready: sampled targets are stable for this review"
+            },
+            if !preview_ready || app.config.concurrency > 500 || total_ips > 10_000 {
+                theme::warn_style()
+            } else {
+                theme::good_style()
+            },
+        )),
     ];
 
     let block_left = widgets::panel_block("Target configuration", false);
@@ -848,6 +870,8 @@ fn render_hint(app: &App, frame: &mut Frame, area: Rect) {
         WizardStep::Review => &[
             ("Tab", "focus"),
             ("↵", "start"),
+            ("s", "new sample"),
+            ("c", "save targets"),
             ("Esc", "back"),
             ("/", "commands"),
             ("?", "help"),
@@ -895,6 +919,7 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
                             app.cursor = app.cidr_candidates.len() - 1;
                             app.toast_success(format!("Added {s}"));
                         }
+                        app.invalidate_preview();
                         app.input_buffer.clear();
                         app.edit_caret = 0;
                         app.custom_input_mode = false;
@@ -947,6 +972,7 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
         KeyCode::Char(' ') => {
             if let Some(e) = app.cidr_candidates.get_mut(app.cursor) {
                 e.selected = !e.selected;
+                app.invalidate_preview();
                 app.save_config();
             }
         }
@@ -959,12 +985,14 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
             for e in app.cidr_candidates.iter_mut() {
                 e.selected = true;
             }
+            app.invalidate_preview();
             app.save_config();
         }
         KeyCode::Char('N') | KeyCode::Char('n') | KeyCode::Char('d') | KeyCode::Char('D') => {
             for e in app.cidr_candidates.iter_mut() {
                 e.selected = false;
             }
+            app.invalidate_preview();
             app.save_config();
         }
         KeyCode::Char('c') => {
@@ -1078,6 +1106,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             app.config.timeout_ms = 2500;
             app.config.connect_timeout_ms = 1000;
             app.config.top = 50;
+            app.invalidate_preview();
             app.toast_success("Preset Applied: Default");
             app.save_config();
         }
@@ -1088,6 +1117,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             app.config.timeout_ms = 1500;
             app.config.connect_timeout_ms = 500;
             app.config.top = 25;
+            app.invalidate_preview();
             app.toast_success("Preset Applied: Fast Scan");
             app.save_config();
         }
@@ -1098,6 +1128,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             app.config.timeout_ms = 3500;
             app.config.connect_timeout_ms = 1500;
             app.config.top = 100;
+            app.invalidate_preview();
             app.toast_success("Preset Applied: Thorough Scan");
             app.save_config();
         }
@@ -1108,6 +1139,8 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
 
 fn handle_review_key(app: &mut App, code: KeyCode) {
     match code {
+        KeyCode::Char('s') => app.regenerate_preview(),
+        KeyCode::Char('c') => app.save_target_manifest(),
         KeyCode::Enter => match app.focus_index {
             1 => {
                 app.wizard_step = WizardStep::Settings;
@@ -1139,6 +1172,7 @@ impl App {
                 self.edit_field = None;
                 self.edit_buffer.clear();
                 self.edit_caret = 0;
+                self.invalidate_preview();
                 self.save_config();
                 true
             }
@@ -1209,9 +1243,7 @@ fn next_char_boundary(s: &str, index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        handle_settings_key, next_char_boundary, previous_char_boundary, SettingField,
-    };
+    use super::{handle_settings_key, next_char_boundary, previous_char_boundary, SettingField};
     use crate::config::AppConfig;
     use crate::tui::App;
     use std::sync::{atomic::AtomicBool, Arc};
