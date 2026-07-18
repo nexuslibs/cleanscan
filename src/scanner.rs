@@ -306,6 +306,9 @@ async fn probe_once(client: &Client, url: &str) -> Result<(f64, String, Option<S
         _ => "unknown",
     };
 
+    // Capture latency immediately after headers are received, before reading body.
+    let latency = start.elapsed().as_secs_f64();
+
     // Read the full body so keep-alive connections can be reused, and to
     // extract the Cloudflare datacenter code from `/cdn-cgi/trace`.
     let body = resp
@@ -314,7 +317,7 @@ async fn probe_once(client: &Client, url: &str) -> Result<(f64, String, Option<S
         .map_err(|_| "body read failure".to_string())?;
     let colo = parse_colo(&body);
 
-    Ok((start.elapsed().as_secs_f64(), protocol.to_string(), colo))
+    Ok((latency, protocol.to_string(), colo))
 }
 
 /// Extract the Cloudflare `colo=` code from a `/cdn-cgi/trace` response body.

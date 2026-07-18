@@ -823,24 +823,22 @@ impl App {
             let (a, b) = (*a, *b);
             let ord = match self.sort_col {
                 1 => a.ip.cmp(&b.ip),
-                2 => a.ok.cmp(&b.ok),
-                3 => a
-                    .success_rate
-                    .partial_cmp(&b.success_rate)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                4 => a
+                2 => a.protocol.cmp(&b.protocol),
+                3 => a.ok.cmp(&b.ok),
+                4 => a.fail.cmp(&b.fail),
+                5 => a
                     .avg
                     .partial_cmp(&b.avg)
                     .unwrap_or(std::cmp::Ordering::Equal),
-                5 => a
+                6 => a
                     .p50
                     .partial_cmp(&b.p50)
                     .unwrap_or(std::cmp::Ordering::Equal),
-                6 => a
+                7 => a
                     .p90
                     .partial_cmp(&b.p90)
                     .unwrap_or(std::cmp::Ordering::Equal),
-                7 => a
+                8 => a
                     .p95
                     .partial_cmp(&b.p95)
                     .unwrap_or(std::cmp::Ordering::Equal),
@@ -1379,7 +1377,7 @@ impl App {
                 KeyCode::Up => {
                     self.column_picker_cursor = self.column_picker_cursor.saturating_sub(1)
                 }
-                KeyCode::Down => self.column_picker_cursor = (self.column_picker_cursor + 1).min(9),
+                KeyCode::Down => self.column_picker_cursor = (self.column_picker_cursor + 1).min(10),
                 KeyCode::Char(' ') | KeyCode::Enter => self.toggle_column(),
                 _ => {}
             }
@@ -1554,7 +1552,7 @@ impl App {
             Action::ConfigureColumns => {
                 if self.screen == Screen::Scanning {
                     self.show_column_picker = true;
-                    self.column_picker_cursor = self.column_picker_cursor.min(9);
+                    self.column_picker_cursor = self.column_picker_cursor.min(10);
                 }
             }
             Action::Confirm => {
