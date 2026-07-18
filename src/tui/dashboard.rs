@@ -285,6 +285,7 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
     app.scroll = app
         .scroll
         .max(app.result_cursor.saturating_sub(visible.saturating_sub(1)))
+        .min(app.result_cursor)
         .min(max_start);
 
     let sorted = app.sorted_results();

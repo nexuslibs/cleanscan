@@ -162,6 +162,7 @@ fn render_results(app: &mut App, frame: &mut Frame, area: Rect) {
             app.speed_result_cursor
                 .saturating_sub(visible.saturating_sub(1)),
         )
+        .min(app.speed_result_cursor)
         .min(max_scroll);
     let header = Row::new(vec![
         Cell::from("IP"),

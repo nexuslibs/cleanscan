@@ -957,8 +957,14 @@ impl App {
         match m.kind {
             MouseEventKind::ScrollUp => {
                 if self.screen == Screen::Scanning {
-                    if self.scroll > 0 {
-                        self.scroll -= 1;
+                    if self.result_cursor > 0 {
+                        self.result_cursor -= 1;
+                        self.scroll = self.scroll.min(self.result_cursor);
+                    }
+                } else if self.screen == Screen::SpeedResults {
+                    if self.speed_result_cursor > 0 {
+                        self.speed_result_cursor -= 1;
+                        self.scroll = self.scroll.min(self.speed_result_cursor);
                     }
                 } else if self.wizard_step == WizardStep::Ranges && !self.custom_input_mode {
                     if self.cursor > 0 {
@@ -973,7 +979,17 @@ impl App {
             }
             MouseEventKind::ScrollDown => {
                 if self.screen == Screen::Scanning {
-                    self.scroll += 1;
+                    let max = self
+                        .sorted_results()
+                        .len()
+                        .min(self.config.top)
+                        .saturating_sub(1);
+                    self.result_cursor = (self.result_cursor + 1).min(max);
+                    self.scroll = self.scroll.max(self.result_cursor);
+                } else if self.screen == Screen::SpeedResults {
+                    let max = self.speed_results.len().saturating_sub(1);
+                    self.speed_result_cursor = (self.speed_result_cursor + 1).min(max);
+                    self.scroll = self.scroll.max(self.speed_result_cursor);
                 } else if self.wizard_step == WizardStep::Ranges && !self.custom_input_mode {
                     let last = self.cidr_candidates.len().saturating_sub(1);
                     if self.cursor < last {
