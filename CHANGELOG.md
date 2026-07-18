@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.0](https://github.com/nexuslibs/cleanscan/compare/v0.1.3...v0.2.0) (2026-07-18)
+
+
+### Features
+
+* prioritize successful IP probes ([90d4ce4](https://github.com/nexuslibs/cleanscan/commit/90d4ce4f0c8955ac11b9953763aaed3565485824))
+* prioritize successful IP probes ([37c4d88](https://github.com/nexuslibs/cleanscan/commit/37c4d8894118cc1b80fec57d9f44a9241359594c))
+
 ## [0.1.3](https://github.com/nexuslibs/cleanscan/compare/v0.1.2...v0.1.3) (2026-07-18)
 
 
