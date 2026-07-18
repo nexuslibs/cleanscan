@@ -1209,9 +1209,7 @@ fn next_char_boundary(s: &str, index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        handle_settings_key, next_char_boundary, previous_char_boundary, SettingField,
-    };
+    use super::{handle_settings_key, next_char_boundary, previous_char_boundary, SettingField};
     use crate::config::AppConfig;
     use crate::tui::App;
     use std::sync::{atomic::AtomicBool, Arc};
