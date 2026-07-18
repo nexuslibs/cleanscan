@@ -270,7 +270,7 @@ impl App {
 
     /// Results sorted for display according to the active sort column.
     pub fn sorted_results(&self) -> Vec<&ProbeResult> {
-        let mut v: Vec<&ProbeResult> = self.results.iter().collect();
+        let mut v: Vec<&ProbeResult> = self.results.iter().filter(|r| r.ok > 0).collect();
         if self.sort_col == 0 {
             v.sort_by(|a, b| {
                 let ord = Self::natural_cmp(a, b);
@@ -406,7 +406,7 @@ impl App {
 }
 
 fn ranked_export_results(results: &[ProbeResult], top: usize) -> Vec<&ProbeResult> {
-    let mut ranked: Vec<&ProbeResult> = results.iter().filter(|r| r.fail == 0).collect();
+    let mut ranked: Vec<&ProbeResult> = results.iter().filter(|r| r.ok > 0).collect();
     ranked.sort_by(|a, b| App::natural_cmp(a, b));
     ranked.truncate(top);
     ranked
@@ -859,5 +859,17 @@ mod tests {
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].ip, "fast");
         assert_eq!(ranked[0].fail, 0);
+    }
+
+    #[test]
+    fn export_excludes_ips_with_no_successful_probes() {
+        let mut failed = result("failed", 1, 0.001);
+        failed.ok = 0;
+        failed.samples.clear();
+
+        let results = [failed, result("ok", 1, 0.1)];
+        let ranked = ranked_export_results(&results, 50);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].ip, "ok");
     }
 }

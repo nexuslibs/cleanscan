@@ -215,130 +215,127 @@ async fn probe_once(client: &Client, url: &str) -> Option<f64> {
     Some(start.elapsed().as_secs_f64())
 }
 
-async fn test_ip(
+struct TargetState {
     ip: String,
-    args: Arc<AppConfig>,
-    sem: Arc<Semaphore>,
-    cancel: Arc<AtomicBool>,
-    paused: Arc<AtomicBool>,
-) -> ProbeResult {
-    let url = format!("https://{}{}", args.host, args.path);
-    let client = match client_for_ip(&args.host, &ip, &args) {
-        Ok(c) => c,
-        Err(_) => {
-            return ProbeResult {
-                ip,
-                ok: 0,
-                fail: args.probes,
-                avg: 0.0,
-                p50: 0.0,
-                p90: 0.0,
-                p95: 0.0,
-                max: 0.0,
-                samples: Vec::new(),
-            };
-        }
-    };
+    url: String,
+    client: Option<Client>,
+    samples: Vec<f64>,
+    fail: usize,
+    scheduled: usize,
+    completed: usize,
+    in_flight: bool,
+}
 
-    let mut futs = FuturesUnordered::new();
-
-    for _ in 0..args.probes {
-        if cancel.load(Ordering::Relaxed) {
-            break;
-        }
-        while paused.load(Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
-        }
-        if cancel.load(Ordering::Relaxed) {
-            break;
-        }
-        // Wait for a probe permit, but stop if cancellation fires while queued.
-        let permit = tokio::select! {
-            biased;
-            p = sem.clone().acquire_owned() => p.unwrap(),
-            _ = async {
-                while !cancel.load(Ordering::Relaxed) {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            } => break,
+impl TargetState {
+    fn new(ip: String, args: &AppConfig, probe_count: usize) -> Self {
+        let url = format!("https://{}{}", args.host, args.path);
+        let client = client_for_ip(&args.host, &ip, args).ok();
+        let (fail, scheduled, completed) = if client.is_some() {
+            (0, 0, 0)
+        } else {
+            (probe_count, probe_count, probe_count)
         };
 
-        // Cancellation may have fired between requesting and obtaining the
-        // permit; drop it and stop scheduling without launching a request.
-        if cancel.load(Ordering::Relaxed) {
-            drop(permit);
-            break;
-        }
-
-        let c = client.clone();
-        let u = url.clone();
-
-        futs.push(tokio::spawn(async move {
-            let _permit = permit;
-            probe_once(&c, &u).await
-        }));
-    }
-
-    let mut samples = Vec::new();
-    let mut fail = 0usize;
-
-    let mut cancelled = false;
-    let cancellation = async {
-        while !cancel.load(Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    };
-    tokio::pin!(cancellation);
-    while !futs.is_empty() {
-        tokio::select! {
-            biased;
-            _ = &mut cancellation, if !cancelled => {
-                cancelled = true;
-                for task in futs.iter_mut() {
-                    task.abort();
-                }
-            }
-            joined = futs.next() => {
-                match joined {
-                    Some(Ok(Some(v))) => samples.push(v),
-                    Some(_) => fail += 1,
-                    None => break,
-                }
-            }
-        }
-        if cancelled {
-            while let Some(joined) = futs.next().await {
-                if joined.is_err() {
-                    fail += 1;
-                }
-            }
-            break;
+        Self {
+            ip,
+            url,
+            client,
+            samples: Vec::new(),
+            fail,
+            scheduled,
+            completed,
+            in_flight: false,
         }
     }
 
-    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-    let ok = samples.len();
-    let avg = if ok > 0 {
-        samples.iter().sum::<f64>() / ok as f64
-    } else {
-        0.0
-    };
-
-    ProbeResult {
-        ip,
-        ok,
-        fail,
-        avg,
-        p50: percentile(&samples, 0.50),
-        p90: percentile(&samples, 0.90),
-        p95: percentile(&samples, 0.95),
-        max: samples.last().copied().unwrap_or(0.0),
-        samples,
+    fn has_remaining_probe(&self, probe_count: usize) -> bool {
+        self.scheduled < probe_count && !self.in_flight
     }
+
+    fn result(&mut self) -> ProbeResult {
+        self.samples
+            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let ok = self.samples.len();
+        let avg = if ok > 0 {
+            self.samples.iter().sum::<f64>() / ok as f64
+        } else {
+            0.0
+        };
+
+        ProbeResult {
+            ip: self.ip.clone(),
+            ok,
+            fail: self.fail,
+            avg,
+            p50: percentile(&self.samples, 0.50),
+            p90: percentile(&self.samples, 0.90),
+            p95: percentile(&self.samples, 0.95),
+            max: self.samples.last().copied().unwrap_or(0.0),
+            samples: self.samples.clone(),
+        }
+    }
+}
+
+fn select_next_target(states: &[TargetState], probe_count: usize) -> Option<usize> {
+    states
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| state.has_remaining_probe(probe_count))
+        .min_by(|(left_index, left), (right_index, right)| {
+            let left_success = left.samples.len();
+            let right_success = right.samples.len();
+
+            let left_tier = if left_success > 0 {
+                0
+            } else if left.completed == 0 {
+                1
+            } else {
+                2
+            };
+            let right_tier = if right_success > 0 {
+                0
+            } else if right.completed == 0 {
+                1
+            } else {
+                2
+            };
+
+            left_tier
+                .cmp(&right_tier)
+                .then_with(|| {
+                    let left_rate = if left.completed == 0 {
+                        0.0
+                    } else {
+                        left_success as f64 / left.completed as f64
+                    };
+                    let right_rate = if right.completed == 0 {
+                        0.0
+                    } else {
+                        right_success as f64 / right.completed as f64
+                    };
+                    right_rate
+                        .partial_cmp(&left_rate)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| right_success.cmp(&left_success))
+                .then_with(|| {
+                    let left_avg = if left_success == 0 {
+                        f64::INFINITY
+                    } else {
+                        left.samples.iter().sum::<f64>() / left_success as f64
+                    };
+                    let right_avg = if right_success == 0 {
+                        f64::INFINITY
+                    } else {
+                        right.samples.iter().sum::<f64>() / right_success as f64
+                    };
+                    left_avg
+                        .partial_cmp(&right_avg)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then(left_index.cmp(right_index))
+        })
+        .map(|(index, _)| index)
 }
 
 /// Run the full scan over `targets`, sending each result through `tx`.
@@ -351,34 +348,123 @@ pub async fn run_scan(
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
 ) {
-    let sem = Arc::new(Semaphore::new(args.concurrency));
+    let sem = Arc::new(Semaphore::new(args.concurrency.max(1)));
 
-    // Bound how many targets are processed at once so queued targets and their
-    // per-target client state cannot grow with the full input. Probe-level
-    // concurrency stays limited by `sem` inside `test_ip`.
+    let probe_count = args.probes.max(1);
     let workers = args.concurrency.max(1);
+    let mut states: Vec<TargetState> = targets
+        .into_iter()
+        .map(|ip| TargetState::new(ip, &args, probe_count))
+        .collect();
+    let mut futs = FuturesUnordered::new();
 
-    futures::stream::iter(targets)
-        .for_each_concurrent(workers, |ip| {
-            let tx = tx.clone();
-            let args = args.clone();
+    for state in &mut states {
+        if state.completed == probe_count {
+            let _ = tx.send(state.result());
+        }
+    }
+
+    let mut cancellation = Box::pin(async {
+        while !cancel.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    });
+
+    loop {
+        while !cancel.load(Ordering::Relaxed) && futs.len() < workers {
+            while paused.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let Some(index) = select_next_target(&states, probe_count) else {
+                break;
+            };
+            let state = &mut states[index];
+            let client = state
+                .client
+                .as_ref()
+                .expect("targets without clients are completed during initialization")
+                .clone();
+            let url = state.url.clone();
+            state.scheduled += 1;
+            state.in_flight = true;
             let sem = sem.clone();
             let cancel = cancel.clone();
-            let paused = paused.clone();
-            async move {
-                if cancel.load(Ordering::Relaxed) {
-                    return;
+
+            futs.push(tokio::spawn(async move {
+                let permit = tokio::select! {
+                    biased;
+                    permit = sem.acquire_owned() => permit.ok(),
+                    _ = async {
+                        while !cancel.load(Ordering::Relaxed) {
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                    } => None,
+                };
+                let sample = match permit {
+                    Some(_permit) => probe_once(&client, &url).await,
+                    None => None,
+                };
+                (index, sample)
+            }));
+        }
+
+        if futs.is_empty() {
+            break;
+        }
+
+        tokio::select! {
+            biased;
+            _ = &mut cancellation => {
+                for task in futs.iter_mut() {
+                    task.abort();
                 }
-                let result = test_ip(ip, args, sem, cancel, paused).await;
-                let _ = tx.send(result);
+                while futs.next().await.is_some() {}
+                break;
             }
-        })
-        .await;
+            joined = futs.next() => {
+                let Some(Ok((index, sample))) = joined else { continue };
+                let state = &mut states[index];
+                state.in_flight = false;
+                state.completed += 1;
+                if let Some(value) = sample {
+                    state.samples.push(value);
+                } else {
+                    state.fail += 1;
+                }
+                if state.completed == probe_count {
+                    let _ = tx.send(state.result());
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::cidr_valid;
+    use super::{cidr_valid, select_next_target, TargetState};
+
+    fn state(
+        ip: &str,
+        completed: usize,
+        scheduled: usize,
+        samples: &[f64],
+        fail: usize,
+    ) -> TargetState {
+        TargetState {
+            ip: ip.to_string(),
+            url: String::new(),
+            client: None,
+            samples: samples.to_vec(),
+            fail,
+            scheduled,
+            completed,
+            in_flight: false,
+        }
+    }
 
     #[test]
     fn cidr_valid_accepts_bare_ipv4_and_ipv6() {
@@ -386,5 +472,44 @@ mod tests {
         assert_eq!(cidr_valid("2001:db8::1").unwrap().prefix_len(), 128);
         assert!(cidr_valid("192.0.2.0/24").is_ok());
         assert!(cidr_valid("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn successful_ip_is_prioritized_for_remaining_probes() {
+        let states = vec![
+            state("192.0.2.1", 1, 1, &[0.1], 0),
+            state("192.0.2.2", 0, 0, &[], 0),
+        ];
+
+        assert_eq!(select_next_target(&states, 3), Some(0));
+    }
+
+    #[test]
+    fn unexplored_ip_precedes_failed_ip() {
+        let states = vec![
+            state("192.0.2.1", 1, 1, &[], 1),
+            state("192.0.2.2", 0, 0, &[], 0),
+        ];
+
+        assert_eq!(select_next_target(&states, 3), Some(1));
+    }
+
+    #[test]
+    fn higher_success_rate_wins_within_successful_ips() {
+        let states = vec![
+            state("192.0.2.1", 2, 2, &[0.1], 1),
+            state("192.0.2.2", 1, 1, &[0.2], 0),
+        ];
+
+        assert_eq!(select_next_target(&states, 3), Some(1));
+    }
+
+    #[test]
+    fn in_flight_ip_is_not_selected_again() {
+        let mut in_flight = state("192.0.2.1", 0, 1, &[], 0);
+        in_flight.in_flight = true;
+        let states = vec![in_flight, state("192.0.2.2", 0, 0, &[], 0)];
+
+        assert_eq!(select_next_target(&states, 3), Some(1));
     }
 }

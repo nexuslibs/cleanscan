@@ -128,7 +128,7 @@ fn cli_mode(config: AppConfig, cidr: Vec<String>, ips: Option<String>) -> Result
         Arc::new(AtomicBool::new(false)),
     ));
 
-    let mut results: Vec<scanner::ProbeResult> = rx.iter().collect();
+    let mut results: Vec<scanner::ProbeResult> = rx.iter().filter(|r| r.ok > 0).collect();
 
     results.sort_by(|a, b| {
         a.fail
