@@ -235,7 +235,9 @@ pub struct App {
     pub sort_col: usize,
     pub sort_asc: bool,
     pub show_failures: bool,
-    pub result_column_visibility: [bool; 10],
+    pub colo_filter: Option<String>,
+    pub country_filter: Option<String>,
+    pub result_column_visibility: [bool; 12],
     pub column_picker_cursor: usize,
     pub start_time: Instant,
     /// Help overlay visibility.
@@ -457,7 +459,9 @@ impl App {
             sort_col: 0,
             sort_asc: true,
             show_failures: false,
-            result_column_visibility: [true; 10],
+            colo_filter: None,
+            country_filter: None,
+            result_column_visibility: [true; 12],
             column_picker_cursor: 0,
             start_time: Instant::now(),
             show_help: false,
@@ -798,6 +802,20 @@ impl App {
             .results
             .iter()
             .filter(|r| self.show_failures || r.ok > 0)
+            .filter(|r| match &self.colo_filter {
+                Some(want) => r
+                    .colo
+                    .as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(want)),
+                None => true,
+            })
+            .filter(|r| match &self.country_filter {
+                Some(want) => r
+                    .country
+                    .as_deref()
+                    .is_some_and(|c| c.to_lowercase().contains(&want.to_lowercase())),
+                None => true,
+            })
             .collect();
         if self.sort_col == 0 {
             v.sort_by(|a, b| {
@@ -814,31 +832,31 @@ impl App {
             let (a, b) = (*a, *b);
             let ord = match self.sort_col {
                 1 => a.ip.cmp(&b.ip),
-                2 => a.ok.cmp(&b.ok),
-                3 => a
-                    .success_rate
-                    .partial_cmp(&b.success_rate)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                4 => a
+                2 => a.protocol.cmp(&b.protocol),
+                3 => a.ok.cmp(&b.ok),
+                4 => a.fail.cmp(&b.fail),
+                5 => a
                     .avg
                     .partial_cmp(&b.avg)
                     .unwrap_or(std::cmp::Ordering::Equal),
-                5 => a
+                6 => a
                     .p50
                     .partial_cmp(&b.p50)
                     .unwrap_or(std::cmp::Ordering::Equal),
-                6 => a
+                7 => a
                     .p90
                     .partial_cmp(&b.p90)
                     .unwrap_or(std::cmp::Ordering::Equal),
-                7 => a
+                8 => a
                     .p95
                     .partial_cmp(&b.p95)
                     .unwrap_or(std::cmp::Ordering::Equal),
-                8 => a
+                9 => a
                     .max
                     .partial_cmp(&b.max)
                     .unwrap_or(std::cmp::Ordering::Equal),
+                10 => a.colo.cmp(&b.colo),
+                11 => a.country.cmp(&b.country),
                 _ => std::cmp::Ordering::Equal,
             };
             if self.sort_asc {
@@ -1178,6 +1196,7 @@ pub fn run_tui(
                         speed_payload_bytes: app.config.speed_payload_bytes,
                         speed_repetitions: app.config.speed_repetitions,
                         speed_timeout_ms: app.config.speed_timeout_ms,
+                        warmup: app.config.warmup,
                     });
                     app.set_scan_targets(targets.clone());
                     *scanner = Some(spawn_scanner(targets, scan_config));
@@ -1368,7 +1387,9 @@ impl App {
                 KeyCode::Up => {
                     self.column_picker_cursor = self.column_picker_cursor.saturating_sub(1)
                 }
-                KeyCode::Down => self.column_picker_cursor = (self.column_picker_cursor + 1).min(9),
+                KeyCode::Down => {
+                    self.column_picker_cursor = (self.column_picker_cursor + 1).min(11)
+                }
                 KeyCode::Char(' ') | KeyCode::Enter => self.toggle_column(),
                 _ => {}
             }
@@ -1386,6 +1407,35 @@ impl App {
                         .min(self.filtered_actions().len().saturating_sub(1));
                 }
                 KeyCode::Enter => {
+                    let query = self.command_query.trim();
+                    if let Some(code) = query.strip_prefix("colo:") {
+                        let code = code.trim();
+                        self.colo_filter = if code.is_empty() {
+                            None
+                        } else {
+                            Some(code.to_ascii_uppercase())
+                        };
+                        self.close_command_palette();
+                        match &self.colo_filter {
+                            Some(c) => self.toast_info(format!("Filtering by colo {c}")),
+                            None => self.toast_info("Colo filter cleared"),
+                        }
+                        return;
+                    }
+                    if let Some(code) = query.strip_prefix("country:") {
+                        let code = code.trim();
+                        self.country_filter = if code.is_empty() {
+                            None
+                        } else {
+                            Some(code.to_string())
+                        };
+                        self.close_command_palette();
+                        match &self.country_filter {
+                            Some(c) => self.toast_info(format!("Filtering by country {c}")),
+                            None => self.toast_info("Country filter cleared"),
+                        }
+                        return;
+                    }
                     if let Some(action) = self.selected_action() {
                         self.close_command_palette();
                         self.activate_action(action);
@@ -1528,7 +1578,7 @@ impl App {
             Action::ConfigureColumns => {
                 if self.screen == Screen::Scanning {
                     self.show_column_picker = true;
-                    self.column_picker_cursor = self.column_picker_cursor.min(9);
+                    self.column_picker_cursor = self.column_picker_cursor.min(11);
                 }
             }
             Action::Confirm => {
@@ -2394,6 +2444,9 @@ mod tests {
             failures: Vec::new(),
             success_rate: 1.0 / (1 + fail) as f64,
             score: 1.0 / p95.max(0.001),
+            colo: None,
+            country: None,
+            cold_ms: None,
         }
     }
 
@@ -2507,9 +2560,9 @@ mod tests {
 
         app.show_command_palette = false;
         app.show_column_picker = true;
-        app.column_picker_cursor = 9;
+        app.column_picker_cursor = 11;
         draw(&mut app, 120, 36);
-        assert_eq!(app.column_picker_list_state.selected(), Some(9));
+        assert_eq!(app.column_picker_list_state.selected(), Some(11));
     }
 
     #[test]
@@ -2728,6 +2781,66 @@ mod tests {
         assert!(app.speed_selected.contains("192.0.2.1"));
         app.speed_query.clear();
         assert!(app.speed_selected.contains("192.0.2.1"));
+    }
+
+    #[test]
+    fn location_filter_matches_colo_case_insensitively() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut a = result("10.0.0.1", 0, 0.1);
+        a.colo = Some("Fra".to_string());
+        let mut b = result("10.0.0.2", 0, 0.1);
+        b.colo = Some("gru".to_string());
+        app.results = vec![a, b];
+        app.colo_filter = Some("fra".to_string());
+        let ips: Vec<_> = app.sorted_results().iter().map(|r| r.ip.clone()).collect();
+        assert_eq!(ips, vec!["10.0.0.1"]);
+    }
+
+    #[test]
+    fn location_filter_matches_unicode_country_substring() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut a = result("10.0.0.1", 0, 0.1);
+        a.country = Some("Côte d'Ivoire".to_string());
+        let mut b = result("10.0.0.2", 0, 0.1);
+        b.country = Some("France".to_string());
+        app.results = vec![a, b];
+        // "CÔTE" (uppercase circumflex) must match "Côte d'Ivoire" case-insensitively.
+        app.country_filter = Some("CÔTE".to_string());
+        let ips: Vec<_> = app.sorted_results().iter().map(|r| r.ip.clone()).collect();
+        assert_eq!(ips, vec!["10.0.0.1"]);
+    }
+
+    #[test]
+    fn location_sort_by_colo_and_country() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut a = result("10.0.0.1", 0, 0.1);
+        a.colo = Some("gru".to_string());
+        a.country = Some("Brazil".to_string());
+        let mut b = result("10.0.0.2", 0, 0.1);
+        b.colo = Some("fra".to_string());
+        b.country = Some("Germany".to_string());
+        app.results = vec![a, b];
+        app.sort_asc = true;
+
+        app.sort_col = 10; // by colo
+        let mut ips: Vec<_> = app.sorted_results().iter().map(|r| r.ip.clone()).collect();
+        assert_eq!(ips, vec!["10.0.0.2", "10.0.0.1"]); // fra < gru
+
+        app.sort_col = 11; // by country
+        ips = app.sorted_results().iter().map(|r| r.ip.clone()).collect();
+        assert_eq!(ips, vec!["10.0.0.1", "10.0.0.2"]); // Brazil < Germany
     }
 
     #[test]

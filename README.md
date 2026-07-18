@@ -165,6 +165,12 @@ the TUI and are not edited in this screen.
 | `/`       | Open the command palette |
 | `?`       | Open contextual help (close with `?`, `Esc`, or `q`) |
 
+In the command palette, type `colo:FRA` (or any datacenter code) to narrow the
+results table to IPs in that Cloudflare colo; `colo:` with no code clears the
+filter. Type `country:Germany` (substring match) to narrow results to a country;
+`country:` with no code clears it. The `Colo` and `Country` columns are shown by
+default and can be toggled like any other result column.
+
 **Speed-test screen**
 
 After latency scanning completes, press `t` to select speed-test targets. The
@@ -207,6 +213,9 @@ latency dashboard.
 | `--min-success-rate`   | —                | Minimum per-target success rate threshold       |
 | `--max-p95-ms`         | —                | Maximum per-target p95 latency threshold        |
 | `--fail-if-no-healthy-target` | off         | Fail if no target meets thresholds              |
+| `--colo`                | —                | Only report IPs in the given Cloudflare datacenter (e.g. `FRA`) |
+| `--country`             | —                | Only report IPs in the given country (substring match, e.g. `Germany`) |
+| `--no-warmup`           | off              | Skip the warmup probe; the first measured probe includes connection setup, while later probes may reuse the connection |
 
 ## Output
 
@@ -216,8 +225,11 @@ unexplored IPs are preferred over IPs that have failed, and original order is
 used as a deterministic tie-breaker. CLI results are ranked by success rate
 (descending), then `p95` and average latency (ascending). Each row reports `ok`/`fail` counts and `avg`,
 `p50`, `p90`, `p95`, and `max` latency in seconds, followed by individual
-successful probe samples in the `samples` column. Only the top `N` rows are
-printed, where `N` is controlled by `--top`.
+successful probe samples in the `samples` column. The `colo` column shows the
+Cloudflare datacenter code parsed from `/cdn-cgi/trace` (when probing that
+path), and `cold_ms` reports the one-off TCP + TLS connection-establishment
+time captured by the warmup probe. Only the top `N` rows are printed, where `N`
+is controlled by `--top`.
 
 Completed scans show a decision summary with READY, DEGRADED, and FAILED
 counts, a recommended target, backups, success rate, p95 latency, and
@@ -236,9 +248,15 @@ successful results to a timestamped
 CIDR ranges are sampled randomly, so overlapping samples may produce fewer
 unique targets than `sample-per-cidr` suggests. Each probe is an HTTPS request
 to the configured host and path, using the candidate IP for the connection
-while retaining the hostname for TLS SNI and the Host header. Results are
-ranked by success rate first, then p95 and average latency; failures include
-categorized diagnostics in the details view and machine-readable output.
+while retaining the hostname for TLS SNI and the Host header. Before the
+counted latency probes, cleanscan sends one discarded warmup probe per IP so
+the TCP + TLS connection is established; the reported `avg`/`p50`/`p90`/`p95`/`max`
+latencies reflect steady-state RTT rather than connection-setup cost, and the
+one-off cold-request latency is reported separately as `cold_ms`. Pass
+`--no-warmup`, and the first measured probe includes connection setup while later
+probes may reuse the connection. Results are ranked by success rate
+first, then p95 and average latency; failures include categorized diagnostics
+in the details view and machine-readable output.
 
 Speed tests use the same direct-IP connection behavior. The default endpoints
 are `/speed-test/100mb.bin` for downloads and `/speed-test/upload` for uploads;

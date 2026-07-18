@@ -1,3 +1,4 @@
+mod colo;
 mod config;
 mod scanner;
 mod speed;
@@ -84,6 +85,18 @@ pub struct Args {
     /// Exit with an error when no target meets the configured thresholds
     #[arg(long)]
     pub fail_if_no_healthy_target: bool,
+
+    /// Only report IPs in the given Cloudflare datacenter (e.g. FRA)
+    #[arg(long)]
+    pub colo: Option<String>,
+
+    /// Only report IPs in the given country (substring match, e.g. "Germany")
+    #[arg(long)]
+    pub country: Option<String>,
+
+    /// Skip the connection-establishment warmup probe (first counted probe includes connection time)
+    #[arg(long)]
+    pub no_warmup: bool,
 }
 
 fn main() -> Result<()> {
@@ -116,6 +129,9 @@ fn main() -> Result<()> {
     }
     if let Some(seed) = args.seed {
         config.seed = seed;
+    }
+    if args.no_warmup {
+        config.warmup = false;
     }
 
     normalize_config(&mut config);
@@ -157,6 +173,8 @@ fn main() -> Result<()> {
             args.max_p95_ms,
             args.fail_if_no_healthy_target,
             args.seed,
+            args.colo,
+            args.country,
         )
     } else {
         tui::run_tui(config, args.cidr, args.ips, args.seed)
@@ -187,6 +205,8 @@ fn cli_mode(
     max_p95_ms: Option<f64>,
     fail_if_no_healthy_target: bool,
     seed: Option<u64>,
+    colo: Option<String>,
+    country: Option<String>,
 ) -> Result<()> {
     let targets = if let Some(path) = targets_file {
         scanner::load_ip_manifest(&path)?
@@ -216,6 +236,24 @@ fn cli_mode(
     // inspect their categorized diagnostics and distinguish them from targets
     // that were never sampled.
     let mut results: Vec<scanner::ProbeResult> = rx.iter().collect();
+
+    if let Some(colo) = &colo {
+        let want = colo.to_ascii_uppercase();
+        results.retain(|r| {
+            r.colo
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&want))
+        });
+    }
+
+    if let Some(country) = &country {
+        let want = country.to_lowercase();
+        results.retain(|r| {
+            r.country
+                .as_deref()
+                .is_some_and(|c| c.to_lowercase().contains(&want))
+        });
+    }
 
     results.sort_by(|a, b| {
         a.fail
@@ -256,7 +294,7 @@ fn cli_mode(
             .collect::<std::result::Result<Vec<_>, _>>()?
             .join("\n"),
         _ => {
-            let mut text = String::from("rank\tip\tprotocol\tok\tfail\tsuccess_rate\tconfidence\tavg\tp50\tp90\tp95\tmax\tsamples\tfailures\n");
+            let mut text = String::from("rank\tip\tcolo\tcountry\tprotocol\tok\tfail\tsuccess_rate\tconfidence\tavg\tp50\tp90\tp95\tmax\tcold_ms\tsamples\tfailures\n");
             for (i, r) in rows.iter().enumerate() {
                 let samples = r
                     .samples
@@ -266,9 +304,11 @@ fn cli_mode(
                     .join(",");
 
                 text.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\n",
                     i + 1,
                     r.ip,
+                    r.colo.clone().unwrap_or_default(),
+                    r.country.clone().unwrap_or_default(),
                     r.protocol,
                     r.ok,
                     r.fail,
@@ -279,6 +319,7 @@ fn cli_mode(
                     r.p90,
                     r.p95,
                     r.max,
+                    r.cold_ms.map(|ms| format!("{:.1}", ms)).unwrap_or_default(),
                     samples,
                     r.failures.join(",")
                 ));
@@ -303,6 +344,7 @@ fn cli_mode(
 mod tests {
     use super::normalize_config;
     use crate::config::AppConfig;
+    use crate::scanner;
 
     #[test]
     fn zero_numeric_values_are_normalized() {
@@ -316,5 +358,34 @@ mod tests {
         assert_eq!(config.sample_per_cidr, 1);
         assert_eq!(config.probes, 1);
         assert_eq!(config.concurrency, 1);
+    }
+
+    #[test]
+    fn country_filter_is_unicode_aware() {
+        let results = vec![scanner::ProbeResult {
+            ip: "198.41.0.4".to_string(),
+            protocol: "h2".to_string(),
+            ok: 1,
+            fail: 0,
+            avg: 0.0,
+            p50: 0.0,
+            p90: 0.0,
+            p95: 0.0,
+            max: 0.0,
+            samples: vec![0.0],
+            failures: Vec::new(),
+            success_rate: 1.0,
+            score: 1.0,
+            colo: Some("ABJ".to_string()),
+            country: Some("Côte d'Ivoire".to_string()),
+            cold_ms: None,
+        }];
+        let mut filtered = results.clone();
+        filtered.retain(|r| {
+            r.country
+                .as_deref()
+                .is_some_and(|c| c.to_lowercase().contains(&"CÔTE".to_lowercase()))
+        });
+        assert_eq!(filtered.len(), 1);
     }
 }

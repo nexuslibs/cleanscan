@@ -25,6 +25,11 @@ pub struct AppConfig {
     pub speed_repetitions: usize,
     #[serde(default = "default_speed_timeout_ms")]
     pub speed_timeout_ms: u64,
+    /// Send a discarded connection-establishment probe before the counted
+    /// latency probes so measured latency reflects steady-state RTT rather
+    /// than TCP + TLS handshake cost.
+    #[serde(default = "default_warmup")]
+    pub warmup: bool,
     pub custom_cidrs: Vec<String>,
     #[serde(default)]
     pub selected_cidrs: Vec<String>,
@@ -52,6 +57,10 @@ fn default_speed_timeout_ms() -> u64 {
     120_000
 }
 
+fn default_warmup() -> bool {
+    true
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -69,6 +78,7 @@ impl Default for AppConfig {
             speed_payload_bytes: default_speed_payload_bytes(),
             speed_repetitions: default_speed_repetitions(),
             speed_timeout_ms: default_speed_timeout_ms(),
+            warmup: default_warmup(),
             custom_cidrs: Vec::new(),
             selected_cidrs: crate::scanner::DEFAULT_CLOUDFLARE_CIDRS
                 .iter()

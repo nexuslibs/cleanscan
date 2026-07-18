@@ -53,6 +53,16 @@ pub struct ProbeResult {
     pub failures: Vec<String>,
     pub success_rate: f64,
     pub score: f64,
+    /// Cloudflare datacenter code (e.g. "FRA") parsed from `/cdn-cgi/trace`,
+    /// or `None` when the probed path does not expose it.
+    pub colo: Option<String>,
+    /// Country derived from `colo` via the embedded Cloudflare datacenter
+    /// mapping, or `None` when the code is unknown or no colo was captured.
+    pub country: Option<String>,
+    /// Round-trip time of the cold (first) request, which establishes the TCP +
+    /// TLS connection, captured separately from steady-state latency. `None`
+    /// when the warmup/first request failed or warmup is disabled.
+    pub cold_ms: Option<f64>,
 }
 
 pub fn result_status(result: &ProbeResult) -> &'static str {
@@ -260,7 +270,6 @@ fn client_for_ip(host: &str, ip: &str, args: &AppConfig) -> Result<Client> {
 
     let client = reqwest::Client::builder()
         .http2_adaptive_window(true)
-        .pool_max_idle_per_host(0)
         .resolve_to_addrs(host, &[socket])
         .connect_timeout(Duration::from_millis(args.connect_timeout_ms))
         .timeout(Duration::from_millis(args.timeout_ms))
@@ -269,7 +278,7 @@ fn client_for_ip(host: &str, ip: &str, args: &AppConfig) -> Result<Client> {
     Ok(client)
 }
 
-async fn probe_once(client: &Client, url: &str) -> Result<(f64, String), String> {
+async fn probe_once(client: &Client, url: &str) -> Result<(f64, String, Option<String>), String> {
     let start = Instant::now();
 
     let resp = client
@@ -300,7 +309,33 @@ async fn probe_once(client: &Client, url: &str) -> Result<(f64, String), String>
         _ => "unknown",
     };
 
-    Ok((start.elapsed().as_secs_f64(), protocol.to_string()))
+    // Capture latency immediately after headers are received, before reading body.
+    let latency = start.elapsed().as_secs_f64();
+
+    // Read the full body so keep-alive connections can be reused, and to
+    // extract the Cloudflare datacenter code from `/cdn-cgi/trace`.
+    let body = resp
+        .text()
+        .await
+        .map_err(|_| "body read failure".to_string())?;
+    let colo = parse_colo(&body);
+
+    Ok((latency, protocol.to_string(), colo))
+}
+
+/// Extract the Cloudflare `colo=` code from a `/cdn-cgi/trace` response body.
+/// The body is `key=value` lines; the field is absent for other paths.
+fn parse_colo(body: &str) -> Option<String> {
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("colo=") {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_ascii_uppercase());
+            }
+        }
+    }
+    None
 }
 
 struct TargetState {
@@ -314,6 +349,19 @@ struct TargetState {
     completed: usize,
     in_flight: bool,
     failures: Vec<String>,
+    /// Cloudflare datacenter code captured from the first successful probe.
+    colo: Option<String>,
+    /// Cold-request (TCP + TLS connection-establishment) round-trip time from
+    /// the warmup probe, captured separately from steady-state latency.
+    cold_ms: Option<f64>,
+    /// Whether the warmup probe has been dispatched and completed.
+    warmup_done: bool,
+    /// Whether a warmup probe is currently in flight.
+    warmup_in_flight: bool,
+    /// When the warmup probe failed, the first successful measured probe must
+    /// be discarded so its connection-setup cost is excluded from steady-state
+    /// latency and instead recorded as `cold_ms`.
+    warmup_discard_first: bool,
 }
 
 impl TargetState {
@@ -342,11 +390,16 @@ impl TargetState {
             } else {
                 vec!["invalid target/client setup".to_string(); probe_count]
             },
+            colo: None,
+            cold_ms: None,
+            warmup_done: !args.warmup || !client_ok,
+            warmup_in_flight: false,
+            warmup_discard_first: false,
         }
     }
 
     fn has_remaining_probe(&self, probe_count: usize) -> bool {
-        self.scheduled < probe_count && !self.in_flight
+        self.warmup_done && self.scheduled < probe_count && !self.in_flight
     }
 
     fn result(&mut self) -> ProbeResult {
@@ -382,6 +435,12 @@ impl TargetState {
             } else {
                 0.0
             },
+            colo: self.colo.clone(),
+            country: self
+                .colo
+                .as_ref()
+                .and_then(|code| crate::colo::lookup_country(code).map(str::to_string)),
+            cold_ms: self.cold_ms.map(|seconds| seconds * 1000.0),
         }
     }
 }
@@ -460,6 +519,19 @@ fn select_next_target(states: &[TargetState], probe_count: usize) -> Option<usiz
         .map(|(index, _)| index)
 }
 
+/// Outcome of a single scheduled probe: a discarded connection-warmup probe
+/// or a counted steady-state latency probe.
+enum ProbeOutcome {
+    Warmup {
+        index: usize,
+        sample: Result<(f64, String, Option<String>), String>,
+    },
+    Measured {
+        index: usize,
+        sample: Result<(f64, String, Option<String>), String>,
+    },
+}
+
 /// Run the full scan over `targets`, sending each result through `tx`.
 /// `cancel` stops scheduling new probes/targets, and `paused` halts probe
 /// scheduling until cleared.
@@ -501,6 +573,43 @@ pub async fn run_scan(
                 break;
             }
 
+            // Dispatch any pending warmup probes first so the TCP+TLS
+            // connection is established before steady-state probes run.
+            if args.warmup {
+                while futs.len() < workers {
+                    let warmup_index = states
+                        .iter()
+                        .position(|s| !s.warmup_done && !s.warmup_in_flight && !s.in_flight);
+                    let Some(index) = warmup_index else { break };
+                    let state = &mut states[index];
+                    let client = state
+                        .client
+                        .as_ref()
+                        .expect("targets without clients are completed during initialization")
+                        .clone();
+                    let url = state.url.clone();
+                    state.warmup_in_flight = true;
+                    let sem = sem.clone();
+                    let cancel = cancel.clone();
+                    futs.push(tokio::spawn(async move {
+                        let permit = tokio::select! {
+                            biased;
+                            permit = sem.acquire_owned() => permit.ok(),
+                            _ = async {
+                                while !cancel.load(Ordering::Relaxed) {
+                                    tokio::time::sleep(Duration::from_millis(25)).await;
+                                }
+                            } => None,
+                        };
+                        let sample = match permit {
+                            Some(_permit) => probe_once(&client, &url).await,
+                            None => Err("cancelled".to_string()),
+                        };
+                        ProbeOutcome::Warmup { index, sample }
+                    }));
+                }
+            }
+
             let Some(index) = select_next_target(&states, probe_count) else {
                 break;
             };
@@ -530,7 +639,7 @@ pub async fn run_scan(
                     Some(_permit) => probe_once(&client, &url).await,
                     None => Err("cancelled".to_string()),
                 };
-                (index, sample)
+                ProbeOutcome::Measured { index, sample }
             }));
         }
 
@@ -548,22 +657,62 @@ pub async fn run_scan(
                 break;
             }
             joined = futs.next() => {
-                let Some(Ok((index, sample))) = joined else { continue };
-                let state = &mut states[index];
-                state.in_flight = false;
-                state.completed += 1;
-                match sample {
-                    Ok((value, protocol)) => {
-                        state.samples.push(value);
-                        state.protocols.push(protocol);
+                let Some(Ok(outcome)) = joined else { continue };
+                match outcome {
+                    ProbeOutcome::Warmup { index, sample } => {
+                        let state = &mut states[index];
+                        state.warmup_in_flight = false;
+                        match sample {
+                            Ok((value, _protocol, colo)) => {
+                                state.warmup_done = true;
+                                state.cold_ms = Some(value);
+                                if state.colo.is_none() {
+                                    state.colo = colo;
+                                }
+                            }
+                            Err(_) => {
+                                // The warmup could not establish the connection,
+                                // so it is not ready for steady-state timing. End
+                                // the warmup phase but flag the first successful
+                                // measured probe to be discarded as the cold
+                                // request, keeping its setup cost out of latency.
+                                state.warmup_done = true;
+                                state.warmup_discard_first = true;
+                            }
+                        }
                     }
-                    Err(reason) => {
-                        state.fail += 1;
-                        state.failures.push(reason);
+                    ProbeOutcome::Measured { index, sample } => {
+                        let state = &mut states[index];
+                        state.in_flight = false;
+                        state.completed += 1;
+                        match sample {
+                            Ok((value, protocol, colo)) => {
+                                if state.warmup_discard_first {
+                                    // This first successful measured probe paid
+                                    // the connection-setup cost; record it as the
+                                    // cold request and exclude it from latency.
+                                    state.warmup_discard_first = false;
+                                    state.cold_ms = Some(value);
+                                    if state.colo.is_none() {
+                                        state.colo = colo;
+                                    }
+                                } else {
+                                    state.samples.push(value);
+                                    state.protocols.push(protocol);
+                                    if state.colo.is_none() {
+                                        state.colo = colo;
+                                    }
+                                }
+                            }
+                            Err(reason) => {
+                                state.fail += 1;
+                                state.failures.push(reason);
+                            }
+                        }
+                        if state.completed == probe_count {
+                            let _ = tx.send(state.result());
+                        }
                     }
-                }
-                if state.completed == probe_count {
-                    let _ = tx.send(state.result());
                 }
             }
         }
@@ -573,9 +722,10 @@ pub async fn run_scan(
 #[cfg(test)]
 mod tests {
     use super::{
-        cidr_valid, collect_from_cidrs_with_seed, result_confidence, result_status,
+        cidr_valid, collect_from_cidrs_with_seed, parse_colo, result_confidence, result_status,
         select_next_target, TargetState,
     };
+    use crate::config::AppConfig;
 
     fn state(
         ip: &str,
@@ -595,6 +745,11 @@ mod tests {
             completed,
             in_flight: false,
             failures: Vec::new(),
+            colo: None,
+            cold_ms: None,
+            warmup_done: true,
+            warmup_in_flight: false,
+            warmup_discard_first: false,
         }
     }
 
@@ -670,5 +825,72 @@ mod tests {
         assert_eq!(result_status(&result), "READY");
         assert_eq!(result_confidence(&result), "HIGH");
         assert_eq!(result.success_rate, 1.0);
+    }
+
+    #[test]
+    fn parse_colo_extracts_datacenter_code() {
+        let body = "fl=abc\nh=example.com\nip=1.2.3.4\ncolo=fra\nts=123\n";
+        assert_eq!(parse_colo(body), Some("FRA".to_string()));
+        assert_eq!(parse_colo("no colo here"), None);
+        assert_eq!(parse_colo("colo=\n"), None);
+    }
+
+    #[test]
+    fn warmup_done_reflects_config() {
+        let enabled = AppConfig {
+            warmup: true,
+            ..Default::default()
+        };
+        let disabled = AppConfig {
+            warmup: false,
+            ..Default::default()
+        };
+
+        let with_warmup = TargetState::new("192.0.2.1".to_string(), &enabled, 4);
+        let without_warmup = TargetState::new("192.0.2.1".to_string(), &disabled, 4);
+
+        assert!(!with_warmup.warmup_done);
+        assert!(without_warmup.warmup_done);
+    }
+
+    #[test]
+    fn failed_client_setup_is_excluded_from_warmup() {
+        let enabled = AppConfig {
+            warmup: true,
+            ..Default::default()
+        };
+        // An unresolvable/invalid IP makes client construction fail, so the
+        // target is completed during initialization and must not be selected
+        // for a warmup probe (which would panic on the missing client).
+        let failed = TargetState::new("not-an-ip".to_string(), &enabled, 4);
+        assert!(failed.warmup_done);
+        assert_eq!(failed.completed, 4);
+        assert_eq!(failed.fail, 4);
+    }
+
+    #[test]
+    fn warmup_excluded_from_latency_stats() {
+        let mut state = TargetState {
+            ip: "192.0.2.1".to_string(),
+            url: String::new(),
+            client: None,
+            samples: vec![0.2, 0.3, 0.25],
+            protocols: vec!["h2".to_string(); 3],
+            fail: 0,
+            scheduled: 3,
+            completed: 3,
+            in_flight: false,
+            failures: Vec::new(),
+            colo: Some("FRA".to_string()),
+            cold_ms: Some(0.05),
+            warmup_done: true,
+            warmup_in_flight: false,
+            warmup_discard_first: false,
+        };
+        let result = state.result();
+        // Steady-state only: cold_ms is separate and samples exclude the warmup.
+        assert_eq!(result.cold_ms, Some(50.0));
+        assert_eq!(result.colo, Some("FRA".to_string()));
+        assert_eq!(result.avg, (0.2 + 0.3 + 0.25) / 3.0);
     }
 }
