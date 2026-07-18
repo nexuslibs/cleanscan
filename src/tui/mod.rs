@@ -2446,7 +2446,7 @@ mod tests {
             score: 1.0 / p95.max(0.001),
             colo: None,
             country: None,
-            connect_ms: None,
+            cold_ms: None,
         }
     }
 

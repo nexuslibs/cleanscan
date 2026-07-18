@@ -320,9 +320,9 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
                 Line::from(format!("P95         : {}", fmt_ms(result.p95))),
                 Line::from(format!("Max         : {}", fmt_ms(result.max))),
                 Line::from(format!(
-                    "Connect     : {}",
+                    "Cold        : {}",
                     result
-                        .connect_ms
+                        .cold_ms
                         .map(|ms| format!("{:.1}ms", ms))
                         .unwrap_or_else(|| "n/a".to_string())
                 )),

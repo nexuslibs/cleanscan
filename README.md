@@ -215,7 +215,7 @@ latency dashboard.
 | `--fail-if-no-healthy-target` | off         | Fail if no target meets thresholds              |
 | `--colo`                | —                | Only report IPs in the given Cloudflare datacenter (e.g. `FRA`) |
 | `--country`             | —                | Only report IPs in the given country (substring match, e.g. `Germany`) |
-| `--no-warmup`           | off              | Skip the connection-establishment warmup probe (measure raw RTT) |
+| `--no-warmup`           | off              | Skip the warmup probe; the first measured probe includes connection setup, while later probes may reuse the connection |
 
 ## Output
 
@@ -227,7 +227,7 @@ used as a deterministic tie-breaker. CLI results are ranked by success rate
 `p50`, `p90`, `p95`, and `max` latency in seconds, followed by individual
 successful probe samples in the `samples` column. The `colo` column shows the
 Cloudflare datacenter code parsed from `/cdn-cgi/trace` (when probing that
-path), and `connect_ms` reports the one-off TCP + TLS connection-establishment
+path), and `cold_ms` reports the one-off TCP + TLS connection-establishment
 time captured by the warmup probe. Only the top `N` rows are printed, where `N`
 is controlled by `--top`.
 
@@ -252,8 +252,9 @@ while retaining the hostname for TLS SNI and the Host header. Before the
 counted latency probes, cleanscan sends one discarded warmup probe per IP so
 the TCP + TLS connection is established; the reported `avg`/`p50`/`p90`/`p95`/`max`
 latencies reflect steady-state RTT rather than connection-setup cost, and the
-one-off connect time is reported separately as `connect_ms`. Pass `--no-warmup`
-to measure raw RTT including the handshake. Results are ranked by success rate
+one-off cold-request latency is reported separately as `cold_ms`. Pass
+`--no-warmup`, and the first measured probe includes connection setup while later
+probes may reuse the connection. Results are ranked by success rate
 first, then p95 and average latency; failures include categorized diagnostics
 in the details view and machine-readable output.
 

@@ -247,11 +247,11 @@ fn cli_mode(
     }
 
     if let Some(country) = &country {
-        let want = country.to_ascii_lowercase();
+        let want = country.to_lowercase();
         results.retain(|r| {
             r.country
                 .as_deref()
-                .is_some_and(|c| c.to_ascii_lowercase().contains(&want))
+                .is_some_and(|c| c.to_lowercase().contains(&want))
         });
     }
 
@@ -294,7 +294,7 @@ fn cli_mode(
             .collect::<std::result::Result<Vec<_>, _>>()?
             .join("\n"),
         _ => {
-            let mut text = String::from("rank\tip\tcolo\tcountry\tprotocol\tok\tfail\tsuccess_rate\tconfidence\tavg\tp50\tp90\tp95\tmax\tconnect_ms\tsamples\tfailures\n");
+            let mut text = String::from("rank\tip\tcolo\tcountry\tprotocol\tok\tfail\tsuccess_rate\tconfidence\tavg\tp50\tp90\tp95\tmax\tcold_ms\tsamples\tfailures\n");
             for (i, r) in rows.iter().enumerate() {
                 let samples = r
                     .samples
@@ -319,7 +319,7 @@ fn cli_mode(
                     r.p90,
                     r.p95,
                     r.max,
-                    r.connect_ms.map(|ms| format!("{:.1}", ms)).unwrap_or_default(),
+                    r.cold_ms.map(|ms| format!("{:.1}", ms)).unwrap_or_default(),
                     samples,
                     r.failures.join(",")
                 ));
@@ -342,6 +342,7 @@ fn cli_mode(
 
 #[cfg(test)]
 mod tests {
+    use crate::scanner;
     use super::normalize_config;
     use crate::config::AppConfig;
 
@@ -357,5 +358,34 @@ mod tests {
         assert_eq!(config.sample_per_cidr, 1);
         assert_eq!(config.probes, 1);
         assert_eq!(config.concurrency, 1);
+    }
+
+    #[test]
+    fn country_filter_is_unicode_aware() {
+        let results = vec![scanner::ProbeResult {
+            ip: "198.41.0.4".to_string(),
+            protocol: "h2".to_string(),
+            ok: 1,
+            fail: 0,
+            avg: 0.0,
+            p50: 0.0,
+            p90: 0.0,
+            p95: 0.0,
+            max: 0.0,
+            samples: vec![0.0],
+            failures: Vec::new(),
+            success_rate: 1.0,
+            score: 1.0,
+            colo: Some("ABJ".to_string()),
+            country: Some("Côte d'Ivoire".to_string()),
+            cold_ms: None,
+        }];
+        let mut filtered = results.clone();
+        filtered.retain(|r| {
+            r.country
+                .as_deref()
+                .is_some_and(|c| c.to_lowercase().contains(&"CÔTE".to_lowercase()))
+        });
+        assert_eq!(filtered.len(), 1);
     }
 }
