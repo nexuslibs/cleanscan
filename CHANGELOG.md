@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/nexuslibs/cleanscan/compare/v0.1.1...v0.1.2) (2026-07-18)
+
+
+### Bug Fixes
+
+* update release workflow to use dedicated token and latest zig setup ([4a6cf8c](https://github.com/nexuslibs/cleanscan/commit/4a6cf8c8f3cf249de9e1d9094a1d58575cbd8d5d))
+
 ## [0.1.1](https://github.com/nexuslibs/cleanscan/compare/v0.1.0...v0.1.1) (2026-07-18)
 
 
