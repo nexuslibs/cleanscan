@@ -53,9 +53,11 @@ fn client_for_ip(host: &str, ip: &str, args: &AppConfig) -> Result<Client> {
     Ok(reqwest::Client::builder()
         .http2_adaptive_window(true)
         .pool_max_idle_per_host(0)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .resolve_to_addrs(host, &[socket])
         .connect_timeout(Duration::from_millis(args.connect_timeout_ms))
-        .timeout(Duration::from_millis(args.timeout_ms))
+        .timeout(Duration::from_millis(args.speed_timeout_ms))
         .build()?)
 }
 

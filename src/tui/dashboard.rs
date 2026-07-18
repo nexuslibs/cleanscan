@@ -441,7 +441,7 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         "↑/↓ scroll • space pause • ? help • q quit"
     });
     let para = Paragraph::new(msg).style(theme::hint_style());
-    frame.render_widget(para, chunks[1]);
+    frame.render_widget(para, chunks[2]);
 }
 
 #[cfg(test)]

@@ -570,6 +570,7 @@ pub fn run_tui(
                         upload_path: app.config.upload_path.clone(),
                         speed_payload_bytes: app.config.speed_payload_bytes,
                         speed_repetitions: app.config.speed_repetitions,
+                        speed_timeout_ms: app.config.speed_timeout_ms,
                     });
                     *scanner = Some(spawn_scanner(targets, scan_config));
                     app.begin_scan(total);
@@ -736,7 +737,8 @@ impl App {
             Screen::Wizard => wizard::handle_wizard_key(self, code),
             Screen::Scanning => self.handle_scan_key(code),
             Screen::SpeedSelect => self.handle_speed_select_key(code),
-            Screen::SpeedTesting | Screen::SpeedResults => self.handle_speed_results_key(code),
+            Screen::SpeedTesting => {}
+            Screen::SpeedResults => self.handle_speed_results_key(code),
         }
     }
 

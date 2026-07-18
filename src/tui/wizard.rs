@@ -20,6 +20,7 @@ pub enum SettingField {
     UploadPath,
     SpeedPayloadMb,
     SpeedRepetitions,
+    SpeedTimeoutMs,
     SamplePerCidr,
     Probes,
     Concurrency,
@@ -36,16 +37,18 @@ const MAX_CONNECT_TIMEOUT_MS: u64 = 600_000;
 const MAX_TOP: usize = 10_000;
 const MAX_SPEED_PAYLOAD_MB: u64 = 1_024;
 const MAX_SPEED_REPETITIONS: usize = 100;
+const MAX_SPEED_TIMEOUT_MS: u64 = 3_600_000;
 
 impl SettingField {
     /// All settings fields in display order.
-    pub const ALL: [SettingField; 12] = [
+    pub const ALL: [SettingField; 13] = [
         SettingField::Host,
         SettingField::Path,
         SettingField::DownloadPath,
         SettingField::UploadPath,
         SettingField::SpeedPayloadMb,
         SettingField::SpeedRepetitions,
+        SettingField::SpeedTimeoutMs,
         SettingField::SamplePerCidr,
         SettingField::Probes,
         SettingField::Concurrency,
@@ -62,6 +65,7 @@ impl SettingField {
             SettingField::UploadPath => "Upload path",
             SettingField::SpeedPayloadMb => "Speed payload (MB)",
             SettingField::SpeedRepetitions => "Speed repetitions",
+            SettingField::SpeedTimeoutMs => "Speed timeout (ms)",
             SettingField::SamplePerCidr => "Sample per CIDR",
             SettingField::Probes => "Probes",
             SettingField::Concurrency => "Concurrency",
@@ -79,6 +83,7 @@ impl SettingField {
             SettingField::UploadPath => "POST endpoint used for upload speed tests; it should consume and discard the request body.",
             SettingField::SpeedPayloadMb => "Payload size used for each upload/download repetition. Larger payloads reduce short-test noise but use more bandwidth.",
             SettingField::SpeedRepetitions => "Number of upload/download repetitions per selected IP; reported speeds are averaged.",
+            SettingField::SpeedTimeoutMs => "Maximum total time for one upload/download transfer, separate from the normal latency probe timeout.",
             SettingField::SamplePerCidr => "Number of random IPs sampled from each selected CIDR. Higher values increase coverage across the edge network, but increase total targets.",
             SettingField::Probes => "Number of requests sent to each IP to probe latency. More probes filter out transient noise and establish a highly accurate latency percentile.",
             SettingField::Concurrency => "Maximum number of simultaneous request workers. Higher concurrency speeds up scanning but may trigger rate limiting or CPU bottlenecks.",
@@ -97,6 +102,7 @@ impl SettingField {
             SettingField::UploadPath => args.upload_path.clone(),
             SettingField::SpeedPayloadMb => (args.speed_payload_bytes / (1024 * 1024)).to_string(),
             SettingField::SpeedRepetitions => args.speed_repetitions.to_string(),
+            SettingField::SpeedTimeoutMs => args.speed_timeout_ms.to_string(),
             SettingField::SamplePerCidr => args.sample_per_cidr.to_string(),
             SettingField::Probes => args.probes.to_string(),
             SettingField::Concurrency => args.concurrency.to_string(),
@@ -122,6 +128,7 @@ impl SettingField {
             SettingField::TimeoutMs | SettingField::ConnectTimeoutMs => 100,
             SettingField::SamplePerCidr => 10,
             SettingField::SpeedPayloadMb => 10,
+            SettingField::SpeedTimeoutMs => 1_000,
             _ => 1,
         }
     }
@@ -136,6 +143,7 @@ impl SettingField {
             SettingField::Top => MAX_TOP as i64,
             SettingField::SpeedPayloadMb => MAX_SPEED_PAYLOAD_MB as i64,
             SettingField::SpeedRepetitions => MAX_SPEED_REPETITIONS as i64,
+            SettingField::SpeedTimeoutMs => MAX_SPEED_TIMEOUT_MS as i64,
             SettingField::Host
             | SettingField::Path
             | SettingField::DownloadPath
@@ -164,6 +172,7 @@ impl SettingField {
             SettingField::Top => args.top = value as usize,
             SettingField::SpeedPayloadMb => args.speed_payload_bytes = value as u64 * 1024 * 1024,
             SettingField::SpeedRepetitions => args.speed_repetitions = value as usize,
+            SettingField::SpeedTimeoutMs => args.speed_timeout_ms = value as u64,
             SettingField::Host
             | SettingField::Path
             | SettingField::DownloadPath
@@ -219,6 +228,15 @@ impl SettingField {
                     return Err(format!("must be between 1 and {MAX_SPEED_REPETITIONS}"));
                 }
                 args.speed_repetitions = v;
+            }
+            SettingField::SpeedTimeoutMs => {
+                let v = raw
+                    .parse::<u64>()
+                    .map_err(|_| "invalid number".to_string())?;
+                if !(1..=MAX_SPEED_TIMEOUT_MS).contains(&v) {
+                    return Err(format!("must be between 1 and {MAX_SPEED_TIMEOUT_MS}"));
+                }
+                args.speed_timeout_ms = v;
             }
             SettingField::SamplePerCidr => {
                 let v = raw

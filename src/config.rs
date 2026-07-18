@@ -21,6 +21,8 @@ pub struct AppConfig {
     pub speed_payload_bytes: u64,
     #[serde(default = "default_speed_repetitions")]
     pub speed_repetitions: usize,
+    #[serde(default = "default_speed_timeout_ms")]
+    pub speed_timeout_ms: u64,
     pub custom_cidrs: Vec<String>,
     #[serde(default)]
     pub selected_cidrs: Vec<String>,
@@ -44,6 +46,10 @@ fn default_speed_repetitions() -> usize {
     1
 }
 
+fn default_speed_timeout_ms() -> u64 {
+    120_000
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -59,6 +65,7 @@ impl Default for AppConfig {
             upload_path: default_upload_path(),
             speed_payload_bytes: default_speed_payload_bytes(),
             speed_repetitions: default_speed_repetitions(),
+            speed_timeout_ms: default_speed_timeout_ms(),
             custom_cidrs: Vec::new(),
             selected_cidrs: crate::scanner::DEFAULT_CLOUDFLARE_CIDRS
                 .iter()

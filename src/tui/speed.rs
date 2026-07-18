@@ -149,7 +149,11 @@ fn render_testing(app: &App, frame: &mut Frame, area: Rect) {
     );
 }
 
-fn render_results(app: &App, frame: &mut Frame, area: Rect) {
+fn render_results(app: &mut App, frame: &mut Frame, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(" Throughput ");
+    let visible = block.inner(area).height.saturating_sub(1) as usize;
+    let max_scroll = app.speed_results.len().saturating_sub(visible);
+    app.scroll = app.scroll.min(max_scroll);
     let header = Row::new(vec![
         Cell::from("IP"),
         Cell::from("Download"),
@@ -157,19 +161,24 @@ fn render_results(app: &App, frame: &mut Frame, area: Rect) {
         Cell::from("Status"),
     ])
     .style(theme::title_style());
-    let rows = app.speed_results.iter().map(|result| {
-        let status = result.error.as_deref().unwrap_or("OK");
-        Row::new(vec![
-            Cell::from(result.ip.clone()),
-            Cell::from(format_measurement(result.download.as_ref())),
-            Cell::from(format_measurement(result.upload.as_ref())),
-            Cell::from(status.to_string()).style(if result.error.is_some() {
-                theme::bad_style()
-            } else {
-                theme::good_style()
-            }),
-        ])
-    });
+    let rows = app
+        .speed_results
+        .iter()
+        .skip(app.scroll)
+        .take(visible)
+        .map(|result| {
+            let status = result.error.as_deref().unwrap_or("OK");
+            Row::new(vec![
+                Cell::from(result.ip.clone()),
+                Cell::from(format_measurement(result.download.as_ref())),
+                Cell::from(format_measurement(result.upload.as_ref())),
+                Cell::from(status.to_string()).style(if result.error.is_some() {
+                    theme::bad_style()
+                } else {
+                    theme::good_style()
+                }),
+            ])
+        });
     let table = Table::new(
         rows,
         [
@@ -180,7 +189,7 @@ fn render_results(app: &App, frame: &mut Frame, area: Rect) {
         ],
     )
     .header(header)
-    .block(Block::default().borders(Borders::ALL).title(" Throughput "));
+    .block(block);
     frame.render_widget(table, area);
 }
 
