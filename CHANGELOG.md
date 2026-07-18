@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.4.0](https://github.com/nexuslibs/cleanscan/compare/v0.3.0...v0.4.0) (2026-07-18)
+
+
+### Features
+
+* add selective IP speed testing ([c23f1f2](https://github.com/nexuslibs/cleanscan/commit/c23f1f28dcc42376a8e75b8a3c190a37f38c873a))
+* add selective IP speed testing ([974e446](https://github.com/nexuslibs/cleanscan/commit/974e446ef1a8131573fec3dddaaae58e6c58e1fe))
+* add speed timeout configuration and update related components ([5b11ef4](https://github.com/nexuslibs/cleanscan/commit/5b11ef4c47b2312599c6bdfba59afac1ffc57d84))
+* enhance host configuration checks and improve speed testing logic in TUI ([6b21f44](https://github.com/nexuslibs/cleanscan/commit/6b21f44aebaa3363fd628a73175fefd2231a507a))
+* implement IP selection and clipboard copy functionality in TUI ([e9c51dd](https://github.com/nexuslibs/cleanscan/commit/e9c51dda88e6bb719ca7d27bee60e3943cae8b55))
+* improve scrolling behavior in scanning and speed results screens ([68cbbfb](https://github.com/nexuslibs/cleanscan/commit/68cbbfb82faaeaee7774fdcabffb87715acb1268))
+* require host configuration before starting scans and update help text ([11bc8d5](https://github.com/nexuslibs/cleanscan/commit/11bc8d5d0ab8d10a23af08f1f3a78620205ef33e))
+
+
+### Bug Fixes
+
+* ensure scroll position does not exceed result cursor in compact table rendering ([9440435](https://github.com/nexuslibs/cleanscan/commit/9440435eaa1d777e1674003715c15203e9c3bce2))
+
 ## [0.3.0](https://github.com/nexuslibs/cleanscan/compare/v0.2.0...v0.3.0) (2026-07-18)
 
 
