@@ -2,19 +2,77 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to rebuild or republish
+        required: true
+        type: string
 
-permissions:
-  contents: write
+concurrency:
+  group: release-pipeline
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
 
 jobs:
-  release:
-    name: ${{ matrix.target }}
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      should_build: ${{ github.event_name == 'workflow_dispatch' && steps.manual.outputs.should_build || steps.release.outputs.should_build }}
+      tag_name: ${{ github.event_name == 'workflow_dispatch' && steps.manual.outputs.tag_name || steps.release.outputs.tag_name }}
+    steps:
+      - name: Run Release Please
+        id: release_please
+        if: github.event_name == 'push'
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - name: Select the generated release
+        id: release
+        if: github.event_name == 'push'
+        env:
+          RELEASE_CREATED: ${{ steps.release_please.outputs.release_created }}
+          TAG_NAME: ${{ steps.release_please.outputs.tag_name }}
+        run: |
+          echo "should_build=${RELEASE_CREATED:-false}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Select a manually requested release
+        id: manual
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ inputs.tag }}
+        run: |
+          case "$TAG_NAME" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "tag must use the vX.Y.Z format" >&2; exit 1 ;;
+          esac
+
+          gh release view "$TAG_NAME" >/dev/null 2>&1 || \
+            gh release create "$TAG_NAME" \
+              --draft \
+              --title "$TAG_NAME" \
+              --notes "Manual rebuild of $TAG_NAME."
+
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -31,12 +89,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4 # v4
         with:
+          ref: ${{ needs.prepare.outputs.tag_name }}
           persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable # stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Verify Cargo version matches the release tag
+        shell: bash
+        env:
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+        run: |
+          expected="${TAG_NAME#v}"
+          actual="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          test "$actual" = "$expected" || {
+            echo "Cargo version $actual does not match tag $TAG_NAME" >&2
+            exit 1
+          }
 
       - name: Install zig (cross musl linker)
         if: contains(matrix.target, 'linux-musl')
@@ -57,14 +128,35 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
+        shell: bash
         run: |
-          BIN="target/${{ matrix.target }}/release/cleanscan"
           tar -czf "cleanscan-${{ matrix.target }}.tar.gz" -C "target/${{ matrix.target }}/release" cleanscan
-          shasum -a 256 "cleanscan-${{ matrix.target }}.tar.gz" | cut -d' ' -f1 > "cleanscan-${{ matrix.target }}.tar.gz.sha256"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "cleanscan-${{ matrix.target }}.tar.gz" | cut -d' ' -f1 > "cleanscan-${{ matrix.target }}.tar.gz.sha256"
+          else
+            shasum -a 256 "cleanscan-${{ matrix.target }}.tar.gz" | cut -d' ' -f1 > "cleanscan-${{ matrix.target }}.tar.gz.sha256"
+          fi
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2 # v2
         with:
+          tag_name: ${{ needs.prepare.outputs.tag_name }}
+          draft: true
+          fail_on_unmatched_files: true
           files: |
             cleanscan-${{ matrix.target }}.tar.gz
             cleanscan-${{ matrix.target }}.tar.gz.sha256
+
+  publish:
+    name: Publish release
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_build == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the fully built release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+        run: gh release edit "$TAG_NAME" --draft=false --latest

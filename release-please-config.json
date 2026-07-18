@@ -1,0 +1,12 @@
+{
+  "release-type": "rust",
+  "include-v-in-tag": true,
+  "changelog-path": "CHANGELOG.md",
+  "draft": true,
+  "packages": {
+    ".": {
+      "release-type": "rust",
+      "package-name": "cleanscan"
+    }
+  }
+}

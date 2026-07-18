@@ -57,6 +57,27 @@ CLEANSCAN_VERSION=v1.0.0 bash -c 'curl -sSfL https://raw.githubusercontent.com/n
 INSTALL_DIR=/opt/bin bash -c 'curl -sSfL https://raw.githubusercontent.com/nexuslibs/cleanscan/main/install.sh | bash'
 ```
 
+## Releases and versioning
+
+Releases are automated through GitHub Actions. Use Conventional Commit
+prefixes in pull request titles and squash commits:
+
+- `fix:` creates a patch release.
+- `feat:` creates a minor release.
+- `feat!:` or a `BREAKING CHANGE:` footer creates a major release.
+- `docs:` and `chore:` changes do not create a release.
+
+While the project is below `1.0.0`, a feature release advances the minor
+version. Release Please opens a version PR that updates the Cargo version and
+changelog. Once CI passes and you merge the release PR, GitHub then builds
+Linux musl and macOS binaries for both supported architectures, verifies their
+checksums, and publishes the release only after every artifact is ready.
+Review and merge the release PR when it is ready. The merge starts the release
+build automatically, and no custom GitHub secret is required.
+
+The installer continues to support the latest release and pinned versions via
+`CLEANSCAN_VERSION=vX.Y.Z`.
+
 ## Usage
 
 ```sh
