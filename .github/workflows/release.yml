@@ -34,7 +34,9 @@ jobs:
         if: github.event_name == 'push'
         uses: googleapis/release-please-action@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # A dedicated token is required when the repository disallows the
+          # built-in GITHUB_TOKEN from creating pull requests.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
@@ -114,8 +116,9 @@ jobs:
 
       - name: Install zig (cross musl linker)
         if: contains(matrix.target, 'linux-musl')
-        uses: mlugg/setup-zig@v1 # v1
+        uses: mlugg/setup-zig@v2 # v2
         with:
+          version: latest
           use-cache: false
 
       - name: Install cargo-zigbuild
