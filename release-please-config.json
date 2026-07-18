@@ -1,0 +1,15 @@
+{
+  "release-type": "rust",
+  "include-v-in-tag": true,
+  "include-component-in-tag": false,
+  "changelog-path": "CHANGELOG.md",
+  "draft": true,
+  "force-tag-creation": true,
+  "bootstrap-sha": "78318ce1ec33b84c46f9b080306f751bf4bd2a91",
+  "packages": {
+    ".": {
+      "release-type": "rust",
+      "package-name": "cleanscan"
+    }
+  }
+}
