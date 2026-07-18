@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/nexuslibs/cleanscan/compare/v0.4.0...v0.5.0) (2026-07-18)
+
+
+### Features
+
+* add protocol column to results and enhance navigation in TUI ([c9ce747](https://github.com/nexuslibs/cleanscan/commit/c9ce7476273188839535a9585c47723d3b8a150d))
+
 ## [0.4.0](https://github.com/nexuslibs/cleanscan/compare/v0.3.0...v0.4.0) (2026-07-18)
 
 
