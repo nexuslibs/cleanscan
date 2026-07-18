@@ -22,7 +22,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     symbols::border::ROUNDED,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, ListState, Paragraph},
     Frame,
 };
 
@@ -227,8 +227,10 @@ pub struct App {
     pub result_cursor: usize,
     /// Scroll offset into the wizard CIDR list.
     pub ranges_scroll: usize,
+    pub ranges_list_state: ListState,
     /// Scroll offset into the wizard settings list.
     pub settings_scroll: usize,
+    pub settings_list_state: ListState,
     /// Currently sorted column index in the results table (natural order = 0).
     pub sort_col: usize,
     pub sort_asc: bool,
@@ -292,9 +294,12 @@ pub struct App {
     pub show_column_picker: bool,
     pub command_query: String,
     pub command_cursor: usize,
+    pub command_list_state: ListState,
+    pub column_picker_list_state: ListState,
     /// Full statistics drawer for the currently selected latency result.
     pub show_result_details: bool,
     pub detail_tab: usize,
+    explicit_target_source: Option<(Vec<String>, Option<String>)>,
 }
 
 impl App {
@@ -386,10 +391,7 @@ impl App {
         self.command_cursor = 0;
     }
 
-    pub fn new(mut config: AppConfig, has_cli_targets: bool, paused: Arc<AtomicBool>) -> Self {
-        if config.seed == 0 {
-            config.seed = rand::random();
-        }
+    pub fn new(config: AppConfig, has_cli_targets: bool, paused: Arc<AtomicBool>) -> Self {
         let scan_seed = config.seed;
         let mut cidr_candidates = Vec::new();
 
@@ -449,7 +451,9 @@ impl App {
             scroll: 0,
             result_cursor: 0,
             ranges_scroll: 0,
+            ranges_list_state: ListState::default(),
             settings_scroll: 0,
+            settings_list_state: ListState::default(),
             sort_col: 0,
             sort_asc: true,
             show_failures: false,
@@ -497,8 +501,11 @@ impl App {
             show_column_picker: false,
             command_query: String::new(),
             command_cursor: 0,
+            command_list_state: ListState::default(),
+            column_picker_list_state: ListState::default(),
             show_result_details: false,
             detail_tab: 0,
+            explicit_target_source: None,
         }
     }
 
@@ -592,25 +599,65 @@ impl App {
         self.preview_targets.clear();
     }
 
-    pub fn regenerate_preview(&mut self) {
-        self.scan_seed = rand::random();
-        self.config.seed = self.scan_seed;
-        let cidrs: Vec<String> = self
-            .cidr_candidates
-            .iter()
-            .filter(|entry| entry.selected)
-            .map(|entry| entry.cidr.clone())
-            .collect();
-        match crate::scanner::collect_from_cidrs_with_seed(
-            &cidrs,
-            self.config.sample_per_cidr,
-            self.scan_seed,
-        ) {
+    pub fn refresh_preview(&mut self) {
+        let result = self.collect_preview(self.scan_seed);
+        match result {
             Ok(targets) => {
                 self.preview_targets = targets;
                 self.toast_success(format!("Generated {} targets", self.preview_targets.len()));
             }
             Err(error) => self.toast_error(format!("Preview failed: {error}")),
+        }
+    }
+
+    fn collect_preview(&self, seed: u64) -> anyhow::Result<Vec<String>> {
+        if let Some((cidrs, ips)) = &self.explicit_target_source {
+            crate::scanner::collect_targets_with_seed(&self.config, cidrs, ips, seed)
+        } else {
+            let cidrs: Vec<String> = self
+                .cidr_candidates
+                .iter()
+                .filter(|entry| entry.selected)
+                .map(|entry| entry.cidr.clone())
+                .collect();
+            crate::scanner::collect_from_cidrs_with_seed(&cidrs, self.config.sample_per_cidr, seed)
+        }
+    }
+
+    pub fn regenerate_preview(&mut self) {
+        let seed = rand::random();
+        match self.collect_preview(seed) {
+            Ok(targets) => {
+                self.scan_seed = seed;
+                self.config.seed = seed;
+                self.preview_targets = targets;
+                self.toast_success(format!("Generated {} targets", self.preview_targets.len()));
+            }
+            Err(error) => self.toast_error(format!("Preview failed: {error}")),
+        }
+    }
+
+    pub fn set_explicit_target_source(&mut self, cidrs: Vec<String>, ips: Option<String>) {
+        self.explicit_target_source = Some((cidrs, ips));
+    }
+
+    fn regenerate_explicit_preview(&mut self) -> bool {
+        if self.explicit_target_source.is_none() {
+            return false;
+        }
+        let seed = rand::random();
+        match self.collect_preview(seed) {
+            Ok(targets) => {
+                self.scan_seed = seed;
+                self.config.seed = seed;
+                self.preview_targets = targets;
+                self.toast_success(format!("Generated {} targets", self.preview_targets.len()));
+                true
+            }
+            Err(error) => {
+                self.toast_error(format!("Preview failed: {error}"));
+                false
+            }
         }
     }
 
@@ -956,9 +1003,18 @@ pub fn run_tui(
     config: AppConfig,
     cli_cidr: Vec<String>,
     cli_ips: Option<String>,
+    explicit_seed: Option<u64>,
 ) -> anyhow::Result<()> {
     let has_cli_targets = cli_ips.is_some() || !cli_cidr.is_empty();
 
+    let mut config = config;
+    config.seed = explicit_seed.unwrap_or_else(|| {
+        if config.seed == 0 {
+            rand::random()
+        } else {
+            config.seed
+        }
+    });
     let config_arc = Arc::new(config);
     let (tx, rx) = std::sync::mpsc::channel::<ProbeResult>();
     let (speed_tx, speed_rx) = std::sync::mpsc::channel::<SpeedResult>();
@@ -970,6 +1026,9 @@ pub fn run_tui(
     let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
     let _guard = RestoreGuard;
     let mut app = App::new((*config_arc).clone(), has_cli_targets, paused.clone());
+    if has_cli_targets {
+        app.set_explicit_target_source(cli_cidr.clone(), cli_ips.clone());
+    }
 
     let spawn_scanner = |targets: Vec<String>,
                          scan_config: Arc<AppConfig>|
@@ -1026,7 +1085,12 @@ pub fn run_tui(
         if app.config.host.is_empty() {
             app.toast_warn("Set a Host before starting the scan");
         } else {
-            let targets = crate::scanner::collect_targets(&config_arc, &cli_cidr, &cli_ips)?;
+            let targets = crate::scanner::collect_targets_with_seed(
+                &config_arc,
+                &cli_cidr,
+                &cli_ips,
+                app.scan_seed,
+            )?;
             let total = targets.len();
             app.set_scan_targets(targets.clone());
             scanner = Some(spawn_scanner(targets, config_arc.clone()));
@@ -1178,6 +1242,12 @@ pub fn run_tui(
                 app.last_tp_instant = Instant::now();
             }
 
+            if app.screen == Screen::Wizard
+                && app.wizard_step == WizardStep::Review
+                && app.preview_targets.is_empty()
+            {
+                app.refresh_preview();
+            }
             terminal.draw(|f| app.render(f))?;
 
             if event::poll(Duration::from_millis(100))? {
@@ -1312,11 +1382,12 @@ impl App {
         if self.show_result_details {
             match code {
                 KeyCode::Esc | KeyCode::Char('q') => self.show_result_details = false,
-                KeyCode::Tab => self.detail_tab = (self.detail_tab + 1) % 4,
+                KeyCode::Tab => self.detail_tab = (self.detail_tab + 1) % 5,
                 KeyCode::Char('1') => self.detail_tab = 0,
                 KeyCode::Char('2') => self.detail_tab = 1,
                 KeyCode::Char('3') => self.detail_tab = 2,
                 KeyCode::Char('4') => self.detail_tab = 3,
+                KeyCode::Char('5') => self.detail_tab = 4,
                 KeyCode::Char('c') => self.activate_action(Action::CopyIp),
                 KeyCode::Char('e') => self.activate_action(Action::Export),
                 KeyCode::Char('t') if self.scan_complete => {
@@ -1495,10 +1566,10 @@ impl App {
         }
     }
 
-    fn render_column_picker(&self, frame: &mut Frame, area: Rect) {
+    fn render_column_picker(&mut self, frame: &mut Frame, area: Rect) {
         let popup = centered(area, 56, 46);
         let inner = widgets::modal(frame, area, popup, " Result columns ");
-        let lines = dashboard::RESULT_COLUMNS
+        let items = dashboard::RESULT_COLUMNS
             .iter()
             .enumerate()
             .map(|(index, name)| {
@@ -1512,14 +1583,26 @@ impl App {
                 } else {
                     ratatui::style::Style::default()
                 };
-                Line::from(format!(" {marker} {name:<8}")).style(style)
+                ratatui::widgets::ListItem::new(
+                    Line::from(format!(" {marker} {name:<8}")).style(style),
+                )
             })
             .collect::<Vec<_>>();
         let body = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(1), Constraint::Length(2)])
             .split(inner);
-        frame.render_widget(Paragraph::new(lines), body[0]);
+        self.column_picker_list_state = self
+            .column_picker_list_state
+            .with_offset(0)
+            .with_selected(Some(self.column_picker_cursor));
+        frame.render_stateful_widget(
+            ratatui::widgets::List::new(items)
+                .highlight_style(theme::row_selected_style())
+                .highlight_symbol("› "),
+            body[0],
+            &mut self.column_picker_list_state,
+        );
         frame.render_widget(
             Paragraph::new("↑/↓ move • Space toggle • Esc close").style(theme::hint_style()),
             body[1],
@@ -1535,26 +1618,26 @@ impl App {
         let start = self
             .command_cursor
             .saturating_sub(visible.saturating_sub(1));
-        let list = actions
+        let items = actions
             .iter()
             .enumerate()
-            .skip(start)
-            .take(visible)
             .map(|(i, action)| {
                 let style = if i == self.command_cursor {
                     theme::row_selected_style()
                 } else {
                     ratatui::style::Style::default()
                 };
-                Line::from(vec![
-                    Span::styled(format!(" {:<24}", action.label()), style),
-                    Span::styled(
-                        format!(" {:<6}", action.shortcut()),
-                        theme::highlight_style(),
-                    ),
-                    Span::styled(action.description(), theme::hint_style()),
-                ])
-                .style(style)
+                ratatui::widgets::ListItem::new(
+                    Line::from(vec![
+                        Span::styled(format!(" {:<24}", action.label()), style),
+                        Span::styled(
+                            format!(" {:<6}", action.shortcut()),
+                            theme::highlight_style(),
+                        ),
+                        Span::styled(action.description(), theme::hint_style()),
+                    ])
+                    .style(style),
+                )
             })
             .collect::<Vec<_>>();
         let chunks = Layout::default()
@@ -1569,7 +1652,18 @@ impl App {
             Paragraph::new(format!(" /{}", self.command_query)).style(theme::title_style()),
             chunks[0],
         );
-        frame.render_widget(Paragraph::new(list), chunks[1]);
+        self.command_list_state = self.command_list_state.with_offset(start).with_selected(
+            actions
+                .get(self.command_cursor)
+                .map(|_| self.command_cursor),
+        );
+        frame.render_stateful_widget(
+            ratatui::widgets::List::new(items)
+                .highlight_style(theme::row_selected_style())
+                .highlight_symbol("› "),
+            chunks[1],
+            &mut self.command_list_state,
+        );
         frame.render_widget(
             Paragraph::new("↑/↓ navigate • Enter run • Esc close").style(theme::hint_style()),
             chunks[2],
@@ -1583,8 +1677,10 @@ impl App {
             SpeedDirection::Download | SpeedDirection::Upload => 1,
             SpeedDirection::Both => 2,
         } as u64;
-        let estimated_bytes =
-            self.speed_selected.len() as u64 * self.config.speed_payload_bytes * directions;
+        let estimated_bytes = self.speed_selected.len() as u64
+            * self.config.speed_payload_bytes
+            * directions
+            * self.config.speed_repetitions as u64;
         let lines = vec![
             Line::from(Span::styled(
                 format!("{} IPs selected", self.speed_selected.len()),
@@ -1673,8 +1769,13 @@ impl App {
                 }
             }
             KeyCode::Char('n') if self.scan_complete => {
-                self.regenerate_preview();
-                if !self.preview_targets.is_empty() {
+                let generated = if self.explicit_target_source.is_some() {
+                    self.regenerate_explicit_preview()
+                } else {
+                    self.regenerate_preview();
+                    !self.preview_targets.is_empty()
+                };
+                if generated {
                     self.rescan_targets = Some(self.preview_targets.clone());
                     self.pending_start = true;
                 }
@@ -2327,6 +2428,61 @@ mod tests {
         app.show_help = false;
         app.confirm_quit = true;
         draw(&mut app, 120, 36);
+    }
+
+    #[test]
+    fn detail_tabs_and_visualizations_render_including_empty_samples() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(3);
+        let mut sampled = result("10.0.0.1", 0, 0.05);
+        sampled.samples = vec![0.04, 0.06, 0.05, 0.08];
+        app.add_result(sampled);
+        let mut empty = result("10.0.0.2", 2, 0.2);
+        empty.ok = 0;
+        empty.samples.clear();
+        app.add_result(empty);
+        app.scan_complete = true;
+        app.show_result_details = true;
+
+        for tab in 0..5 {
+            app.detail_tab = tab;
+            draw(&mut app, 120, 40);
+        }
+        app.result_cursor = 1;
+        app.detail_tab = 2;
+        draw(&mut app, 120, 40);
+    }
+
+    #[test]
+    fn list_widgets_track_selection_and_scroll_for_wizard_and_overlays() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.cursor = app.cidr_candidates.len().saturating_sub(1);
+        draw(&mut app, 120, 36);
+        assert_eq!(app.ranges_list_state.selected(), Some(app.cursor));
+        assert!(app.ranges_list_state.offset() <= app.cursor);
+
+        app.wizard_step = WizardStep::Settings;
+        app.cursor = 0;
+        draw(&mut app, 120, 36);
+        assert_eq!(app.settings_list_state.selected(), Some(1));
+
+        app.open_command_palette();
+        draw(&mut app, 120, 36);
+        assert_eq!(app.command_list_state.selected(), Some(0));
+
+        app.show_command_palette = false;
+        app.show_column_picker = true;
+        app.column_picker_cursor = 9;
+        draw(&mut app, 120, 36);
+        assert_eq!(app.column_picker_list_state.selected(), Some(9));
     }
 
     #[test]

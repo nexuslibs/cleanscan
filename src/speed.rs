@@ -312,5 +312,8 @@ mod tests {
         assert_eq!(result.bytes, 100);
         assert_eq!(result.seconds, 1.5);
         assert_eq!(result.bytes_per_second, 75.0);
+        assert_eq!(result.median_bytes_per_second, 75.0);
+        assert_eq!(result.p10_bytes_per_second, 50.0);
+        assert_eq!(result.p90_bytes_per_second, 100.0);
     }
 }

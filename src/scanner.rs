@@ -158,16 +158,19 @@ fn add_ip_or_cidr(
     Ok(())
 }
 
-pub fn collect_targets(
+pub fn collect_targets_with_optional_seed(
     config: &AppConfig,
     cli_cidrs: &[String],
     cli_ips: &Option<String>,
+    explicit_seed: Option<u64>,
 ) -> Result<Vec<String>> {
-    let seed = if config.seed == 0 {
-        rand::random()
-    } else {
-        config.seed
-    };
+    let seed = explicit_seed.unwrap_or_else(|| {
+        if config.seed == 0 {
+            rand::random()
+        } else {
+            config.seed
+        }
+    });
     collect_targets_with_seed(config, cli_cidrs, cli_ips, seed)
 }
 

@@ -1,10 +1,12 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::Style,
+    symbols::Marker,
     text::{Line, Span},
     widgets::{
-        Bar, BarChart, BarGroup, Cell, LineGauge, Paragraph, Row, Scrollbar, ScrollbarState,
-        Sparkline, Table,
+        canvas::{Canvas, Points},
+        Axis, Bar, BarChart, BarGroup, Cell, Chart, Dataset, GraphType, LineGauge, Paragraph, Row,
+        Scrollbar, ScrollbarState, Sparkline, Table, Tabs,
     },
     Frame,
 };
@@ -212,6 +214,7 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
             ("f", "show failures"),
             ("r", "rerun targets"),
             ("n", "new sample"),
+            ("m", "comparison export"),
             ("c", "copy"),
             ("/", "commands"),
             ("?", "help"),
@@ -232,6 +235,14 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
+    let tabs = [
+        "Overview",
+        "Diagnostics",
+        "Distribution",
+        "Speed",
+        "Latency Map",
+    ];
+    app.detail_tab = app.detail_tab.min(tabs.len().saturating_sub(1));
     let Some(result) = app
         .sorted_results()
         .into_iter()
@@ -242,41 +253,49 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
     };
     let popup = crate::tui::centered(area, 64, 62);
     let inner = widgets::modal(frame, area, popup, " Selected edge details ");
-    let tabs = ["Overview", "Diagnostics", "Distribution", "Speed"];
-    let mut lines = vec![
-        Line::from(Span::styled(result.ip.clone(), theme::header_style())),
-        Line::from(Span::styled(
-            tabs.iter()
-                .enumerate()
-                .map(|(index, label)| {
-                    if index == app.detail_tab {
-                        format!("[{}]", label)
-                    } else {
-                        format!(" {} ", label)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" "),
-            theme::highlight_style(),
-        )),
-        Line::from(""),
-    ];
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            result.ip.clone(),
+            theme::header_style(),
+        ))),
+        chunks[0],
+    );
+    frame.render_widget(
+        Tabs::new(tabs)
+            .select(app.detail_tab)
+            .highlight_style(theme::highlight_style())
+            .divider("│"),
+        chunks[1],
+    );
+
     match app.detail_tab {
-        0 => lines.extend([
-            Line::from(format!("Status      : {}", result_status(result))),
-            Line::from(format!("Protocol    : {}", result.protocol)),
-            Line::from(format!(
-                "Success     : {}/{} ({:.1}%)",
-                result.ok,
-                result.ok + result.fail,
-                result.success_rate * 100.0
-            )),
-            Line::from(format!("Average     : {}", fmt_ms(result.avg))),
-            Line::from(format!("P95         : {}", fmt_ms(result.p95))),
-            Line::from(format!("Max         : {}", fmt_ms(result.max))),
-            Line::from(format!("Confidence  : {}", result_confidence(result))),
-        ]),
+        0 => {
+            let lines = vec![
+                Line::from(format!("Status      : {}", result_status(result))),
+                Line::from(format!("Protocol    : {}", result.protocol)),
+                Line::from(format!(
+                    "Success     : {}/{} ({:.1}%)",
+                    result.ok,
+                    result.ok + result.fail,
+                    result.success_rate * 100.0
+                )),
+                Line::from(format!("Average     : {}", fmt_ms(result.avg))),
+                Line::from(format!("P95         : {}", fmt_ms(result.p95))),
+                Line::from(format!("Max         : {}", fmt_ms(result.max))),
+                Line::from(format!("Confidence  : {}", result_confidence(result))),
+            ];
+            render_detail_text(frame, chunks[2], lines);
+        }
         1 => {
+            let mut lines = Vec::new();
             lines.push(Line::from(Span::styled(
                 "Failure breakdown",
                 theme::subtitle_style(),
@@ -292,25 +311,21 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
                     lines.push(Line::from(format!("  {reason:<24} {count}")));
                 }
             }
+            render_detail_text(frame, chunks[2], lines);
         }
-        2 => lines.extend([
-            Line::from(Span::styled(
-                "Latency distribution",
-                theme::subtitle_style(),
-            )),
-            Line::from(format!(
-                "Min         : {}",
-                fmt_ms(result.samples.first().copied().unwrap_or(0.0))
-            )),
-            Line::from(format!("P50         : {}", fmt_ms(result.p50))),
-            Line::from(format!("P90         : {}", fmt_ms(result.p90))),
-            Line::from(format!("P95         : {}", fmt_ms(result.p95))),
-            Line::from(format!("Samples     : {}", result.samples.len())),
-        ]),
-        _ => lines.push(Line::from(
-            "Run a speed test to populate throughput details.",
-        )),
+        2 => render_latency_chart(frame, chunks[2], result),
+        3 => render_detail_text(
+            frame,
+            chunks[2],
+            vec![Line::from(
+                "Run a speed test to populate throughput details.",
+            )],
+        ),
+        _ => render_latency_map(frame, chunks[2], app),
     }
+}
+
+fn render_detail_text(frame: &mut Frame, area: Rect, mut lines: Vec<Line<'static>>) {
     lines.extend([
         Line::from(""),
         Line::from(Span::styled(
@@ -318,9 +333,106 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
             theme::hint_style(),
         )),
     ]);
-    // The modal already draws a titled, bordered frame; render the body straight
-    // into its inner rect so there is a single clean border (no nested panel).
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_latency_chart(frame: &mut Frame, area: Rect, result: &ProbeResult) {
+    if result.samples.is_empty() {
+        render_detail_text(
+            frame,
+            area,
+            vec![Line::from("No successful probe samples available.")],
+        );
+        return;
+    }
+    let points: Vec<(f64, f64)> = result
+        .samples
+        .iter()
+        .enumerate()
+        .map(|(index, seconds)| (index as f64 + 1.0, seconds * 1000.0))
+        .collect();
+    let max_y = points
+        .iter()
+        .map(|(_, value)| *value)
+        .fold(1.0_f64, f64::max);
+    let max_x = points.len().max(2) as f64;
+    let chart = Chart::new(vec![Dataset::default()
+        .name("latency ms")
+        .graph_type(GraphType::Line)
+        .marker(Marker::Braille)
+        .style(theme::good_style())
+        .data(&points)])
+    .block(widgets::panel_block("Probe latency", false))
+    .x_axis(
+        Axis::default()
+            .title("probe")
+            .bounds([1.0, max_x])
+            .labels(vec![
+                Line::from("1"),
+                Line::from(format!("{}", points.len())),
+            ]),
+    )
+    .y_axis(
+        Axis::default()
+            .title("ms")
+            .bounds([0.0, max_y])
+            .labels(vec![Line::from("0"), Line::from(format!("{max_y:.0}"))]),
+    );
+    frame.render_widget(chart, area);
+}
+
+fn render_latency_map(frame: &mut Frame, area: Rect, app: &App) {
+    let results = app
+        .sorted_results()
+        .into_iter()
+        .take(app.config.top)
+        .collect::<Vec<_>>();
+    if results.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No results available for the latency map.").style(theme::hint_style()),
+            area,
+        );
+        return;
+    }
+    let points = results
+        .iter()
+        .enumerate()
+        .map(|(index, result)| (index as f64 + 1.0, result.avg * 1000.0))
+        .collect::<Vec<_>>();
+    let selected = app.result_cursor.min(points.len().saturating_sub(1));
+    let max_y = points
+        .iter()
+        .map(|(_, value)| *value)
+        .fold(1.0_f64, f64::max);
+    let palette = theme::palette();
+    let regular = points
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != selected)
+        .map(|(_, point)| *point)
+        .collect::<Vec<_>>();
+    let selected_point = [points[selected]];
+    let canvas = Canvas::default()
+        .block(widgets::panel_block(
+            "Latency map — rank vs average ms",
+            false,
+        ))
+        .x_bounds([1.0, points.len().max(2) as f64])
+        .y_bounds([0.0, max_y])
+        .marker(Marker::Braille)
+        .paint(move |ctx| {
+            if !regular.is_empty() {
+                ctx.draw(&Points {
+                    coords: &regular,
+                    color: palette.info,
+                });
+            }
+            ctx.draw(&Points {
+                coords: &selected_point,
+                color: palette.highlight,
+            });
+        });
+    frame.render_widget(canvas, area);
 }
 
 fn render_header(app: &App, frame: &mut Frame, area: Rect) {
@@ -604,13 +716,18 @@ fn render_decision_panel(app: &App, frame: &mut Frame, area: Rect) {
         0.0
     };
     let ranked = app.sorted_results();
+    let candidates = ranked
+        .iter()
+        .copied()
+        .filter(|result| result.ok > 0)
+        .collect::<Vec<_>>();
     let mut lines = vec![Line::from(vec![
         Span::styled(format!("READY {ready}  "), theme::good_style()),
         Span::styled(format!("DEGRADED {degraded}  "), theme::warn_style()),
         Span::styled(format!("FAILED {failed}  "), theme::bad_style()),
         Span::raw(format!("{rate:.1}% probe success")),
     ])];
-    if let Some(result) = ranked.first() {
+    if let Some(result) = candidates.first() {
         lines.push(Line::from(format!(
             "Recommended: {} • {} • p95 {} • confidence {}",
             result.ip,
@@ -618,7 +735,7 @@ fn render_decision_panel(app: &App, frame: &mut Frame, area: Rect) {
             fmt_ms(result.p95),
             result_confidence(result)
         )));
-        let backups = ranked
+        let backups = candidates
             .iter()
             .skip(1)
             .take(2)
@@ -947,6 +1064,7 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
             ("f", "show failures"),
             ("r", "rerun targets"),
             ("n", "new sample"),
+            ("m", "comparison export"),
             ("/", "commands"),
             ("?", "help"),
             ("q", "quit"),

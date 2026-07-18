@@ -94,7 +94,7 @@ fn scanning_lines(app: &App) -> Vec<Line<'static>> {
         key("Home / End", "Jump to top / bottom"),
         key("Tab", "Focus table and action buttons"),
         key("Enter", "Open full details for the selected IP"),
-        key("1–4 / Tab", "Switch detail tabs in the selected-IP modal"),
+        key("1–5 / Tab", "Switch detail tabs in the selected-IP modal"),
     ];
 
     if app.scan_complete {

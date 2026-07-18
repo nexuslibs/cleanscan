@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Wrap},
+    widgets::{List, ListItem, Paragraph, Wrap},
     Frame,
 };
 
@@ -378,25 +378,12 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
     let inner = list_block.inner(main_layout[0]);
     app.ranges_inner = Some(inner);
 
-    let visible = inner.height as usize;
-    let max_scroll = app.cidr_candidates.len().saturating_sub(visible);
-    if app.cursor < app.ranges_scroll {
-        app.ranges_scroll = app.cursor;
-    } else if app.cursor >= app.ranges_scroll.saturating_add(visible) {
-        app.ranges_scroll = app.cursor + 1 - visible;
-    }
-    app.ranges_scroll = app.ranges_scroll.min(max_scroll);
-    let start = app.ranges_scroll;
-
-    let lines: Vec<Line> = app
+    let items: Vec<ListItem> = app
         .cidr_candidates
         .iter()
         .enumerate()
-        .skip(start)
-        .take(visible)
         .map(|(i, e)| {
             let mark = if e.selected { "☑" } else { "☐" };
-            let cursor = if i == app.cursor { "› " } else { "  " };
             let style = if i == app.cursor {
                 theme::row_selected_style()
             } else if e.selected {
@@ -404,12 +391,22 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
             } else {
                 theme::hint_style()
             };
-            Line::from(format!("{}{} {}", cursor, mark, e.cidr)).style(style)
+            ListItem::new(Line::from(format!("{} {}", mark, e.cidr)).style(style))
         })
         .collect();
-
-    let para = Paragraph::new(lines).block(list_block);
-    frame.render_widget(para, main_layout[0]);
+    app.ranges_list_state = app
+        .ranges_list_state
+        .with_offset(app.ranges_scroll)
+        .with_selected((!app.cidr_candidates.is_empty()).then_some(app.cursor));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(list_block)
+            .highlight_style(theme::row_selected_style())
+            .highlight_symbol("› "),
+        main_layout[0],
+        &mut app.ranges_list_state,
+    );
+    app.ranges_scroll = app.ranges_list_state.offset();
 
     // Right Side Info Panel
     let selected_count = app.cidr_candidates.iter().filter(|e| e.selected).count();
@@ -570,7 +567,6 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         for _ in 0..count {
             let i = field_idx;
             let f = SettingField::ALL[i];
-            let cursor = if i == app.cursor { "› " } else { "  " };
             let style = if i == app.cursor {
                 theme::row_selected_style()
             } else {
@@ -585,30 +581,30 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
                 f.value_string(&app.config)
             };
             let label = format!("{:20}", f.label());
-            lines.push(Line::from(format!("{}{} = {}", cursor, label, value)).style(style));
+            lines.push(Line::from(format!("{} = {}", label, value)).style(style));
             row_map.push(Some(i));
             field_idx += 1;
         }
     }
 
-    let visible = inner.height as usize;
-    let cursor_row = row_map
-        .iter()
-        .position(|field| *field == Some(app.cursor))
-        .unwrap_or(0);
-    let max_scroll = lines.len().saturating_sub(visible);
-    if cursor_row < app.settings_scroll {
-        app.settings_scroll = cursor_row;
-    } else if visible > 0 && cursor_row >= app.settings_scroll + visible {
-        app.settings_scroll = cursor_row + 1 - visible;
-    }
-    app.settings_scroll = app.settings_scroll.min(max_scroll);
-    let start = app.settings_scroll.min(lines.len());
-    let end = (start + visible).min(lines.len());
+    let items = lines.into_iter().map(ListItem::new).collect::<Vec<_>>();
+    let selected_row = row_map.iter().position(|field| *field == Some(app.cursor));
+    app.settings_list_state = app
+        .settings_list_state
+        .with_offset(app.settings_scroll)
+        .with_selected(selected_row);
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(block)
+            .highlight_style(theme::row_selected_style())
+            .highlight_symbol("› "),
+        main_layout[0],
+        &mut app.settings_list_state,
+    );
+    app.settings_scroll = app.settings_list_state.offset();
+    let start = app.settings_scroll.min(row_map.len());
+    let end = (start + inner.height as usize).min(row_map.len());
     app.settings_row_map = row_map[start..end].to_vec();
-
-    let para = Paragraph::new(lines[start..end].to_vec()).block(block);
-    frame.render_widget(para, main_layout[0]);
 
     // Right Side Description Panel
     let current_field = SettingField::ALL[app.cursor.min(SettingField::ALL.len() - 1)];
@@ -653,9 +649,7 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
         .collect();
 
     let selected_count = selected.len();
-    if app.preview_targets.is_empty() && selected_count > 0 {
-        app.regenerate_preview();
-    }
+    let preview_ready = !app.preview_targets.is_empty();
     let total_ips = if app.preview_targets.is_empty() {
         selected_count.saturating_mul(app.config.sample_per_cidr)
     } else {
@@ -762,14 +756,16 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            if app.config.concurrency > 500 {
+            if !preview_ready {
+                "Unavailable: target preview could not be generated"
+            } else if app.config.concurrency > 500 {
                 "Warning: very high concurrency may trigger rate limits"
             } else if total_ips > 10_000 {
                 "Warning: large target set; this scan may take significant time"
             } else {
                 "Ready: sampled targets are stable for this review"
             },
-            if app.config.concurrency > 500 || total_ips > 10_000 {
+            if !preview_ready || app.config.concurrency > 500 || total_ips > 10_000 {
                 theme::warn_style()
             } else {
                 theme::good_style()

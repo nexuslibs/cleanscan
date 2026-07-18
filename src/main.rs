@@ -120,6 +120,17 @@ fn main() -> Result<()> {
 
     normalize_config(&mut config);
 
+    if let Some(min) = args.min_success_rate {
+        if !min.is_finite() || !(0.0..=1.0).contains(&min) {
+            anyhow::bail!("--min-success-rate must be a finite value between 0.0 and 1.0");
+        }
+    }
+    if let Some(max) = args.max_p95_ms {
+        if !max.is_finite() || max < 0.0 {
+            anyhow::bail!("--max-p95-ms must be a finite, non-negative value");
+        }
+    }
+
     if config.host.is_empty() && (args.cli || args.ips.is_some() || !args.cidr.is_empty()) {
         anyhow::bail!(
             "no host configured — pass --host <domain> or set a host in the TUI settings"
@@ -137,9 +148,10 @@ fn main() -> Result<()> {
             args.min_success_rate,
             args.max_p95_ms,
             args.fail_if_no_healthy_target,
+            args.seed,
         )
     } else {
-        tui::run_tui(config, args.cidr, args.ips)
+        tui::run_tui(config, args.cidr, args.ips, args.seed)
     }
 }
 
@@ -165,8 +177,9 @@ fn cli_mode(
     min_success_rate: Option<f64>,
     max_p95_ms: Option<f64>,
     fail_if_no_healthy_target: bool,
+    seed: Option<u64>,
 ) -> Result<()> {
-    let targets = scanner::collect_targets(&config, &cidr, &ips)?;
+    let targets = scanner::collect_targets_with_optional_seed(&config, &cidr, &ips, seed)?;
     let total = targets.len();
 
     eprintln!(
@@ -219,9 +232,7 @@ fn cli_mode(
             && min_success_rate.is_none_or(|min| result.success_rate >= min)
             && max_p95_ms.is_none_or(|max| result.p95 * 1000.0 <= max)
     });
-    if fail_if_no_healthy_target && !healthy {
-        anyhow::bail!("no target met the configured health thresholds");
-    }
+    let health_error = fail_if_no_healthy_target && !healthy;
 
     let rows = results.iter().take(config.top).collect::<Vec<_>>();
     let rendered = match format {
@@ -266,6 +277,10 @@ fn cli_mode(
         std::fs::write(path, rendered)?;
     } else {
         println!("{rendered}");
+    }
+
+    if health_error {
+        anyhow::bail!("no target met the configured health thresholds");
     }
 
     Ok(())

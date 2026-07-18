@@ -210,11 +210,11 @@ latency dashboard.
 
 ## Output
 
-Only IPs with at least one successful probe are shown. Probes are scheduled one
+All sampled IPs are shown, including targets with no successful probes. Probes are scheduled one
 at a time per IP: successful IPs receive priority for their remaining probes,
 unexplored IPs are preferred over IPs that have failed, and original order is
-used as a deterministic tie-breaker. CLI results are ranked by failure count
-(ascending), then `p95`, `max`, and `avg` latency (all ascending). Each row reports `ok`/`fail` counts and `avg`,
+used as a deterministic tie-breaker. CLI results are ranked by success rate
+(descending), then `p95` and average latency (ascending). Each row reports `ok`/`fail` counts and `avg`,
 `p50`, `p90`, `p95`, and `max` latency in seconds, followed by individual
 successful probe samples in the `samples` column. Only the top `N` rows are
 printed, where `N` is controlled by `--top`.
