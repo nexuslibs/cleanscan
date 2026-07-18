@@ -40,7 +40,10 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    if area.width < 100 {
+    // The full 12-column table needs 120 (WIDTHS) + 11 column separators
+    // + 2 border columns = 133 columns to render without clipping, so only
+    // enter wide mode once the area is at least that wide.
+    if area.width < 134 {
         render_compact(app, frame, area);
     } else {
         render_wide(app, frame, area);

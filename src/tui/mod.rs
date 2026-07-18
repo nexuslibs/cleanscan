@@ -811,7 +811,7 @@ impl App {
                 })
                 .filter(|r| match &self.country_filter {
                     Some(want) => r.country.as_deref().is_some_and(|c| {
-                        c.to_ascii_lowercase().contains(&want.to_ascii_lowercase())
+                        c.to_lowercase().contains(&want.to_lowercase())
                     }),
                     None => true,
                 })
@@ -2780,6 +2780,66 @@ mod tests {
         assert!(app.speed_selected.contains("192.0.2.1"));
         app.speed_query.clear();
         assert!(app.speed_selected.contains("192.0.2.1"));
+    }
+
+    #[test]
+    fn location_filter_matches_colo_case_insensitively() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut a = result("10.0.0.1", 0, 0.1);
+        a.colo = Some("Fra".to_string());
+        let mut b = result("10.0.0.2", 0, 0.1);
+        b.colo = Some("gru".to_string());
+        app.results = vec![a, b];
+        app.colo_filter = Some("fra".to_string());
+        let ips: Vec<_> = app.sorted_results().iter().map(|r| r.ip.clone()).collect();
+        assert_eq!(ips, vec!["10.0.0.1"]);
+    }
+
+    #[test]
+    fn location_filter_matches_unicode_country_substring() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut a = result("10.0.0.1", 0, 0.1);
+        a.country = Some("Côte d'Ivoire".to_string());
+        let mut b = result("10.0.0.2", 0, 0.1);
+        b.country = Some("France".to_string());
+        app.results = vec![a, b];
+        // "CÔTE" (uppercase circumflex) must match "Côte d'Ivoire" case-insensitively.
+        app.country_filter = Some("CÔTE".to_string());
+        let ips: Vec<_> = app.sorted_results().iter().map(|r| r.ip.clone()).collect();
+        assert_eq!(ips, vec!["10.0.0.1"]);
+    }
+
+    #[test]
+    fn location_sort_by_colo_and_country() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut a = result("10.0.0.1", 0, 0.1);
+        a.colo = Some("gru".to_string());
+        a.country = Some("Brazil".to_string());
+        let mut b = result("10.0.0.2", 0, 0.1);
+        b.colo = Some("fra".to_string());
+        b.country = Some("Germany".to_string());
+        app.results = vec![a, b];
+        app.sort_asc = true;
+
+        app.sort_col = 10; // by colo
+        let mut ips: Vec<_> = app.sorted_results().iter().map(|r| r.ip.clone()).collect();
+        assert_eq!(ips, vec!["10.0.0.2", "10.0.0.1"]); // fra < gru
+
+        app.sort_col = 11; // by country
+        ips = app.sorted_results().iter().map(|r| r.ip.clone()).collect();
+        assert_eq!(ips, vec!["10.0.0.1", "10.0.0.2"]); // Brazil < Germany
     }
 
     #[test]
