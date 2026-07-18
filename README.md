@@ -16,6 +16,7 @@ the best Cloudflare edge IPs to reach a given origin host.
   the `--cli` flag.
 - Custom DNS resolution per IP, HTTP/2 adaptive windows, configurable
   concurrency, probes, and timeouts.
+- Selective upload/download throughput tests for successful latency targets.
 - Persistent TUI settings, including selected CIDR ranges and scan parameters.
 
 ## Build
@@ -135,7 +136,8 @@ The following parameters are editable, with the same meaning as their CLI
 counterparts: `Host` (`--host`), `Path` (`--path`), `Sample per CIDR`
 (`--sample-per-cidr`), `Probes` (`--probes`), `Concurrency` (`--concurrency`),
 `Timeout (ms)` (`--timeout-ms`), `Connect timeout (ms)` (`--connect-timeout-ms`),
-and `Top results` (`--top`).
+and `Top results` (`--top`). Speed-test settings are also editable: download
+path, upload path, payload size in MB, and repetition count.
 Target-source flags such as `--cidr` and `--ips` are selected before launching
 the TUI and are not edited in this screen.
 
@@ -146,6 +148,14 @@ the TUI and are not edited in this screen.
 | `q`       | Quit                            |
 | `p` / `␣` | Pause / resume the scan         |
 | `s`       | Save results to a `.tsv` file (after the scan finishes) |
+| `v`       | Select successful IPs for speed testing (after the scan finishes) |
+
+**Speed-test screen**
+
+After latency scanning completes, press `v` to select successful IPs. Press
+`space` to toggle an IP, `A` or `D` to select or clear all, `n` for download,
+`u` for upload, `b` for both, and `Enter` to start. Results report throughput
+in Mbps for each direction; `Esc` or `b` returns to the latency dashboard.
 
 ### CLI options
 
@@ -182,6 +192,11 @@ CIDR ranges are sampled randomly, so overlapping samples may produce fewer
 unique targets than `sample-per-cidr` suggests. Each probe is an HTTPS request
 to the configured host and path, using the candidate IP for the connection
 while retaining the hostname for TLS SNI and the Host header.
+
+Speed tests use the same direct-IP connection behavior. The default endpoints
+are `/speed-test/100mb.bin` for downloads and `/speed-test/upload` for uploads;
+the download endpoint should serve at least the configured payload size, and
+the upload endpoint should consume the complete POST body before responding.
 
 ## Configuration
 

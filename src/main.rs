@@ -1,5 +1,6 @@
 mod config;
 mod scanner;
+mod speed;
 mod tui;
 
 use clap::Parser;

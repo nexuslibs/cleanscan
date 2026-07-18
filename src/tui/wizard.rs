@@ -16,6 +16,10 @@ use crate::tui::{App, ButtonAction, WizardStep};
 pub enum SettingField {
     Host,
     Path,
+    DownloadPath,
+    UploadPath,
+    SpeedPayloadMb,
+    SpeedRepetitions,
     SamplePerCidr,
     Probes,
     Concurrency,
@@ -30,12 +34,18 @@ const MAX_CONCURRENCY: usize = 10_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 const MAX_CONNECT_TIMEOUT_MS: u64 = 600_000;
 const MAX_TOP: usize = 10_000;
+const MAX_SPEED_PAYLOAD_MB: u64 = 1_024;
+const MAX_SPEED_REPETITIONS: usize = 100;
 
 impl SettingField {
     /// All settings fields in display order.
-    pub const ALL: [SettingField; 8] = [
+    pub const ALL: [SettingField; 12] = [
         SettingField::Host,
         SettingField::Path,
+        SettingField::DownloadPath,
+        SettingField::UploadPath,
+        SettingField::SpeedPayloadMb,
+        SettingField::SpeedRepetitions,
         SettingField::SamplePerCidr,
         SettingField::Probes,
         SettingField::Concurrency,
@@ -48,6 +58,10 @@ impl SettingField {
         match self {
             SettingField::Host => "Host",
             SettingField::Path => "Path",
+            SettingField::DownloadPath => "Download path",
+            SettingField::UploadPath => "Upload path",
+            SettingField::SpeedPayloadMb => "Speed payload (MB)",
+            SettingField::SpeedRepetitions => "Speed repetitions",
             SettingField::SamplePerCidr => "Sample per CIDR",
             SettingField::Probes => "Probes",
             SettingField::Concurrency => "Concurrency",
@@ -61,6 +75,10 @@ impl SettingField {
         match self {
             SettingField::Host => "The hostname used in SNI and the Host header for HTTP probes (e.g. app.iplat.ir). Cleanscan resolves this host to the tested edge IPs directly.",
             SettingField::Path => "The HTTP request path to probe (e.g. /cdn-cgi/trace). Typically points to a lightweight text file or endpoint to minimize bandwidth usage.",
+            SettingField::DownloadPath => "Static file endpoint used for download speed tests.",
+            SettingField::UploadPath => "POST endpoint used for upload speed tests; it should consume and discard the request body.",
+            SettingField::SpeedPayloadMb => "Payload size used for each upload/download repetition. Larger payloads reduce short-test noise but use more bandwidth.",
+            SettingField::SpeedRepetitions => "Number of upload/download repetitions per selected IP; reported speeds are averaged.",
             SettingField::SamplePerCidr => "Number of random IPs sampled from each selected CIDR. Higher values increase coverage across the edge network, but increase total targets.",
             SettingField::Probes => "Number of requests sent to each IP to probe latency. More probes filter out transient noise and establish a highly accurate latency percentile.",
             SettingField::Concurrency => "Maximum number of simultaneous request workers. Higher concurrency speeds up scanning but may trigger rate limiting or CPU bottlenecks.",
@@ -75,6 +93,10 @@ impl SettingField {
         match self {
             SettingField::Host => args.host.clone(),
             SettingField::Path => args.path.clone(),
+            SettingField::DownloadPath => args.download_path.clone(),
+            SettingField::UploadPath => args.upload_path.clone(),
+            SettingField::SpeedPayloadMb => (args.speed_payload_bytes / (1024 * 1024)).to_string(),
+            SettingField::SpeedRepetitions => args.speed_repetitions.to_string(),
             SettingField::SamplePerCidr => args.sample_per_cidr.to_string(),
             SettingField::Probes => args.probes.to_string(),
             SettingField::Concurrency => args.concurrency.to_string(),
@@ -85,7 +107,13 @@ impl SettingField {
     }
 
     fn is_numeric(&self) -> bool {
-        !matches!(self, SettingField::Host | SettingField::Path)
+        !matches!(
+            self,
+            SettingField::Host
+                | SettingField::Path
+                | SettingField::DownloadPath
+                | SettingField::UploadPath
+        )
     }
 
     /// Step size used when nudging a numeric field with up/down arrows.
@@ -93,6 +121,7 @@ impl SettingField {
         match self {
             SettingField::TimeoutMs | SettingField::ConnectTimeoutMs => 100,
             SettingField::SamplePerCidr => 10,
+            SettingField::SpeedPayloadMb => 10,
             _ => 1,
         }
     }
@@ -105,7 +134,12 @@ impl SettingField {
             SettingField::TimeoutMs => MAX_TIMEOUT_MS as i64,
             SettingField::ConnectTimeoutMs => MAX_CONNECT_TIMEOUT_MS as i64,
             SettingField::Top => MAX_TOP as i64,
-            SettingField::Host | SettingField::Path => i64::MAX,
+            SettingField::SpeedPayloadMb => MAX_SPEED_PAYLOAD_MB as i64,
+            SettingField::SpeedRepetitions => MAX_SPEED_REPETITIONS as i64,
+            SettingField::Host
+            | SettingField::Path
+            | SettingField::DownloadPath
+            | SettingField::UploadPath => i64::MAX,
         }
     }
 
@@ -128,7 +162,12 @@ impl SettingField {
             SettingField::TimeoutMs => args.timeout_ms = value as u64,
             SettingField::ConnectTimeoutMs => args.connect_timeout_ms = value as u64,
             SettingField::Top => args.top = value as usize,
-            SettingField::Host | SettingField::Path => {}
+            SettingField::SpeedPayloadMb => args.speed_payload_bytes = value as u64 * 1024 * 1024,
+            SettingField::SpeedRepetitions => args.speed_repetitions = value as usize,
+            SettingField::Host
+            | SettingField::Path
+            | SettingField::DownloadPath
+            | SettingField::UploadPath => {}
         }
     }
 
@@ -150,6 +189,36 @@ impl SettingField {
                     return Err("path must be non-empty and begin with /".to_string());
                 }
                 args.path = raw.to_string();
+            }
+            SettingField::DownloadPath => {
+                if raw.is_empty() || !raw.starts_with('/') {
+                    return Err("download path must be non-empty and begin with /".to_string());
+                }
+                args.download_path = raw.to_string();
+            }
+            SettingField::UploadPath => {
+                if raw.is_empty() || !raw.starts_with('/') {
+                    return Err("upload path must be non-empty and begin with /".to_string());
+                }
+                args.upload_path = raw.to_string();
+            }
+            SettingField::SpeedPayloadMb => {
+                let v = raw
+                    .parse::<u64>()
+                    .map_err(|_| "invalid number".to_string())?;
+                if !(1..=MAX_SPEED_PAYLOAD_MB).contains(&v) {
+                    return Err(format!("must be between 1 and {MAX_SPEED_PAYLOAD_MB}"));
+                }
+                args.speed_payload_bytes = v * 1024 * 1024;
+            }
+            SettingField::SpeedRepetitions => {
+                let v = raw
+                    .parse::<usize>()
+                    .map_err(|_| "invalid number".to_string())?;
+                if !(1..=MAX_SPEED_REPETITIONS).contains(&v) {
+                    return Err(format!("must be between 1 and {MAX_SPEED_REPETITIONS}"));
+                }
+                args.speed_repetitions = v;
             }
             SettingField::SamplePerCidr => {
                 let v = raw

@@ -1,5 +1,6 @@
 pub mod dashboard;
 pub mod help;
+pub mod speed;
 pub mod theme;
 pub mod wizard;
 
@@ -22,6 +23,7 @@ use ratatui::{
 
 use crate::config::AppConfig;
 use crate::scanner::ProbeResult;
+use crate::speed::{SpeedDirection, SpeedResult};
 use crate::tui::wizard::SettingField;
 
 /// Which top-level screen the TUI is showing.
@@ -31,6 +33,9 @@ pub enum Screen {
     Wizard,
     /// Live scanning dashboard.
     Scanning,
+    SpeedSelect,
+    SpeedTesting,
+    SpeedResults,
 }
 
 /// Step within the guided wizard.
@@ -50,6 +55,7 @@ pub enum ButtonAction {
     Quit,
     Save,
     PauseResume,
+    SpeedTest,
 }
 
 /// A selectable CIDR candidate in the wizard's ranges step.
@@ -102,6 +108,14 @@ pub struct App {
     pub confirm_quit: bool,
     /// Set when the wizard's Start action fires; the run loop performs the spawn.
     pub pending_start: bool,
+    pub speed_targets: Vec<String>,
+    pub speed_selected: std::collections::HashSet<String>,
+    pub speed_cursor: usize,
+    pub speed_direction: SpeedDirection,
+    pub speed_results: Vec<SpeedResult>,
+    pub speed_complete: bool,
+    pub speed_start_time: Instant,
+    pub pending_speed_start: bool,
 }
 
 impl App {
@@ -171,6 +185,14 @@ impl App {
             table_col_bounds: Vec::new(),
             confirm_quit: false,
             pending_start: false,
+            speed_targets: Vec::new(),
+            speed_selected: std::collections::HashSet::new(),
+            speed_cursor: 0,
+            speed_direction: SpeedDirection::Both,
+            speed_results: Vec::new(),
+            speed_complete: false,
+            speed_start_time: Instant::now(),
+            pending_speed_start: false,
         }
     }
 
@@ -443,6 +465,7 @@ pub fn run_tui(
 
     let config_arc = Arc::new(config);
     let (tx, rx) = std::sync::mpsc::channel::<ProbeResult>();
+    let (speed_tx, speed_rx) = std::sync::mpsc::channel::<SpeedResult>();
     let paused = Arc::new(AtomicBool::new(false));
     let cancel = Arc::new(AtomicBool::new(false));
 
@@ -478,7 +501,29 @@ pub fn run_tui(
         })
     };
 
+    let spawn_speed = |targets: Vec<String>,
+                       scan_config: Arc<AppConfig>,
+                       direction: SpeedDirection|
+     -> std::thread::JoinHandle<Result<(), String>> {
+        let speed_config = scan_config;
+        let speed_cancel = cancel.clone();
+        let speed_sender = speed_tx.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| format!("failed to create tokio runtime: {e}"))?;
+            rt.block_on(crate::speed::run_speed_scan(
+                targets,
+                speed_config,
+                direction,
+                speed_sender,
+                speed_cancel,
+            ));
+            Ok(())
+        })
+    };
+
     let mut scanner: Option<std::thread::JoinHandle<Result<(), String>>> = None;
+    let mut speed_runner: Option<std::thread::JoinHandle<Result<(), String>>> = None;
 
     // CLI-provided targets start scanning immediately (legacy behavior).
     if has_cli_targets {
@@ -521,6 +566,10 @@ pub fn run_tui(
                         timeout_ms: app.config.timeout_ms,
                         connect_timeout_ms: app.config.connect_timeout_ms,
                         top: app.config.top,
+                        download_path: app.config.download_path.clone(),
+                        upload_path: app.config.upload_path.clone(),
+                        speed_payload_bytes: app.config.speed_payload_bytes,
+                        speed_repetitions: app.config.speed_repetitions,
                     });
                     *scanner = Some(spawn_scanner(targets, scan_config));
                     app.begin_scan(total);
@@ -533,6 +582,9 @@ pub fn run_tui(
         loop {
             while let Ok(r) = rx.try_recv() {
                 app.add_result(r);
+            }
+            while let Ok(r) = speed_rx.try_recv() {
+                app.speed_results.push(r);
             }
 
             if !app.scan_complete && scanner.as_ref().is_some_and(|s| s.is_finished()) {
@@ -549,6 +601,32 @@ pub fn run_tui(
                         Err(_) => {
                             app.scan_complete = true;
                             app.toast("Scan worker panicked");
+                        }
+                    }
+                }
+            }
+
+            if app.screen == Screen::SpeedTesting
+                && speed_runner.as_ref().is_some_and(|s| s.is_finished())
+            {
+                while let Ok(r) = speed_rx.try_recv() {
+                    app.speed_results.push(r);
+                }
+                if let Some(handle) = speed_runner.take() {
+                    match handle.join() {
+                        Ok(Ok(())) => {
+                            app.speed_complete = true;
+                            app.screen = Screen::SpeedResults;
+                        }
+                        Ok(Err(e)) => {
+                            app.speed_complete = true;
+                            app.toast(format!("Speed test failed: {e}"));
+                            app.screen = Screen::SpeedResults;
+                        }
+                        Err(_) => {
+                            app.speed_complete = true;
+                            app.toast("Speed test worker panicked");
+                            app.screen = Screen::SpeedResults;
                         }
                     }
                 }
@@ -576,6 +654,25 @@ pub fn run_tui(
                 app.pending_start = false;
                 start_wizard_scan(&mut app, &mut scanner, &spawn_scanner);
             }
+
+            if app.pending_speed_start {
+                app.pending_speed_start = false;
+                let targets: Vec<String> = app
+                    .speed_targets
+                    .iter()
+                    .filter(|ip| app.speed_selected.contains(*ip))
+                    .cloned()
+                    .collect();
+                app.speed_results.clear();
+                app.speed_complete = false;
+                app.speed_start_time = Instant::now();
+                app.screen = Screen::SpeedTesting;
+                speed_runner = Some(spawn_speed(
+                    targets,
+                    Arc::new(app.config.clone()),
+                    app.speed_direction,
+                ));
+            }
         }
         Ok(())
     };
@@ -584,6 +681,9 @@ pub fn run_tui(
 
     cancel.store(true, Ordering::Relaxed);
     if let Some(s) = scanner {
+        let _ = s.join();
+    }
+    if let Some(s) = speed_runner {
         let _ = s.join();
     }
     result
@@ -635,6 +735,8 @@ impl App {
         match self.screen {
             Screen::Wizard => wizard::handle_wizard_key(self, code),
             Screen::Scanning => self.handle_scan_key(code),
+            Screen::SpeedSelect => self.handle_speed_select_key(code),
+            Screen::SpeedTesting | Screen::SpeedResults => self.handle_speed_results_key(code),
         }
     }
 
@@ -651,6 +753,9 @@ impl App {
         match self.screen {
             Screen::Wizard => wizard::render(self, frame, frame.area()),
             Screen::Scanning => dashboard::render(self, frame, frame.area()),
+            Screen::SpeedSelect | Screen::SpeedTesting | Screen::SpeedResults => {
+                speed::render(self, frame, frame.area())
+            }
         }
 
         if self.show_help {
@@ -670,6 +775,9 @@ impl App {
                 }
             }
             KeyCode::Char('s') | KeyCode::Char('S') => self.save(),
+            KeyCode::Char('v') | KeyCode::Char('V') if self.scan_complete => {
+                self.open_speed_selection();
+            }
             KeyCode::Up if self.scroll > 0 => {
                 self.scroll -= 1;
             }
@@ -678,6 +786,76 @@ impl App {
             KeyCode::PageDown => self.scroll += 10,
             KeyCode::Home => self.scroll = 0,
             KeyCode::End => self.scroll = usize::MAX,
+            _ => {}
+        }
+    }
+
+    fn open_speed_selection(&mut self) {
+        self.speed_targets = self
+            .results
+            .iter()
+            .filter(|result| result.ok > 0)
+            .map(|result| result.ip.clone())
+            .collect();
+        self.speed_targets.sort();
+        self.speed_selected.clear();
+        self.speed_cursor = 0;
+        self.speed_direction = SpeedDirection::Both;
+        self.speed_results.clear();
+        self.speed_complete = false;
+        self.screen = Screen::SpeedSelect;
+    }
+
+    fn handle_speed_select_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char(' ') => {
+                if let Some(ip) = self.speed_targets.get(self.speed_cursor).cloned() {
+                    if !self.speed_selected.insert(ip.clone()) {
+                        self.speed_selected.remove(&ip);
+                    }
+                }
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                self.speed_selected = self.speed_targets.iter().cloned().collect();
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => self.speed_selected.clear(),
+            KeyCode::Char('u') | KeyCode::Char('U') => {
+                self.speed_direction = SpeedDirection::Upload
+            }
+            KeyCode::Char('b') | KeyCode::Char('B') => self.speed_direction = SpeedDirection::Both,
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.speed_direction = SpeedDirection::Download
+            }
+            KeyCode::Up if self.speed_cursor > 0 => self.speed_cursor -= 1,
+            KeyCode::Down if self.speed_cursor + 1 < self.speed_targets.len() => {
+                self.speed_cursor += 1
+            }
+            KeyCode::PageUp => self.speed_cursor = self.speed_cursor.saturating_sub(10),
+            KeyCode::PageDown => {
+                self.speed_cursor =
+                    (self.speed_cursor + 10).min(self.speed_targets.len().saturating_sub(1))
+            }
+            KeyCode::Enter => {
+                if self.speed_selected.is_empty() {
+                    self.toast("Select at least one successful IP");
+                } else {
+                    self.pending_speed_start = true;
+                }
+            }
+            KeyCode::Esc => self.screen = Screen::Scanning,
+            _ => {}
+        }
+    }
+
+    fn handle_speed_results_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('B') => {
+                self.screen = Screen::Scanning;
+            }
+            KeyCode::Up if self.scroll > 0 => self.scroll -= 1,
+            KeyCode::Down => self.scroll += 1,
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
+            KeyCode::PageDown => self.scroll += 10,
             _ => {}
         }
     }
@@ -808,6 +986,7 @@ impl App {
                 let next = !self.paused.load(Ordering::Relaxed);
                 self.paused.store(next, Ordering::Relaxed);
             }
+            ButtonAction::SpeedTest => self.open_speed_selection(),
         }
     }
 }

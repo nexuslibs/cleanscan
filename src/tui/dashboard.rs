@@ -404,6 +404,7 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Length(18),
+            Constraint::Length(20),
             Constraint::Min(0),
             Constraint::Length(18),
         ])
@@ -423,10 +424,19 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     };
     app.button(frame, chunks[0], left_label, left_action, false);
 
-    app.button(frame, chunks[2], "Quit (q)", ButtonAction::Quit, false);
+    if app.scan_complete {
+        app.button(
+            frame,
+            chunks[1],
+            "Speed test (v)",
+            ButtonAction::SpeedTest,
+            false,
+        );
+    }
+    app.button(frame, chunks[3], "Quit (q)", ButtonAction::Quit, false);
 
     let msg = app.visible_message().unwrap_or(if app.scan_complete {
-        "Scan complete — ↑/↓ scroll, s save, q quit"
+        "Scan complete — ↑/↓ scroll, s save, v speed test, q quit"
     } else {
         "↑/↓ scroll • space pause • ? help • q quit"
     });

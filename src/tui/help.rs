@@ -13,6 +13,9 @@ pub fn overlay(app: &App, frame: &mut Frame, area: Rect) {
     let lines: Vec<Line> = match app.screen {
         Screen::Wizard => wizard_lines(app.wizard_step),
         Screen::Scanning => scanning_lines(),
+        Screen::SpeedSelect => speed_selection_lines(),
+        Screen::SpeedTesting => speed_testing_lines(),
+        Screen::SpeedResults => speed_results_lines(),
     };
 
     let block = Block::default()
@@ -88,6 +91,7 @@ fn scanning_lines() -> Vec<Line<'static>> {
         key("Home / End", "Jump to top / bottom"),
         key("space  or  p", "Pause / resume the scan"),
         key("s", "Save results to a .tsv file (when done)"),
+        key("v", "Select successful IPs for upload/download speed tests"),
         key("Click header", "Sort results by that column"),
         key("Mouse wheel", "Scroll the results table"),
         key("?  or  any key", "Toggle / close this help"),
@@ -97,5 +101,37 @@ fn scanning_lines() -> Vec<Line<'static>> {
             " Colors: green = fast, yellow = ok, red = slow/failing",
             theme::hint_style(),
         )),
+    ]
+}
+
+fn speed_selection_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            " Speed-test target selection",
+            theme::header_style(),
+        )),
+        key("↑ / ↓", "Move through successful IPs"),
+        key("Space", "Toggle the highlighted IP"),
+        key("A / D", "Select all / deselect all"),
+        key("n / u / b", "Download / upload / both"),
+        key("Enter", "Start tests"),
+        key("Esc", "Return to latency results"),
+        key("q", "Quit cleanscan"),
+    ]
+}
+
+fn speed_testing_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(" Speed tests running", theme::header_style())),
+        key("q", "Quit cleanscan"),
+    ]
+}
+
+fn speed_results_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(" Speed-test results", theme::header_style())),
+        key("↑ / ↓", "Scroll results"),
+        key("Esc / b", "Return to latency results"),
+        key("q", "Quit cleanscan"),
     ]
 }
