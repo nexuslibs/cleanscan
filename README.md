@@ -121,7 +121,8 @@ Navigation mirrors the selection screen:
 
 | Key            | Action                                  |
 |----------------|-----------------------------------------|
-| `↑` / `↓` (`k`/`j`) | Move the cursor through the parameters |
+| `j` / `k` | Move the cursor through the parameters |
+| `↑` / `↓` | Increase/decrease the highlighted numeric parameter immediately |
 | `Enter`        | Edit the highlighted parameter          |
 | `char`         | While editing, append to the value      |
 | `Backspace`    | While editing, delete a character       |

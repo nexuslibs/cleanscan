@@ -109,6 +109,29 @@ impl SettingField {
         }
     }
 
+    /// Return the value after one up/down adjustment, clamped to the field's
+    /// valid range.
+    fn nudged_value(&self, value: i64, direction: i64) -> i64 {
+        value
+            .saturating_add(direction.saturating_mul(self.step()))
+            .clamp(1, self.max_value())
+    }
+
+    /// Adjust this numeric field directly in the application config.
+    fn nudge_config(&self, args: &mut AppConfig, direction: i64) {
+        let value = self.value_string(args).parse::<i64>().unwrap_or(1);
+        let value = self.nudged_value(value, direction);
+        match self {
+            SettingField::SamplePerCidr => args.sample_per_cidr = value as usize,
+            SettingField::Probes => args.probes = value as usize,
+            SettingField::Concurrency => args.concurrency = value as usize,
+            SettingField::TimeoutMs => args.timeout_ms = value as u64,
+            SettingField::ConnectTimeoutMs => args.connect_timeout_ms = value as u64,
+            SettingField::Top => args.top = value as usize,
+            SettingField::Host | SettingField::Path => {}
+        }
+    }
+
     /// Parse `raw` and apply it to `args`. Returns an error message on failure.
     pub fn apply(&self, raw: &str, args: &mut AppConfig) -> Result<(), String> {
         let raw = raw.trim();
@@ -498,8 +521,9 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     desc_para_lines.push(Line::from("  Press Enter to edit directly."));
     if current_field.is_numeric() {
         desc_para_lines.push(Line::from(
-            "  Use ↑/↓ arrows to increment/decrement values.",
+            "  Use ↑/↓ arrows to adjust this value immediately.",
         ));
+        desc_para_lines.push(Line::from("  Use j/k to move between fields."));
     }
 
     let desc_block = Block::default()
@@ -679,7 +703,7 @@ fn render_hint(app: &App, frame: &mut Frame, area: Rect) {
             if app.edit_field.is_some() {
                 "type value • ←/→ move • ↑/↓ step • Enter confirm • Esc cancel"
             } else {
-                "↑/↓ move • Enter edit • 1/2/3 presets • → next • ? help"
+                "j/k move • ↑/↓ adjust numeric • Enter edit • 1/2/3 presets • → next • ? help"
             }
         }
         WizardStep::Review => "Enter start • ← back • ? help",
@@ -848,13 +872,9 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             KeyCode::Home => app.edit_caret = 0,
             KeyCode::End => app.edit_caret = app.edit_buffer.len(),
             KeyCode::Up | KeyCode::Down if field.is_numeric() => {
-                let delta = if code == KeyCode::Up {
-                    field.step()
-                } else {
-                    -field.step()
-                };
+                let delta = if code == KeyCode::Up { 1 } else { -1 };
                 if let Ok(v) = app.edit_buffer.parse::<i64>() {
-                    let nv = v.saturating_add(delta).clamp(1, field.max_value());
+                    let nv = field.nudged_value(v, delta);
                     app.edit_buffer = nv.to_string();
                     app.edit_caret = app.edit_buffer.len();
                 }
@@ -868,11 +888,26 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
         return;
     }
 
+    let field = SettingField::ALL[app.cursor.min(SettingField::ALL.len() - 1)];
     match code {
-        KeyCode::Up | KeyCode::Char('k') if app.cursor > 0 => {
+        KeyCode::Up | KeyCode::Down if field.is_numeric() => {
+            let direction = if code == KeyCode::Up { 1 } else { -1 };
+            field.nudge_config(&mut app.config, direction);
+            app.save_config();
+        }
+        KeyCode::Char('k') if app.cursor > 0 => {
             app.cursor -= 1;
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Char('j') => {
+            let last = SettingField::ALL.len().saturating_sub(1);
+            if app.cursor < last {
+                app.cursor += 1;
+            }
+        }
+        KeyCode::Up if app.cursor > 0 => {
+            app.cursor -= 1;
+        }
+        KeyCode::Down => {
             let last = SettingField::ALL.len().saturating_sub(1);
             if app.cursor < last {
                 app.cursor += 1;
@@ -992,5 +1027,28 @@ mod tests {
         assert_eq!(previous_char_boundary(value, 5), 1);
         assert_eq!(next_char_boundary(value, 1), 5);
         assert_eq!(next_char_boundary(value, 5), value.len());
+    }
+
+    #[test]
+    fn numeric_nudge_uses_field_specific_steps() {
+        assert_eq!(SettingField::Probes.nudged_value(8, 1), 9);
+        assert_eq!(SettingField::SamplePerCidr.nudged_value(100, 1), 110);
+        assert_eq!(SettingField::TimeoutMs.nudged_value(2500, -1), 2400);
+    }
+
+    #[test]
+    fn numeric_nudge_clamps_to_valid_bounds() {
+        assert_eq!(SettingField::Probes.nudged_value(1, -1), 1);
+        assert_eq!(SettingField::Probes.nudged_value(1000, 1), 1000);
+        assert_eq!(SettingField::Top.nudged_value(10_000, 1), 10_000);
+    }
+
+    #[test]
+    fn numeric_nudge_updates_config() {
+        let mut config = AppConfig::default();
+        SettingField::TimeoutMs.nudge_config(&mut config, 1);
+        SettingField::SamplePerCidr.nudge_config(&mut config, -1);
+        assert_eq!(config.timeout_ms, 2600);
+        assert_eq!(config.sample_per_cidr, 90);
     }
 }
