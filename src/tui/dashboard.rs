@@ -314,13 +314,35 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
             render_detail_text(frame, chunks[2], lines);
         }
         2 => render_latency_chart(frame, chunks[2], result),
-        3 => render_detail_text(
-            frame,
-            chunks[2],
-            vec![Line::from(
-                "Run a speed test to populate throughput details.",
-            )],
-        ),
+        3 => {
+            let Some(speed_result) = app.speed_results.iter().find(|speed| speed.ip == result.ip)
+            else {
+                render_detail_text(
+                    frame,
+                    chunks[2],
+                    vec![Line::from(
+                        "Run a speed test to populate throughput details.",
+                    )],
+                );
+                return;
+            };
+            let mut lines = vec![Line::from(Span::styled(
+                "Throughput",
+                theme::subtitle_style(),
+            ))];
+            lines.push(Line::from(format!(
+                "Download   : {}",
+                format_speed_measurement(speed_result.download.as_ref())
+            )));
+            lines.push(Line::from(format!(
+                "Upload     : {}",
+                format_speed_measurement(speed_result.upload.as_ref())
+            )));
+            if let Some(error) = &speed_result.error {
+                lines.push(Line::from(format!("Status     : {error}")));
+            }
+            render_detail_text(frame, chunks[2], lines);
+        }
         _ => render_latency_map(frame, chunks[2], app),
     }
 }
@@ -387,6 +409,13 @@ fn render_latency_map(frame: &mut Frame, area: Rect, app: &App) {
         .into_iter()
         .take(app.config.top)
         .collect::<Vec<_>>();
+    let selected_ip = results
+        .get(app.result_cursor)
+        .map(|result| result.ip.clone());
+    let results = results
+        .into_iter()
+        .filter(|result| !(result.avg == 0.0 && result.ok == 0))
+        .collect::<Vec<_>>();
     if results.is_empty() {
         frame.render_widget(
             Paragraph::new("No results available for the latency map.").style(theme::hint_style()),
@@ -399,7 +428,10 @@ fn render_latency_map(frame: &mut Frame, area: Rect, app: &App) {
         .enumerate()
         .map(|(index, result)| (index as f64 + 1.0, result.avg * 1000.0))
         .collect::<Vec<_>>();
-    let selected = app.result_cursor.min(points.len().saturating_sub(1));
+    let selected = selected_ip
+        .as_deref()
+        .and_then(|ip| results.iter().position(|result| result.ip == ip))
+        .unwrap_or_else(|| app.result_cursor.min(points.len().saturating_sub(1)));
     let max_y = points
         .iter()
         .map(|(_, value)| *value)
@@ -433,6 +465,19 @@ fn render_latency_map(frame: &mut Frame, area: Rect, app: &App) {
             });
         });
     frame.render_widget(canvas, area);
+}
+
+fn format_speed_measurement(value: Option<&crate::speed::SpeedMeasurement>) -> String {
+    value
+        .map(|measurement| {
+            format!(
+                "{:.2} Mbps (p10 {:.2} / p90 {:.2})",
+                measurement.median_bytes_per_second * 8.0 / 1_000_000.0,
+                measurement.p10_bytes_per_second * 8.0 / 1_000_000.0,
+                measurement.p90_bytes_per_second * 8.0 / 1_000_000.0
+            )
+        })
+        .unwrap_or_else(|| "—".to_string())
 }
 
 fn render_header(app: &App, frame: &mut Frame, area: Rect) {
