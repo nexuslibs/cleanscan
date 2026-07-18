@@ -89,7 +89,7 @@ fn main() -> Result<()> {
 
     normalize_config(&mut config);
 
-    if config.host.is_empty() {
+    if config.host.is_empty() && (args.cli || args.ips.is_some() || !args.cidr.is_empty()) {
         anyhow::bail!(
             "no host configured — pass --host <domain> or set a host in the TUI settings"
         );

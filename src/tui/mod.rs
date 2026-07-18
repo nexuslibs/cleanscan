@@ -336,9 +336,10 @@ impl App {
             .iter()
             .copied()
             .filter(|action| {
-                query.is_empty()
-                    || action.label().to_ascii_lowercase().contains(&query)
-                    || action.description().to_ascii_lowercase().contains(&query)
+                (self.screen != Screen::SpeedTesting || *action != Action::SpeedTest)
+                    && (query.is_empty()
+                        || action.label().to_ascii_lowercase().contains(&query)
+                        || action.description().to_ascii_lowercase().contains(&query))
             })
             .collect()
     }
@@ -1004,7 +1005,10 @@ pub fn run_tui(
                 start_wizard_scan(&mut app, &mut scanner, &spawn_scanner);
             }
 
-            if app.pending_speed_start {
+            if app.pending_speed_start
+                && app.screen == Screen::SpeedSelect
+                && speed_runner.is_none()
+            {
                 app.pending_speed_start = false;
                 let targets: Vec<String> = app
                     .speed_targets
@@ -1168,6 +1172,9 @@ impl App {
     }
 
     fn activate_action(&mut self, action: Action) {
+        if action == Action::SpeedTest && self.screen == Screen::SpeedTesting {
+            return;
+        }
         match action {
             Action::Back => self.activate_button(ButtonAction::Back),
             Action::Next => self.activate_button(ButtonAction::Next),
@@ -1869,6 +1876,21 @@ mod tests {
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert!(!app.show_command_palette);
         assert!(app.show_help);
+    }
+
+    #[test]
+    fn command_palette_does_not_offer_speed_test_while_testing() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.screen = Screen::SpeedTesting;
+        app.open_command_palette();
+
+        assert!(!app.filtered_actions().contains(&Action::SpeedTest));
+        app.activate_action(Action::SpeedTest);
+        assert_eq!(app.screen, Screen::SpeedTesting);
     }
 
     #[test]

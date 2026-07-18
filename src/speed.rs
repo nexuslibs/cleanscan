@@ -188,13 +188,29 @@ pub async fn run_speed_scan(
     tx: std::sync::mpsc::Sender<SpeedResult>,
     cancel: Arc<AtomicBool>,
 ) {
-    let semaphore = Arc::new(Semaphore::new(args.concurrency.clamp(1, 4)));
+    let concurrency = args.concurrency.clamp(1, 4);
+    let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut tasks = JoinSet::new();
+    let mut cancellation = Box::pin(async {
+        while !cancel.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    });
 
     for ip in targets {
-        while tasks.len() >= args.concurrency.clamp(1, 4) {
-            if let Some(Ok(result)) = tasks.join_next().await {
-                let _ = tx.send(result);
+        while tasks.len() >= concurrency {
+            tokio::select! {
+                biased;
+                _ = &mut cancellation => {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    return;
+                }
+                result = tasks.join_next() => {
+                    if let Some(Ok(result)) = result {
+                        let _ = tx.send(result);
+                    }
+                }
             }
         }
         if cancel.load(Ordering::Relaxed) {
@@ -209,9 +225,20 @@ pub async fn run_speed_scan(
         });
     }
 
-    while let Some(result) = tasks.join_next().await {
-        if let Ok(result) = result {
-            let _ = tx.send(result);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut cancellation => {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                return;
+            }
+            result = tasks.join_next() => {
+                let Some(result) = result else { break };
+                if let Ok(result) = result {
+                    let _ = tx.send(result);
+                }
+            }
         }
     }
 }
