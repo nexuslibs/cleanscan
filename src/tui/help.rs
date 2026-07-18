@@ -86,7 +86,8 @@ fn wizard_lines(step: WizardStep) -> Vec<Line<'static>> {
 fn scanning_lines() -> Vec<Line<'static>> {
     vec![
         Line::from(Span::styled(" Scanning dashboard", theme::header_style())),
-        key("↑ / ↓", "Scroll the results table"),
+        key("↑ / ↓", "Select a result IP"),
+        key("c", "Copy the selected IP"),
         key("PageUp / PageDn", "Scroll by a page"),
         key("Home / End", "Jump to top / bottom"),
         key("space  or  p", "Pause / resume the scan"),
@@ -130,7 +131,8 @@ fn speed_testing_lines() -> Vec<Line<'static>> {
 fn speed_results_lines() -> Vec<Line<'static>> {
     vec![
         Line::from(Span::styled(" Speed-test results", theme::header_style())),
-        key("↑ / ↓", "Scroll results"),
+        key("↑ / ↓", "Select a result IP"),
+        key("c", "Copy the selected IP"),
         key("Esc / b", "Return to latency results"),
         key("q", "Quit cleanscan"),
     ]

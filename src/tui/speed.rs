@@ -153,7 +153,16 @@ fn render_results(app: &mut App, frame: &mut Frame, area: Rect) {
     let block = Block::default().borders(Borders::ALL).title(" Throughput ");
     let visible = block.inner(area).height.saturating_sub(1) as usize;
     let max_scroll = app.speed_results.len().saturating_sub(visible);
-    app.scroll = app.scroll.min(max_scroll);
+    app.speed_result_cursor = app
+        .speed_result_cursor
+        .min(app.speed_results.len().saturating_sub(1));
+    app.scroll = app
+        .scroll
+        .max(
+            app.speed_result_cursor
+                .saturating_sub(visible.saturating_sub(1)),
+        )
+        .min(max_scroll);
     let header = Row::new(vec![
         Cell::from("IP"),
         Cell::from("Download"),
@@ -166,9 +175,11 @@ fn render_results(app: &mut App, frame: &mut Frame, area: Rect) {
         .iter()
         .skip(app.scroll)
         .take(visible)
-        .map(|result| {
+        .enumerate()
+        .map(|(index, result)| {
+            let selected = app.scroll + index == app.speed_result_cursor;
             let status = result.error.as_deref().unwrap_or("OK");
-            Row::new(vec![
+            let mut row = Row::new(vec![
                 Cell::from(result.ip.clone()),
                 Cell::from(format_measurement(result.download.as_ref())),
                 Cell::from(format_measurement(result.upload.as_ref())),
@@ -177,7 +188,11 @@ fn render_results(app: &mut App, frame: &mut Frame, area: Rect) {
                 } else {
                     theme::good_style()
                 }),
-            ])
+            ]);
+            if selected {
+                row = row.style(theme::highlight_style());
+            }
+            row
         });
     let table = Table::new(
         rows,
@@ -208,7 +223,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
     let text = match app.screen {
         Screen::SpeedSelect => "↑/↓ move • Space select • Enter start • Esc back • q quit",
         Screen::SpeedTesting => "Speed test running • q quit",
-        Screen::SpeedResults => "↑/↓ scroll • Esc/B back to latency results • q quit",
+        Screen::SpeedResults => "↑/↓ select • c copy IP • Esc/B back to latency results • q quit",
         _ => "",
     };
     frame.render_widget(Paragraph::new(text).style(theme::hint_style()), area);

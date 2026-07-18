@@ -1,3 +1,4 @@
+mod clipboard;
 pub mod dashboard;
 pub mod help;
 pub mod speed;
@@ -88,6 +89,7 @@ pub struct App {
     pub message_time: Option<Instant>,
     /// Scroll offset into the results table.
     pub scroll: usize,
+    pub result_cursor: usize,
     /// Scroll offset into the wizard CIDR list.
     pub ranges_scroll: usize,
     /// Currently sorted column index in the results table (natural order = 0).
@@ -113,6 +115,7 @@ pub struct App {
     pub speed_cursor: usize,
     pub speed_direction: SpeedDirection,
     pub speed_results: Vec<SpeedResult>,
+    pub speed_result_cursor: usize,
     pub speed_complete: bool,
     pub speed_start_time: Instant,
     pub pending_speed_start: bool,
@@ -172,6 +175,7 @@ impl App {
             message: None,
             message_time: None,
             scroll: 0,
+            result_cursor: 0,
             ranges_scroll: 0,
             sort_col: 0,
             sort_asc: true,
@@ -190,6 +194,7 @@ impl App {
             speed_cursor: 0,
             speed_direction: SpeedDirection::Both,
             speed_results: Vec::new(),
+            speed_result_cursor: 0,
             speed_complete: false,
             speed_start_time: Instant::now(),
             pending_speed_start: false,
@@ -233,6 +238,7 @@ impl App {
         self.scan_complete = false;
         self.results.clear();
         self.scroll = 0;
+        self.result_cursor = 0;
         self.sort_col = 0;
         self.sort_asc = true;
         self.message = None;
@@ -242,6 +248,30 @@ impl App {
 
     pub fn add_result(&mut self, result: ProbeResult) {
         self.results.push(result);
+    }
+
+    fn copy_selected_ip(&mut self) {
+        let ip = match self.screen {
+            Screen::Scanning => self
+                .sorted_results()
+                .into_iter()
+                .take(self.config.top)
+                .nth(self.result_cursor)
+                .map(|result| result.ip.clone()),
+            Screen::SpeedResults => self
+                .speed_results
+                .get(self.speed_result_cursor)
+                .map(|result| result.ip.clone()),
+            _ => None,
+        };
+        let Some(ip) = ip else {
+            self.toast("No IP selected");
+            return;
+        };
+        match clipboard::copy(&ip) {
+            Ok(destination) => self.toast(format!("Copied {ip} to {destination}")),
+            Err(error) => self.toast(format!("Copy failed: {error}")),
+        }
     }
 
     /// Show a transient status/toast message.
@@ -617,6 +647,8 @@ pub fn run_tui(
                     match handle.join() {
                         Ok(Ok(())) => {
                             app.speed_complete = true;
+                            app.speed_result_cursor = 0;
+                            app.scroll = 0;
                             app.screen = Screen::SpeedResults;
                         }
                         Ok(Err(e)) => {
@@ -780,14 +812,46 @@ impl App {
             KeyCode::Char('v') | KeyCode::Char('V') if self.scan_complete => {
                 self.open_speed_selection();
             }
-            KeyCode::Up if self.scroll > 0 => {
-                self.scroll -= 1;
+            KeyCode::Char('c') | KeyCode::Char('C') => self.copy_selected_ip(),
+            KeyCode::Up => {
+                self.result_cursor = self.result_cursor.saturating_sub(1);
+                self.scroll = self.scroll.min(self.result_cursor);
             }
-            KeyCode::Down => self.scroll += 1,
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
-            KeyCode::PageDown => self.scroll += 10,
-            KeyCode::Home => self.scroll = 0,
-            KeyCode::End => self.scroll = usize::MAX,
+            KeyCode::Down => {
+                let max = self
+                    .sorted_results()
+                    .len()
+                    .min(self.config.top)
+                    .saturating_sub(1);
+                self.result_cursor = (self.result_cursor + 1).min(max);
+                self.scroll = self.scroll.max(self.result_cursor);
+            }
+            KeyCode::PageUp => {
+                self.result_cursor = self.result_cursor.saturating_sub(10);
+                self.scroll = self.scroll.min(self.result_cursor);
+            }
+            KeyCode::PageDown => {
+                let max = self
+                    .sorted_results()
+                    .len()
+                    .min(self.config.top)
+                    .saturating_sub(1);
+                self.result_cursor = (self.result_cursor + 10).min(max);
+                self.scroll = self.scroll.max(self.result_cursor);
+            }
+            KeyCode::Home => {
+                self.result_cursor = 0;
+                self.scroll = 0;
+            }
+            KeyCode::End => {
+                let max = self
+                    .sorted_results()
+                    .len()
+                    .min(self.config.top)
+                    .saturating_sub(1);
+                self.result_cursor = max;
+                self.scroll = max;
+            }
             _ => {}
         }
     }
@@ -854,10 +918,33 @@ impl App {
             KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('B') => {
                 self.screen = Screen::Scanning;
             }
-            KeyCode::Up if self.scroll > 0 => self.scroll -= 1,
-            KeyCode::Down => self.scroll += 1,
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(10),
-            KeyCode::PageDown => self.scroll += 10,
+            KeyCode::Char('c') | KeyCode::Char('C') => self.copy_selected_ip(),
+            KeyCode::Up => {
+                self.speed_result_cursor = self.speed_result_cursor.saturating_sub(1);
+                self.scroll = self.scroll.min(self.speed_result_cursor);
+            }
+            KeyCode::Down => {
+                let max = self.speed_results.len().saturating_sub(1);
+                self.speed_result_cursor = (self.speed_result_cursor + 1).min(max);
+                self.scroll = self.scroll.max(self.speed_result_cursor);
+            }
+            KeyCode::PageUp => {
+                self.speed_result_cursor = self.speed_result_cursor.saturating_sub(10);
+                self.scroll = self.scroll.min(self.speed_result_cursor);
+            }
+            KeyCode::PageDown => {
+                let max = self.speed_results.len().saturating_sub(1);
+                self.speed_result_cursor = (self.speed_result_cursor + 10).min(max);
+                self.scroll = self.scroll.max(self.speed_result_cursor);
+            }
+            KeyCode::Home => {
+                self.speed_result_cursor = 0;
+                self.scroll = 0;
+            }
+            KeyCode::End => {
+                self.speed_result_cursor = self.speed_results.len().saturating_sub(1);
+                self.scroll = self.speed_result_cursor;
+            }
             _ => {}
         }
     }

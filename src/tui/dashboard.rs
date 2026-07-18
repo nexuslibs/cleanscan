@@ -281,6 +281,11 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
     if app.scroll > max_start {
         app.scroll = max_start;
     }
+    app.result_cursor = app.result_cursor.min(display_len.saturating_sub(1));
+    app.scroll = app
+        .scroll
+        .max(app.result_cursor.saturating_sub(visible.saturating_sub(1)))
+        .min(max_start);
 
     let sorted = app.sorted_results();
     let display: Vec<&ProbeResult> = sorted.iter().take(display_len).copied().collect();
@@ -321,6 +326,7 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
         .enumerate()
         .map(|(i, r)| {
             let rank = start + i + 1;
+            let is_selected = start + i == app.result_cursor;
 
             // Highlight rank 1 (fastest IP) to make it look premium
             let is_first = app.sort_col == 4 && app.sort_asc && rank == 1;
@@ -330,7 +336,11 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
                 (r.ip.clone(), rank.to_string())
             };
 
-            let mut base_style = Style::default();
+            let mut base_style = if is_selected {
+                theme::highlight_style()
+            } else {
+                Style::default()
+            };
             if is_first {
                 base_style = base_style.fg(Color::LightCyan).add_modifier(Modifier::BOLD);
             }
@@ -436,9 +446,9 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     app.button(frame, chunks[3], "Quit (q)", ButtonAction::Quit, false);
 
     let msg = app.visible_message().unwrap_or(if app.scan_complete {
-        "Scan complete — ↑/↓ scroll, s save, v speed test, q quit"
+        "Scan complete — ↑/↓ select, c copy IP, s save, v speed test, q quit"
     } else {
-        "↑/↓ scroll • space pause • ? help • q quit"
+        "↑/↓ select • c copy IP • space pause • ? help • q quit"
     });
     let para = Paragraph::new(msg).style(theme::hint_style());
     frame.render_widget(para, chunks[2]);

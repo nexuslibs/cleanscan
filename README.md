@@ -149,13 +149,16 @@ the TUI and are not edited in this screen.
 | `p` / `␣` | Pause / resume the scan         |
 | `s`       | Save results to a `.tsv` file (after the scan finishes) |
 | `v`       | Select successful IPs for speed testing (after the scan finishes) |
+| `↑` / `↓` | Select a result IP |
+| `c`       | Copy the selected IP to the clipboard |
 
 **Speed-test screen**
 
 After latency scanning completes, press `v` to select successful IPs. Press
 `space` to toggle an IP, `A` or `D` to select or clear all, `n` for download,
 `u` for upload, `b` for both, and `Enter` to start. Results report throughput
-in Mbps for each direction; `Esc` or `b` returns to the latency dashboard.
+in Mbps for each direction. Use `↑` / `↓` to select an IP and `c` to copy it;
+`Esc` or `b` returns to the latency dashboard.
 
 ### CLI options
 
