@@ -83,10 +83,14 @@ fn render_selection(app: &mut App, frame: &mut Frame, area: Rect) {
         1,
     ));
     app.speed_table_col_bounds.clear();
-    let widths = [6u16, 25, 11, 13, 13, 10];
+    let widths = [5u16, 25, 11, 13, 13, 8];
     let mut x = table_inner.x;
-    for width in widths {
-        let end = x.saturating_add(width.min(table_inner.right().saturating_sub(x)));
+    for (column, width) in widths.into_iter().enumerate() {
+        let end = if column == widths.len() - 1 {
+            table_inner.right()
+        } else {
+            x.saturating_add(width.min(table_inner.right().saturating_sub(x)))
+        };
         app.speed_table_col_bounds.push((x, end));
         x = end;
     }
@@ -96,6 +100,8 @@ fn render_selection(app: &mut App, frame: &mut Frame, area: Rect) {
         table_inner.width,
         table_inner.height.saturating_sub(1),
     ));
+
+    frame.render_widget(block, chunks[0]);
 
     if indices.is_empty() {
         let empty = Paragraph::new(vec![
@@ -113,9 +119,8 @@ fn render_selection(app: &mut App, frame: &mut Frame, area: Rect) {
                 theme::hint_style(),
             )),
         ])
-        .alignment(ratatui::layout::Alignment::Center)
-        .block(block);
-        frame.render_widget(empty, chunks[0]);
+        .alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(empty, table_inner);
     } else {
         let visible = table_inner.height.saturating_sub(1) as usize;
         app.speed_cursor = app.speed_cursor.min(indices.len().saturating_sub(1));
@@ -196,9 +201,8 @@ fn render_selection(app: &mut App, frame: &mut Frame, area: Rect) {
                     Constraint::Min(8),
                 ],
             )
-            .header(header)
-            .block(block),
-            chunks[0],
+            .header(header),
+            table_inner,
         );
     }
 
@@ -484,7 +488,6 @@ fn format_measurement(value: Option<&crate::speed::SpeedMeasurement>) -> String 
 fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
     let hints: &[widgets::KeyHint] = match app.screen {
         Screen::SpeedSelect => &[
-            ("/", "search"),
             ("s", "reverse sort"),
             ("Tab", "focus"),
             ("Space", "select"),

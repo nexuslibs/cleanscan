@@ -9,6 +9,7 @@ pub mod wizard;
 pub use widgets::{ButtonKind, ToastKind};
 
 use std::{
+    collections::HashSet,
     fs,
     io::{self, Write},
     sync::atomic::{AtomicBool, Ordering},
@@ -1784,11 +1785,12 @@ impl App {
 
     fn speed_visible_indices(&self) -> Vec<usize> {
         let query = self.speed_query.to_ascii_lowercase();
+        let speed_targets: HashSet<&str> = self.speed_targets.iter().map(String::as_str).collect();
         let mut indices: Vec<usize> = self
             .results
             .iter()
             .enumerate()
-            .filter(|(_, result)| self.speed_targets.iter().any(|ip| ip == &result.ip))
+            .filter(|(_, result)| speed_targets.contains(result.ip.as_str()))
             .filter(|(_, result)| {
                 query.is_empty()
                     || result.ip.to_ascii_lowercase().contains(&query)
