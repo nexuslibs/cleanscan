@@ -2,13 +2,16 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarState, Table},
+    widgets::{
+        Bar, BarChart, BarGroup, Cell, LineGauge, Paragraph, Row, Scrollbar, ScrollbarState,
+        Sparkline, Table,
+    },
     Frame,
 };
 
 use crate::scanner::ProbeResult;
 use crate::tui::theme;
-use crate::tui::{App, ButtonAction};
+use crate::tui::{widgets, App, ButtonAction, ButtonKind};
 
 const COLS: [&str; 9] = ["#", "IP", "OK", "Fail", "Avg", "P50", "P90", "P95", "Max"];
 const WIDTHS: [Constraint; 9] = [
@@ -57,22 +60,23 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
         "SCANNING"
     };
 
-    let spans = vec![
-        Span::styled(
-            format!(" CLEANSCAN v{} ", env!("CARGO_PKG_VERSION")),
-            theme::header_style(),
-        ),
-        Span::styled(format!("│ {} ", status), theme::status_style(status)),
-        Span::raw(format!("│ Host: {} ", app.config.host)),
-        Span::raw(format!("│ Path: {} ", app.config.path)),
-        Span::styled(format!("│ elapsed {}", elapsed_str), theme::hint_style()),
-    ];
-    let line = Line::from(spans);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::border_style());
-    let para = Paragraph::new(line).block(block);
-    frame.render_widget(para, area);
+    // A spinner reinforces the "live" state while scanning.
+    let status_text = if status == "SCANNING" {
+        format!("{} {}", widgets::spinner_frame(app.tick), status)
+    } else {
+        status.to_string()
+    };
+
+    widgets::app_header(
+        frame,
+        area,
+        Some((&status_text, theme::status_style(status))),
+        &[
+            widgets::HeaderSegment::new("Host", app.config.host.clone()),
+            widgets::HeaderSegment::new("Path", app.config.path.clone()),
+            widgets::HeaderSegment::new("Elapsed", elapsed_str),
+        ],
+    );
 }
 
 fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
@@ -121,13 +125,41 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
         0.0
     };
 
-    // Panel 1: Progress & Success
-    let progress_lines = vec![
-        Line::from(vec![
-            Span::styled("Progress : ", theme::title_style()),
-            Span::raw(format!("{}/{} targets ({pct}%)", passed, total)),
-        ]),
-        Line::from(vec![
+    // Panel 1: Progress gauge + throughput / workers.
+    let block_p1 = widgets::panel_block("Progress", false);
+    let p1_inner = block_p1.inner(col_chunks[0]);
+    frame.render_widget(block_p1, col_chunks[0]);
+    let p1_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // gauge
+            Constraint::Length(1), // success
+            Constraint::Length(1), // rate / eta
+            Constraint::Min(1),    // workers
+        ])
+        .split(p1_inner);
+
+    let ratio = if total > 0 {
+        (passed as f64 / total as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let gauge = LineGauge::default()
+        .filled_style(if app.scan_complete {
+            theme::good_style()
+        } else {
+            theme::status_style("SCANNING")
+        })
+        .unfilled_style(theme::hint_style())
+        .label(Span::styled(
+            format!("{passed}/{total} ({pct}%)"),
+            theme::title_style(),
+        ))
+        .ratio(ratio);
+    frame.render_widget(gauge, p1_rows[0]);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
             Span::styled("Success  : ", theme::title_style()),
             Span::raw(format!(
                 "{:.1}% ({} ok, {} fail)",
@@ -135,19 +167,25 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
                 total_probes_ok,
                 total_probes_done - total_probes_ok
             )),
-        ]),
-        Line::from(vec![
+        ])),
+        p1_rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
             Span::styled("Speed/ETA: ", theme::title_style()),
             Span::raw(format!("{} • ETA {}", rate_str, eta_str)),
-        ]),
-    ];
-    let block_p1 = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::border_style())
-        .title(" Progress & Workers ");
+        ])),
+        p1_rows[2],
+    );
     frame.render_widget(
-        Paragraph::new(progress_lines).block(block_p1),
-        col_chunks[0],
+        Paragraph::new(Line::from(vec![
+            Span::styled("Workers  : ", theme::title_style()),
+            Span::raw(format!(
+                "{} concurrent • {} probes/IP",
+                app.config.concurrency, app.config.probes
+            )),
+        ])),
+        p1_rows[3],
     );
 
     // Panel 2: Latency summary
@@ -187,15 +225,40 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
             Span::raw(format!("{:.1}ms", median_latency * 1000.0)),
         ]),
     ];
-    let block_p2 = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::border_style())
-        .title(" Latency Metrics ");
-    frame.render_widget(Paragraph::new(latency_lines).block(block_p2), col_chunks[1]);
+    let block_p2 = widgets::panel_block("Latency & Throughput", false);
+    let p2_inner = block_p2.inner(col_chunks[1]);
+    frame.render_widget(block_p2, col_chunks[1]);
+    let p2_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(p2_inner);
+    frame.render_widget(Paragraph::new(latency_lines), p2_rows[0]);
 
-    // Panel 3: Latency Distribution Bar Chart
+    // Throughput sparkline (probes/sec), most recent samples fill the width.
+    let spark_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(9), Constraint::Min(1)])
+        .split(p2_rows[1]);
+    frame.render_widget(
+        Paragraph::new(Span::styled("Thrput/s:", theme::title_style())),
+        spark_cols[0],
+    );
+    let spark_width = spark_cols[1].width as usize;
+    let samples: &[u64] = if app.throughput.len() > spark_width {
+        &app.throughput[app.throughput.len() - spark_width..]
+    } else {
+        &app.throughput
+    };
+    frame.render_widget(
+        Sparkline::default()
+            .data(samples)
+            .style(theme::status_style("SCANNING")),
+        spark_cols[1],
+    );
+
+    // Panel 3: Latency distribution as a horizontal bar chart.
     let total_ok = ok_results.len();
-    let (mut exc, mut gd, mut fr, mut pr) = (0, 0, 0, 0);
+    let (mut exc, mut gd, mut fr, mut pr) = (0u64, 0u64, 0u64, 0u64);
     for r in &ok_results {
         let ms = r.avg * 1000.0;
         match latency_bucket(ms) {
@@ -206,52 +269,36 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
         }
     }
 
-    let make_bar = |count: usize| -> String {
-        if total_ok == 0 {
-            return String::new();
-        }
-        let pct = count as f64 / total_ok as f64;
-        let bar_len = (pct * 8.0).round() as usize;
-        "█".repeat(bar_len)
-    };
+    let bars = [
+        ("<80ms", exc, theme::good_style()),
+        ("80-200", gd, theme::warn_style()),
+        ("200-250", fr, theme::bad_style()),
+        ("≥250ms", pr, theme::bad_style()),
+    ]
+    .into_iter()
+    .map(|(label, value, style)| {
+        Bar::default()
+            .value(value)
+            .label(Line::from(label))
+            .text_value(value.to_string())
+            .style(style)
+    })
+    .collect::<Vec<_>>();
 
-    let distribution_lines = vec![
-        Line::from(vec![
-            Span::styled("  <80ms : ", theme::good_style()),
-            Span::raw(format!("{:<8} ", make_bar(exc))),
-            Span::styled(format!("{exc}"), theme::hint_style()),
-        ]),
-        Line::from(vec![
-            Span::styled("150–200ms: ", theme::warn_style()),
-            Span::raw(format!("{:<8} ", make_bar(gd))),
-            Span::styled(format!("{gd}"), theme::hint_style()),
-        ]),
-        Line::from(vec![
-            Span::styled("200-250 : ", theme::bad_style()),
-            Span::raw(format!("{:<8} ", make_bar(fr))),
-            Span::styled(format!("{fr}"), theme::hint_style()),
-        ]),
-        Line::from(vec![
-            Span::styled("  ≥250ms: ", theme::bad_style()),
-            Span::raw(format!("{:<8} ", make_bar(pr))),
-            Span::styled(format!("{pr}"), theme::hint_style()),
-        ]),
-    ];
-    let block_p3 = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::border_style())
-        .title(" Latency Spread ");
-    frame.render_widget(
-        Paragraph::new(distribution_lines).block(block_p3),
-        col_chunks[2],
-    );
+    let block_p3 = widgets::panel_block("Latency Spread", false);
+    let chart = BarChart::default()
+        .block(block_p3)
+        .data(BarGroup::default().bars(&bars))
+        .direction(Direction::Horizontal)
+        .bar_width(1)
+        .bar_gap(0)
+        .max((total_ok as u64).max(1))
+        .label_style(theme::hint_style());
+    frame.render_widget(chart, col_chunks[2]);
 }
 
 fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::border_active_style())
-        .title(" Results ");
+    let block = widgets::panel_block("Results", true);
     let inner = block.inner(area);
     let header_rect = Rect {
         x: inner.x,
@@ -291,6 +338,13 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
     let sorted = app.sorted_results();
     let display: Vec<&ProbeResult> = sorted.iter().take(display_len).copied().collect();
 
+    // The natural #1 (fastest, zero-fail) edge, starred wherever it appears.
+    let best_ip: Option<String> = {
+        let mut v: Vec<&ProbeResult> = app.results.iter().filter(|r| r.ok > 0).collect();
+        v.sort_by(|a, b| App::natural_cmp(a, b));
+        v.first().map(|r| r.ip.clone())
+    };
+
     let start = app.scroll;
     let end = (start + visible).min(display.len());
     let page: Vec<&ProbeResult> = display[start..end].to_vec();
@@ -329,43 +383,97 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
             let rank = start + i + 1;
             let is_selected = start + i == app.result_cursor;
 
-            // Highlight rank 1 (fastest IP) to make it look premium
-            let is_first = app.sort_col == 4 && app.sort_asc && rank == 1;
+            // Star the fastest edge (natural #1) wherever it lands in the sort.
+            let is_first = best_ip.as_deref() == Some(r.ip.as_str());
             let (ip_text, rank_text) = if is_first {
                 (format!("★ {}", r.ip), format!(" {rank}"))
             } else {
                 (r.ip.clone(), rank.to_string())
             };
 
-            let mut base_style = if is_selected {
-                theme::highlight_style()
+            let base_style = if is_selected {
+                theme::row_selected_style()
+            } else if is_first {
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
-            if is_first {
-                base_style = base_style.fg(Color::LightCyan).add_modifier(Modifier::BOLD);
-            }
+
+            // Full-row background: selection wins, otherwise subtle zebra striping.
+            let row_style = if is_selected {
+                theme::row_selected_style()
+            } else if (start + i) % 2 == 1 {
+                theme::row_alt_style()
+            } else {
+                Style::default()
+            };
 
             Row::new(vec![
                 Cell::from(rank_text).style(base_style),
                 Cell::from(ip_text).style(base_style),
                 Cell::from(r.ok.to_string()).style(base_style),
-                Cell::from(r.fail.to_string()).style(if r.fail > 0 {
+                Cell::from(r.fail.to_string()).style(if is_selected {
+                    base_style
+                } else if r.fail > 0 {
                     theme::bad_style()
                 } else {
                     base_style
                 }),
-                Cell::from(fmt_ms(r.avg)).style(theme::latency_style(r.avg * 1000.0)),
-                Cell::from(fmt_ms(r.p50)).style(theme::latency_style(r.p50 * 1000.0)),
-                Cell::from(fmt_ms(r.p90)).style(theme::latency_style(r.p90 * 1000.0)),
-                Cell::from(fmt_ms(r.p95)).style(theme::latency_style(r.p95 * 1000.0)),
-                Cell::from(fmt_ms(r.max)).style(theme::latency_style(r.max * 1000.0)),
+                Cell::from(fmt_ms(r.avg)).style(if is_selected {
+                    base_style
+                } else {
+                    theme::latency_style(r.avg * 1000.0)
+                }),
+                Cell::from(fmt_ms(r.p50)).style(if is_selected {
+                    base_style
+                } else {
+                    theme::latency_style(r.p50 * 1000.0)
+                }),
+                Cell::from(fmt_ms(r.p90)).style(if is_selected {
+                    base_style
+                } else {
+                    theme::latency_style(r.p90 * 1000.0)
+                }),
+                Cell::from(fmt_ms(r.p95)).style(if is_selected {
+                    base_style
+                } else {
+                    theme::latency_style(r.p95 * 1000.0)
+                }),
+                Cell::from(fmt_ms(r.max)).style(if is_selected {
+                    base_style
+                } else {
+                    theme::latency_style(r.max * 1000.0)
+                }),
             ])
+            .style(row_style)
         })
         .collect();
 
     let table = Table::new(rows, WIDTHS).header(header).block(block);
     frame.render_widget(table, area);
+
+    // Empty state: no successful results to show yet.
+    if display.is_empty() {
+        let msg = if app.scan_complete {
+            "No successful IPs found — try widening the CIDR selection or raising timeouts."
+        } else {
+            "Probing edges… successful IPs will appear here as they respond."
+        };
+        let hint_area = Rect {
+            x: inner.x,
+            y: inner.y + (inner.height / 2).min(2),
+            width: inner.width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(msg)
+                .style(theme::hint_style())
+                .alignment(ratatui::layout::Alignment::Center),
+            hint_area,
+        );
+    }
 
     // Scrollbar reflects position within the displayed (top) results.
     if display.len() > visible {
@@ -433,26 +541,31 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     } else {
         "Pause (p)"
     };
-    app.button(frame, chunks[0], left_label, left_action, false);
+    let left_kind = if app.scan_complete {
+        ButtonKind::Primary
+    } else {
+        ButtonKind::Secondary
+    };
+    app.button_ex(frame, chunks[0], left_label, left_action, left_kind, false);
 
     if app.scan_complete {
-        app.button(
+        app.button_ex(
             frame,
             chunks[1],
             "Speed test (v)",
             ButtonAction::SpeedTest,
+            ButtonKind::Primary,
             false,
         );
     }
     app.button(frame, chunks[3], "Quit (q)", ButtonAction::Quit, false);
 
-    let msg = app.visible_message().unwrap_or(if app.scan_complete {
-        "Scan complete — ↑/↓ select, c copy IP, s save, v speed test, q quit"
+    let hints = if app.scan_complete {
+        "↑/↓ select • c copy IP • s save • v speed test • ? help • q quit"
     } else {
         "↑/↓ select • c copy IP • space pause • ? help • q quit"
-    });
-    let para = Paragraph::new(msg).style(theme::hint_style());
-    frame.render_widget(para, chunks[2]);
+    };
+    widgets::status_bar(frame, chunks[2], hints, app.visible_message());
 }
 
 #[cfg(test)]

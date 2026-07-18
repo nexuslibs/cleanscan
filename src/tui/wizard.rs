@@ -1,15 +1,15 @@
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
     Frame,
 };
 
 use crate::config::AppConfig;
 use crate::tui::theme;
-use crate::tui::{App, ButtonAction, WizardStep};
+use crate::tui::{widgets, App, ButtonAction, ButtonKind, WizardStep};
 
 /// Identifies an editable scan parameter on the settings step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,22 +40,31 @@ const MAX_SPEED_REPETITIONS: usize = 100;
 const MAX_SPEED_TIMEOUT_MS: u64 = 3_600_000;
 
 impl SettingField {
-    /// All settings fields in display order.
+    /// All settings fields in display order, grouped by concern. Group
+    /// boundaries are described by [`SettingField::GROUPS`].
     pub const ALL: [SettingField; 13] = [
+        // Target
         SettingField::Host,
         SettingField::Path,
-        SettingField::DownloadPath,
-        SettingField::UploadPath,
-        SettingField::SpeedPayloadMb,
-        SettingField::SpeedRepetitions,
-        SettingField::SpeedTimeoutMs,
+        // Latency scan
         SettingField::SamplePerCidr,
         SettingField::Probes,
         SettingField::Concurrency,
         SettingField::TimeoutMs,
         SettingField::ConnectTimeoutMs,
         SettingField::Top,
+        // Speed test
+        SettingField::DownloadPath,
+        SettingField::UploadPath,
+        SettingField::SpeedPayloadMb,
+        SettingField::SpeedRepetitions,
+        SettingField::SpeedTimeoutMs,
     ];
+
+    /// Section headers and the number of consecutive fields in each, in the
+    /// same order as [`SettingField::ALL`].
+    pub const GROUPS: [(&'static str, usize); 3] =
+        [("Target", 2), ("Latency scan", 6), ("Speed test", 5)];
 
     pub fn label(&self) -> &'static str {
         match self {
@@ -340,28 +349,46 @@ fn render_step_bar(app: &App, frame: &mut Frame, area: Rect) {
         }
     }
     let line = Line::from(spans);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::border_style());
-    let para = Paragraph::new(line).block(block);
+    let para = Paragraph::new(line).block(widgets::panel_block("", false));
     frame.render_widget(para, area);
 }
 
 fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
+    // On tall terminals, lead with a compact brand banner.
+    let body = if area.height >= 16 {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(1)])
+            .split(area);
+        let banner = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "C L E A N S C A N",
+                theme::header_style().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "Cloudflare edge latency & speed scanner",
+                theme::hint_style(),
+            )),
+        ])
+        .alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(banner, split[0]);
+        split[1]
+    } else {
+        area
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(3)])
-        .split(area);
+        .split(body);
 
     let main_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(chunks[0]);
 
-    let list_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::border_active_style())
-        .title(" Cloudflare CIDR ranges (space toggle, A all, D none) ");
+    let list_block =
+        widgets::panel_block("Cloudflare CIDR ranges (space toggle, A all, N none)", true);
     let inner = list_block.inner(main_layout[0]);
     app.ranges_inner = Some(inner);
 
@@ -382,10 +409,10 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
         .skip(start)
         .take(visible)
         .map(|(i, e)| {
-            let mark = if e.selected { "● [x]" } else { "○ [ ]" };
+            let mark = if e.selected { "☑" } else { "☐" };
             let cursor = if i == app.cursor { "› " } else { "  " };
             let style = if i == app.cursor {
-                theme::highlight_style()
+                theme::row_selected_style()
             } else if e.selected {
                 Style::default().fg(Color::LightCyan)
             } else {
@@ -433,7 +460,7 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
             Span::raw("Select all CIDRs"),
         ]),
         Line::from(vec![
-            Span::styled("  D  ", theme::highlight_style()),
+            Span::styled("  N  ", theme::highlight_style()),
             Span::raw("Deselect all CIDRs"),
         ]),
         Line::from(vec![
@@ -442,10 +469,7 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
         ]),
     ];
 
-    let info_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::border_style())
-        .title(" Selected Metrics ");
+    let info_block = widgets::panel_block("Selected Metrics", false);
     let info_para = Paragraph::new(info_text).block(info_block);
     frame.render_widget(info_para, main_layout[1]);
 
@@ -459,16 +483,8 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
         "  press 'a' to add a custom CIDR range  ".to_string()
     };
     let title = " Add CIDR ";
-    let input = Paragraph::new(input_line).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(if app.custom_input_mode {
-                theme::border_active_style()
-            } else {
-                theme::border_style()
-            })
-            .title(title),
-    );
+    let input =
+        Paragraph::new(input_line).block(widgets::panel_block(title, app.custom_input_mode));
     frame.render_widget(input, chunks[1]);
 }
 
@@ -540,10 +556,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         Span::styled(current_preset, theme::title_style()),
     ];
 
-    let preset_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::border_style())
-        .title(" Preset Configurations ");
+    let preset_block = widgets::panel_block("Preset Configurations", false);
     let preset_para = Paragraph::new(Line::from(preset_spans)).block(preset_block);
     frame.render_widget(preset_para, chunks[0]);
 
@@ -553,22 +566,29 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(chunks[1]);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::border_active_style())
-        .title(" Scan parameters (Enter edit, ↑/↓ step numeric) ");
+    let block = widgets::panel_block("Scan parameters (Enter edit, ↑/↓ step numeric)", true);
     let inner = block.inner(main_layout[0]);
     app.settings_inner = Some(inner);
 
-    let lines: Vec<Line> = SettingField::ALL
-        .iter()
-        .enumerate()
-        .map(|(i, f)| {
+    // Build the field list with section subheaders, tracking which display row
+    // maps to which field index (headers map to `None`) for mouse hit-testing.
+    let mut lines: Vec<Line> = Vec::new();
+    let mut row_map: Vec<Option<usize>> = Vec::new();
+    let mut field_idx = 0usize;
+    for (header, count) in SettingField::GROUPS {
+        lines.push(Line::from(Span::styled(
+            format!(" {} ", header.to_uppercase()),
+            theme::subtitle_style().add_modifier(Modifier::BOLD),
+        )));
+        row_map.push(None);
+        for _ in 0..count {
+            let i = field_idx;
+            let f = SettingField::ALL[i];
             let cursor = if i == app.cursor { "› " } else { "  " };
             let style = if i == app.cursor {
-                theme::highlight_style()
+                theme::row_selected_style()
             } else {
-                Style::default().fg(Color::LightCyan)
+                Style::default().fg(theme::palette().subtitle)
             };
             let value = if app.edit_field == Some(i) {
                 let (before, after) = app
@@ -579,9 +599,12 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
                 f.value_string(&app.config)
             };
             let label = format!("{:20}", f.label());
-            Line::from(format!("{}{} = {}", cursor, label, value)).style(style)
-        })
-        .collect();
+            lines.push(Line::from(format!("{}{} = {}", cursor, label, value)).style(style));
+            row_map.push(Some(i));
+            field_idx += 1;
+        }
+    }
+    app.settings_row_map = row_map;
 
     let para = Paragraph::new(lines).block(block);
     frame.render_widget(para, main_layout[0]);
@@ -613,10 +636,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         desc_para_lines.push(Line::from("  Use j/k to move between fields."));
     }
 
-    let desc_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::border_style())
-        .title(" Field Context ");
+    let desc_block = widgets::panel_block("Field Context", false);
     let desc_widget = Paragraph::new(desc_para_lines)
         .block(desc_block)
         .wrap(Wrap { trim: true });
@@ -730,17 +750,11 @@ fn render_review(app: &App, frame: &mut Frame, area: Rect) {
         ]),
     ];
 
-    let block_left = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::border_style())
-        .title(" Target configuration ");
+    let block_left = widgets::panel_block("Target configuration", false);
     let para_left = Paragraph::new(summary_left).block(block_left);
     frame.render_widget(para_left, main_layout[0]);
 
-    let block_right = Block::default()
-        .borders(Borders::ALL)
-        .border_style(theme::border_style())
-        .title(" Scope & Workload ");
+    let block_right = widgets::panel_block("Scope & Workload", false);
     let para_right = Paragraph::new(summary_right).block(block_right);
     frame.render_widget(para_right, main_layout[1]);
 }
@@ -774,7 +788,19 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         _ => "Next (→) ›",
     };
     let right_focused = app.wizard_step == WizardStep::Review;
-    app.button(frame, chunks[2], right_label, right_action, right_focused);
+    let right_kind = if right_focused {
+        ButtonKind::Primary
+    } else {
+        ButtonKind::Secondary
+    };
+    app.button_ex(
+        frame,
+        chunks[2],
+        right_label,
+        right_action,
+        right_kind,
+        right_focused,
+    );
 }
 
 fn render_hint(app: &App, frame: &mut Frame, area: Rect) {
@@ -783,7 +809,7 @@ fn render_hint(app: &App, frame: &mut Frame, area: Rect) {
             if app.custom_input_mode {
                 "type CIDR • Enter confirm • Esc cancel"
             } else {
-                "↑/↓ move • space toggle • a add • A all • D none • → next • ? help"
+                "↑/↓ move • space toggle • a add • A all • N none • → next • ? help"
             }
         }
         WizardStep::Settings => {
@@ -795,8 +821,7 @@ fn render_hint(app: &App, frame: &mut Frame, area: Rect) {
         }
         WizardStep::Review => "Enter start • ← back • ? help",
     };
-    let para = Paragraph::new(text).style(theme::hint_style());
-    frame.render_widget(para, area);
+    widgets::status_bar(frame, area, text, app.visible_message());
 }
 
 /// Handle a key while on the wizard. Delegates to the active step's editor.
@@ -829,21 +854,21 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
                         {
                             entry.selected = true;
                             app.cursor = idx;
-                            app.toast(format!("CIDR {s} already exists; selected it"));
+                            app.toast_warn(format!("CIDR {s} already exists; selected it"));
                         } else {
                             app.cidr_candidates.push(crate::tui::CidrEntry {
                                 cidr: s.clone(),
                                 selected: true,
                             });
                             app.cursor = app.cidr_candidates.len() - 1;
-                            app.toast(format!("Added {s}"));
+                            app.toast_success(format!("Added {s}"));
                         }
                         app.input_buffer.clear();
                         app.edit_caret = 0;
                         app.custom_input_mode = false;
                         app.save_config();
                     }
-                    Err(e) => app.toast(format!("Invalid CIDR '{s}': {e}")),
+                    Err(e) => app.toast_error(format!("Invalid CIDR '{s}': {e}")),
                 }
             }
             KeyCode::Esc => {
@@ -904,7 +929,7 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
             }
             app.save_config();
         }
-        KeyCode::Char('d') | KeyCode::Char('D') => {
+        KeyCode::Char('N') | KeyCode::Char('n') | KeyCode::Char('d') | KeyCode::Char('D') => {
             for e in app.cidr_candidates.iter_mut() {
                 e.selected = false;
             }
@@ -934,7 +959,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
                     app.edit_caret = 0;
                     app.save_config();
                 }
-                Err(e) => app.toast(format!("Invalid {}: {}", field.label(), e)),
+                Err(e) => app.toast_error(format!("Invalid {}: {}", field.label(), e)),
             },
             KeyCode::Esc => {
                 app.edit_field = None;
@@ -1018,7 +1043,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             app.config.timeout_ms = 2500;
             app.config.connect_timeout_ms = 1000;
             app.config.top = 50;
-            app.toast("Preset Applied: Default");
+            app.toast_success("Preset Applied: Default");
             app.save_config();
         }
         KeyCode::Char('2') => {
@@ -1028,7 +1053,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             app.config.timeout_ms = 1500;
             app.config.connect_timeout_ms = 500;
             app.config.top = 25;
-            app.toast("Preset Applied: Fast Scan");
+            app.toast_success("Preset Applied: Fast Scan");
             app.save_config();
         }
         KeyCode::Char('3') => {
@@ -1038,7 +1063,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             app.config.timeout_ms = 3500;
             app.config.connect_timeout_ms = 1500;
             app.config.top = 100;
-            app.toast("Preset Applied: Thorough Scan");
+            app.toast_success("Preset Applied: Thorough Scan");
             app.save_config();
         }
         _ => {}

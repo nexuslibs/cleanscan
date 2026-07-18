@@ -106,7 +106,7 @@ on the command line, the scan starts directly with those targets.
 | `↑` / `↓` (`k`/`j`) | Move the cursor through the CIDR list |
 | `space`        | Toggle selection of the highlighted CIDR |
 | `A`            | Select **all** CIDRs                    |
-| `D`            | Deselect **all** CIDRs                  |
+| `N`            | Deselect **all** CIDRs                  |
 | `a`            | Add a custom CIDR via the inline text field |
 | `c`            | Open the **settings** screen to tweak scan parameters |
 | `Enter`        | Start the scan with the selected CIDRs  |
@@ -155,10 +155,10 @@ the TUI and are not edited in this screen.
 **Speed-test screen**
 
 After latency scanning completes, press `v` to select successful IPs. Press
-`space` to toggle an IP, `A` or `D` to select or clear all, `n` for download,
-`u` for upload, `b` for both, and `Enter` to start. Results report throughput
-in Mbps for each direction. Use `↑` / `↓` to select an IP and `c` to copy it;
-`Esc` or `b` returns to the latency dashboard.
+`space` to toggle an IP, `A` to select all, `N` to clear the selection, `d` for
+download, `u` for upload, `b` for both, and `Enter` to start. Results report
+throughput in Mbps for each direction. Use `↑` / `↓` to select an IP and `c` to
+copy it; `Esc` or `b` returns to the latency dashboard.
 
 ### CLI options
 

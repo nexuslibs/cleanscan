@@ -3,7 +3,10 @@ pub mod dashboard;
 pub mod help;
 pub mod speed;
 pub mod theme;
+pub mod widgets;
 pub mod wizard;
+
+pub use widgets::{ButtonKind, ToastKind};
 
 use std::{
     fs,
@@ -16,7 +19,6 @@ use std::{
 use crossterm::event::{self, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
     symbols::border::ROUNDED,
     widgets::{Block, Borders, Paragraph},
     Frame,
@@ -57,6 +59,15 @@ pub enum ButtonAction {
     Save,
     PauseResume,
     SpeedTest,
+    ConfirmQuit,
+    CancelQuit,
+    SpeedAll,
+    SpeedClear,
+    SpeedDirDownload,
+    SpeedDirUpload,
+    SpeedDirBoth,
+    SpeedStart,
+    SpeedBack,
 }
 
 /// A selectable CIDR candidate in the wizard's ranges step.
@@ -86,6 +97,7 @@ pub struct App {
     pub should_quit: bool,
     pub paused: Arc<AtomicBool>,
     pub message: Option<String>,
+    pub message_kind: ToastKind,
     pub message_time: Option<Instant>,
     /// Scroll offset into the results table.
     pub scroll: usize,
@@ -98,13 +110,28 @@ pub struct App {
     pub start_time: Instant,
     /// Help overlay visibility.
     pub show_help: bool,
+    /// Animation frame counter, advanced once per event-loop iteration.
+    pub tick: u64,
+    /// Last known mouse position, used for button hover styling.
+    pub hover_pos: Option<(u16, u16)>,
+    /// Rolling per-second probe throughput samples (for the sparkline).
+    pub throughput: Vec<u64>,
+    /// Timestamp of the last throughput sample.
+    pub last_tp_instant: Instant,
+    /// Result count at the last throughput sample.
+    pub last_tp_count: usize,
     // --- mouse hit-testing regions (recomputed every render) ---
     pub buttons: Vec<(Rect, ButtonAction)>,
     pub ranges_inner: Option<Rect>,
     pub settings_inner: Option<Rect>,
+    /// Maps each rendered settings row to a field index (`None` for headers).
+    pub settings_row_map: Vec<Option<usize>>,
     pub table_inner: Option<Rect>,
     pub table_header: Option<Rect>,
     pub table_col_bounds: Vec<(u16, u16)>,
+    /// Speed-select list inner rect + first visible index, for mouse hit-testing.
+    pub speed_list_inner: Option<Rect>,
+    pub speed_list_start: usize,
     /// Set when a quit was requested while a scan is running; a second 'q'
     /// confirms the exit. Any other key clears it.
     pub confirm_quit: bool,
@@ -173,6 +200,7 @@ impl App {
             should_quit: false,
             paused,
             message: None,
+            message_kind: ToastKind::Info,
             message_time: None,
             scroll: 0,
             result_cursor: 0,
@@ -181,12 +209,20 @@ impl App {
             sort_asc: true,
             start_time: Instant::now(),
             show_help: false,
+            tick: 0,
+            hover_pos: None,
+            throughput: Vec::new(),
+            last_tp_instant: Instant::now(),
+            last_tp_count: 0,
             buttons: Vec::new(),
             ranges_inner: None,
             settings_inner: None,
+            settings_row_map: Vec::new(),
             table_inner: None,
             table_header: None,
             table_col_bounds: Vec::new(),
+            speed_list_inner: None,
+            speed_list_start: 0,
             confirm_quit: false,
             pending_start: false,
             speed_targets: Vec::new(),
@@ -227,7 +263,7 @@ impl App {
         current_config.selected_cidrs = selected_cidrs;
 
         if let Err(e) = crate::config::save_config(&current_config) {
-            self.toast(format!("Config save failed: {e}"));
+            self.toast_error(format!("Config save failed: {e}"));
         }
     }
 
@@ -244,6 +280,9 @@ impl App {
         self.message = None;
         self.message_time = None;
         self.start_time = Instant::now();
+        self.throughput.clear();
+        self.last_tp_instant = Instant::now();
+        self.last_tp_count = 0;
     }
 
     pub fn add_result(&mut self, result: ProbeResult) {
@@ -265,26 +304,46 @@ impl App {
             _ => None,
         };
         let Some(ip) = ip else {
-            self.toast("No IP selected");
+            self.toast_warn("No IP selected");
             return;
         };
         match clipboard::copy(&ip) {
-            Ok(destination) => self.toast(format!("Copied {ip} to {destination}")),
-            Err(error) => self.toast(format!("Copy failed: {error}")),
+            Ok(destination) => self.toast_success(format!("Copied {ip} to {destination}")),
+            Err(error) => self.toast_error(format!("Copy failed: {error}")),
         }
     }
 
-    /// Show a transient status/toast message.
+    /// Show a transient status/toast message (informational severity).
     pub fn toast(&mut self, msg: impl Into<String>) {
+        self.toast_kind(msg, ToastKind::Info);
+    }
+
+    /// Show a transient toast with an explicit severity.
+    pub fn toast_kind(&mut self, msg: impl Into<String>, kind: ToastKind) {
         self.message = Some(msg.into());
+        self.message_kind = kind;
         self.message_time = Some(Instant::now());
     }
 
+    pub fn toast_success(&mut self, msg: impl Into<String>) {
+        self.toast_kind(msg, ToastKind::Success);
+    }
+
+    pub fn toast_warn(&mut self, msg: impl Into<String>) {
+        self.toast_kind(msg, ToastKind::Warn);
+    }
+
+    pub fn toast_error(&mut self, msg: impl Into<String>) {
+        self.toast_kind(msg, ToastKind::Error);
+    }
+
     /// Whether the current toast should still be visible (auto-fade after 4s).
-    pub fn visible_message(&self) -> Option<&str> {
+    pub fn visible_message(&self) -> Option<(&str, ToastKind)> {
         match (self.message.as_deref(), self.message_time) {
-            (Some(m), Some(t)) if t.elapsed() < Duration::from_secs(4) => Some(m),
-            (Some(m), None) => Some(m),
+            (Some(m), Some(t)) if t.elapsed() < Duration::from_secs(4) => {
+                Some((m, self.message_kind))
+            }
+            (Some(m), None) => Some((m, self.message_kind)),
             _ => None,
         }
     }
@@ -383,18 +442,29 @@ impl App {
         action: ButtonAction,
         focused: bool,
     ) {
-        let style = if focused {
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(ratatui::style::Modifier::BOLD)
-        } else {
-            theme::header_style()
-        };
+        self.button_ex(frame, area, label, action, ButtonKind::Secondary, focused);
+    }
+
+    /// Render an action button with an explicit visual weight. Focus or mouse
+    /// hover both render the button in its "active" style.
+    pub fn button_ex(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        label: &str,
+        action: ButtonAction,
+        kind: ButtonKind,
+        focused: bool,
+    ) {
+        let hovered = self.hover_pos.is_some_and(|p| point_in(area, p));
+        let style = widgets::button_style(kind, focused || hovered);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_set(ROUNDED)
             .style(style);
-        let para = Paragraph::new(format!(" {label} ")).block(block);
+        let para = Paragraph::new(format!(" {label} "))
+            .alignment(ratatui::layout::Alignment::Center)
+            .block(block);
         frame.render_widget(para, area);
         self.buttons.push((area, action));
     }
@@ -447,12 +517,12 @@ impl App {
     /// Save results to a TSV file (only meaningful when the scan is done).
     pub fn save(&mut self) {
         if !self.scan_complete {
-            self.toast("Scan still running — wait for it to finish before saving");
+            self.toast_warn("Scan still running — wait for it to finish before saving");
             return;
         }
         match self.save_to_file() {
-            Ok(name) => self.toast(format!("Results saved to {name}")),
-            Err(e) => self.toast(format!("Save failed: {e}")),
+            Ok(name) => self.toast_success(format!("Results saved to {name}")),
+            Err(e) => self.toast_error(format!("Save failed: {e}")),
         }
     }
 }
@@ -578,7 +648,7 @@ pub fn run_tui(
                 .map(|e| e.cidr.clone())
                 .collect();
             if cidrs.is_empty() {
-                app.toast("Select at least one CIDR (space) before starting");
+                app.toast_warn("Select at least one CIDR (space) before starting");
                 return;
             }
             match crate::scanner::collect_from_cidrs(&cidrs, app.config.sample_per_cidr) {
@@ -605,7 +675,7 @@ pub fn run_tui(
                     *scanner = Some(spawn_scanner(targets, scan_config));
                     app.begin_scan(total);
                 }
-                Err(e) => app.toast(format!("Error: {e}")),
+                Err(e) => app.toast_error(format!("Error: {e}")),
             }
         };
 
@@ -627,11 +697,11 @@ pub fn run_tui(
                         Ok(Ok(())) => app.scan_complete = true,
                         Ok(Err(e)) => {
                             app.scan_complete = true;
-                            app.toast(format!("Scan failed: {e}"));
+                            app.toast_error(format!("Scan failed: {e}"));
                         }
                         Err(_) => {
                             app.scan_complete = true;
-                            app.toast("Scan worker panicked");
+                            app.toast_error("Scan worker panicked");
                         }
                     }
                 }
@@ -653,12 +723,12 @@ pub fn run_tui(
                         }
                         Ok(Err(e)) => {
                             app.speed_complete = true;
-                            app.toast(format!("Speed test failed: {e}"));
+                            app.toast_error(format!("Speed test failed: {e}"));
                             app.screen = Screen::SpeedResults;
                         }
                         Err(_) => {
                             app.speed_complete = true;
-                            app.toast("Speed test worker panicked");
+                            app.toast_error("Speed test worker panicked");
                             app.screen = Screen::SpeedResults;
                         }
                     }
@@ -666,6 +736,22 @@ pub fn run_tui(
             }
 
             app.tick_message();
+            app.tick = app.tick.wrapping_add(1);
+
+            // Sample probe throughput roughly once per second for the sparkline.
+            if app.screen == Screen::Scanning
+                && !app.scan_complete
+                && app.last_tp_instant.elapsed() >= Duration::from_millis(1000)
+            {
+                let now_count = app.results.len();
+                let delta = now_count.saturating_sub(app.last_tp_count) as u64;
+                app.throughput.push(delta);
+                if app.throughput.len() > 240 {
+                    app.throughput.remove(0);
+                }
+                app.last_tp_count = now_count;
+                app.last_tp_instant = Instant::now();
+            }
 
             terminal.draw(|f| app.render(f))?;
 
@@ -730,24 +816,27 @@ impl App {
             return;
         }
 
+        // The quit-confirm modal captures all input until dismissed.
+        if self.confirm_quit {
+            match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.should_quit = true,
+                _ => self.confirm_quit = false,
+            }
+            return;
+        }
+
         // Global keys work on every screen.
         match code {
             KeyCode::Char('?') => {
-                self.confirm_quit = false;
                 self.show_help = !self.show_help;
                 return;
             }
             KeyCode::Char('q') | KeyCode::Char('Q') => {
                 if self.screen == Screen::Scanning && !self.scan_complete {
-                    if self.confirm_quit {
-                        self.should_quit = true;
-                    } else {
-                        self.confirm_quit = true;
-                        self.toast("Scan running — press q again to quit");
-                    }
-                    return;
+                    self.confirm_quit = true;
+                } else {
+                    self.should_quit = true;
                 }
-                self.should_quit = true;
                 return;
             }
             _ => {}
@@ -756,13 +845,7 @@ impl App {
         if self.show_help {
             // Any key closes the help overlay.
             self.show_help = false;
-            self.confirm_quit = false;
             return;
-        }
-
-        // Any key other than 'q' clears a pending quit confirmation.
-        if !matches!(code, KeyCode::Char('q') | KeyCode::Char('Q')) {
-            self.confirm_quit = false;
         }
 
         match self.screen {
@@ -780,9 +863,11 @@ impl App {
         self.buttons.clear();
         self.ranges_inner = None;
         self.settings_inner = None;
+        self.settings_row_map.clear();
         self.table_inner = None;
         self.table_header = None;
         self.table_col_bounds.clear();
+        self.speed_list_inner = None;
 
         match self.screen {
             Screen::Wizard => wizard::render(self, frame, frame.area()),
@@ -795,6 +880,68 @@ impl App {
         if self.show_help {
             help::overlay(self, frame, frame.area());
         }
+
+        if self.confirm_quit {
+            self.render_quit_confirm(frame, frame.area());
+        }
+    }
+
+    /// Modal shown when the user tries to quit mid-scan.
+    fn render_quit_confirm(&mut self, frame: &mut Frame, area: Rect) {
+        use ratatui::layout::Alignment;
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::Paragraph;
+
+        let popup = centered(area, 46, 30);
+        let inner = widgets::modal(frame, area, popup, " Quit cleanscan? ");
+
+        let body = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(3),
+            ])
+            .split(inner);
+
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "A scan is still running.",
+                theme::title_style(),
+            )),
+            Line::from(Span::styled(
+                "Quitting now will discard in-progress results.",
+                theme::hint_style(),
+            )),
+        ];
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), body[0]);
+
+        let buttons = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(20),
+                Constraint::Percentage(28),
+                Constraint::Percentage(4),
+                Constraint::Percentage(28),
+                Constraint::Percentage(20),
+            ])
+            .split(body[2]);
+        self.button(
+            frame,
+            buttons[1],
+            "Stay (n)",
+            ButtonAction::CancelQuit,
+            false,
+        );
+        self.button_ex(
+            frame,
+            buttons[3],
+            "Quit (y)",
+            ButtonAction::ConfirmQuit,
+            ButtonKind::Primary,
+            true,
+        );
     }
 
     fn handle_scan_key(&mut self, code: KeyCode) {
@@ -884,14 +1031,16 @@ impl App {
             KeyCode::Char('a') | KeyCode::Char('A') => {
                 self.speed_selected = self.speed_targets.iter().cloned().collect();
             }
-            KeyCode::Char('d') | KeyCode::Char('D') => self.speed_selected.clear(),
+            KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.speed_selected.clear()
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                self.speed_direction = SpeedDirection::Download
+            }
             KeyCode::Char('u') | KeyCode::Char('U') => {
                 self.speed_direction = SpeedDirection::Upload
             }
             KeyCode::Char('b') | KeyCode::Char('B') => self.speed_direction = SpeedDirection::Both,
-            KeyCode::Char('n') | KeyCode::Char('N') => {
-                self.speed_direction = SpeedDirection::Download
-            }
             KeyCode::Up if self.speed_cursor > 0 => self.speed_cursor -= 1,
             KeyCode::Down if self.speed_cursor + 1 < self.speed_targets.len() => {
                 self.speed_cursor += 1
@@ -903,7 +1052,7 @@ impl App {
             }
             KeyCode::Enter => {
                 if self.speed_selected.is_empty() {
-                    self.toast("Select at least one successful IP");
+                    self.toast_warn("Select at least one successful IP");
                 } else {
                     self.pending_speed_start = true;
                 }
@@ -951,6 +1100,23 @@ impl App {
 
     fn handle_mouse(&mut self, m: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
+        // Track the pointer so buttons can render a hover state.
+        self.hover_pos = Some((m.column, m.row));
+
+        // While the quit-confirm modal is up, only its buttons are live.
+        if self.confirm_quit {
+            if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+                let p = (m.column, m.row);
+                for (rect, action) in self.buttons.clone() {
+                    if point_in(rect, p) {
+                        self.activate_button(action);
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
         if self.show_help || self.edit_field.is_some() || self.custom_input_mode {
             return;
         }
@@ -966,6 +1132,8 @@ impl App {
                         self.speed_result_cursor -= 1;
                         self.scroll = self.scroll.min(self.speed_result_cursor);
                     }
+                } else if self.screen == Screen::SpeedSelect {
+                    self.speed_cursor = self.speed_cursor.saturating_sub(1);
                 } else if self.wizard_step == WizardStep::Ranges && !self.custom_input_mode {
                     if self.cursor > 0 {
                         self.cursor -= 1;
@@ -990,6 +1158,9 @@ impl App {
                     let max = self.speed_results.len().saturating_sub(1);
                     self.speed_result_cursor = (self.speed_result_cursor + 1).min(max);
                     self.scroll = self.scroll.max(self.speed_result_cursor);
+                } else if self.screen == Screen::SpeedSelect {
+                    let last = self.speed_targets.len().saturating_sub(1);
+                    self.speed_cursor = (self.speed_cursor + 1).min(last);
                 } else if self.wizard_step == WizardStep::Ranges && !self.custom_input_mode {
                     let last = self.cidr_candidates.len().saturating_sub(1);
                     if self.cursor < last {
@@ -1029,8 +1200,8 @@ impl App {
                     } else if self.wizard_step == WizardStep::Settings {
                         if let Some(inner) = self.settings_inner {
                             if point_in(inner, p) && self.edit_field.is_none() {
-                                let idx = (m.row - inner.y) as usize;
-                                if idx < SettingField::ALL.len() {
+                                let row = (m.row - inner.y) as usize;
+                                if let Some(Some(idx)) = self.settings_row_map.get(row).copied() {
                                     self.cursor = idx;
                                     self.start_edit(idx);
                                 }
@@ -1046,6 +1217,18 @@ impl App {
                                 } else {
                                     self.sort_col = col;
                                     self.sort_asc = true;
+                                }
+                            }
+                        }
+                    }
+                } else if self.screen == Screen::SpeedSelect {
+                    if let Some(inner) = self.speed_list_inner {
+                        if point_in(inner, p) {
+                            let idx = self.speed_list_start + (m.row - inner.y) as usize;
+                            if let Some(ip) = self.speed_targets.get(idx).cloned() {
+                                self.speed_cursor = idx;
+                                if !self.speed_selected.insert(ip.clone()) {
+                                    self.speed_selected.remove(&ip);
                                 }
                             }
                         }
@@ -1085,13 +1268,36 @@ impl App {
                     self.pending_start = true;
                 }
             }
-            ButtonAction::Quit => self.should_quit = true,
+            ButtonAction::Quit => {
+                if self.screen == Screen::Scanning && !self.scan_complete {
+                    self.confirm_quit = true;
+                } else {
+                    self.should_quit = true;
+                }
+            }
             ButtonAction::Save => self.save(),
             ButtonAction::PauseResume => {
                 let next = !self.paused.load(Ordering::Relaxed);
                 self.paused.store(next, Ordering::Relaxed);
             }
             ButtonAction::SpeedTest => self.open_speed_selection(),
+            ButtonAction::ConfirmQuit => self.should_quit = true,
+            ButtonAction::CancelQuit => self.confirm_quit = false,
+            ButtonAction::SpeedAll => {
+                self.speed_selected = self.speed_targets.iter().cloned().collect();
+            }
+            ButtonAction::SpeedClear => self.speed_selected.clear(),
+            ButtonAction::SpeedDirDownload => self.speed_direction = SpeedDirection::Download,
+            ButtonAction::SpeedDirUpload => self.speed_direction = SpeedDirection::Upload,
+            ButtonAction::SpeedDirBoth => self.speed_direction = SpeedDirection::Both,
+            ButtonAction::SpeedStart => {
+                if self.speed_selected.is_empty() {
+                    self.toast_warn("Select at least one successful IP");
+                } else {
+                    self.pending_speed_start = true;
+                }
+            }
+            ButtonAction::SpeedBack => self.screen = Screen::Scanning,
         }
     }
 }
@@ -1116,7 +1322,11 @@ impl Drop for RestoreGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{ranked_export_results, ProbeResult};
+    use super::{ranked_export_results, App, ProbeResult, Screen};
+    use crate::config::AppConfig;
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
 
     fn result(ip: &str, fail: usize, p95: f64) -> ProbeResult {
         ProbeResult {
@@ -1130,6 +1340,12 @@ mod tests {
             max: p95,
             samples: vec![p95],
         }
+    }
+
+    fn draw(app: &mut App, w: u16, h: u16) {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| app.render(f)).unwrap();
     }
 
     #[test]
@@ -1155,5 +1371,51 @@ mod tests {
         let ranked = ranked_export_results(&results, 50);
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].ip, "ok");
+    }
+
+    #[test]
+    fn dashboard_renders_without_panicking() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(500);
+        for i in 0..40 {
+            app.add_result(result(
+                &format!("10.0.0.{i}"),
+                i % 5,
+                0.05 + i as f64 * 0.01,
+            ));
+        }
+        app.throughput = vec![1, 3, 2, 5, 8, 4, 6, 2];
+        // Render at a comfortable size and a smaller one to exercise layouts.
+        draw(&mut app, 140, 40);
+        draw(&mut app, 90, 30);
+        // Completed state and overlays should also render cleanly.
+        app.scan_complete = true;
+        app.show_help = true;
+        draw(&mut app, 120, 36);
+        app.show_help = false;
+        app.confirm_quit = true;
+        draw(&mut app, 120, 36);
+    }
+
+    #[test]
+    fn all_screens_render_without_panicking() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        for screen in [
+            Screen::Wizard,
+            Screen::SpeedSelect,
+            Screen::SpeedTesting,
+            Screen::SpeedResults,
+        ] {
+            app.screen = screen;
+            draw(&mut app, 120, 36);
+        }
     }
 }

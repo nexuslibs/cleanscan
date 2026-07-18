@@ -32,9 +32,12 @@ fn try_native_clipboard(text: &str) -> bool {
             return false;
         };
         let Some(mut stdin) = child.stdin.take() else {
+            let _ = child.wait();
             return false;
         };
         if stdin.write_all(text.as_bytes()).is_err() {
+            drop(stdin);
+            let _ = child.wait();
             return false;
         }
         drop(stdin);

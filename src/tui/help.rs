@@ -2,11 +2,11 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 
-use crate::tui::{centered, theme, App, Screen, WizardStep};
+use crate::tui::{centered, theme, widgets, App, Screen, WizardStep};
 
 /// Render a context-aware help overlay. Closed by any key (`?` toggles).
 pub fn overlay(app: &App, frame: &mut Frame, area: Rect) {
@@ -18,13 +18,10 @@ pub fn overlay(app: &App, frame: &mut Frame, area: Rect) {
         Screen::SpeedResults => speed_results_lines(),
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Help — press any key to close ");
-    let para = Paragraph::new(lines).block(block).style(Style::default());
     let popup = centered(area, 64, 70);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(para, popup);
+    let inner = widgets::modal(frame, area, popup, " Help — press any key to close ");
+    let para = Paragraph::new(lines).style(Style::default());
+    frame.render_widget(para, inner);
 }
 
 fn key(keys: &str, desc: &str) -> Line<'static> {
@@ -52,8 +49,9 @@ fn wizard_lines(step: WizardStep) -> Vec<Line<'static>> {
             )));
             v.push(key("space", "Toggle the highlighted range on/off"));
             v.push(key("A", "Select all ranges"));
-            v.push(key("D", "Deselect all ranges"));
+            v.push(key("N", "Deselect all ranges"));
             v.push(key("a", "Add a custom CIDR (type + Enter)"));
+            v.push(key("c", "Jump to the settings step"));
             v.push(key("Esc", "Cancel custom CIDR entry"));
         }
         WizardStep::Settings => {
@@ -112,9 +110,9 @@ fn speed_selection_lines() -> Vec<Line<'static>> {
             theme::header_style(),
         )),
         key("↑ / ↓", "Move through successful IPs"),
-        key("Space", "Toggle the highlighted IP"),
-        key("A / D", "Select all / deselect all"),
-        key("n / u / b", "Download / upload / both"),
+        key("Space / click", "Toggle the highlighted IP"),
+        key("a / N", "Select all / clear selection"),
+        key("d / u / b", "Direction: download / upload / both"),
         key("Enter", "Start tests"),
         key("Esc", "Return to latency results"),
         key("q", "Quit cleanscan"),
