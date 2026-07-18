@@ -277,71 +277,65 @@ impl TargetState {
 }
 
 fn select_next_target(states: &[TargetState], probe_count: usize) -> Option<usize> {
-    let mut candidates: Vec<usize> = states
+    states
         .iter()
         .enumerate()
         .filter(|(_, state)| state.has_remaining_probe(probe_count))
+        .min_by(|(left_index, left), (right_index, right)| {
+            let left_success = left.samples.len();
+            let right_success = right.samples.len();
+
+            let left_tier = if left_success > 0 {
+                0
+            } else if left.completed == 0 {
+                1
+            } else {
+                2
+            };
+            let right_tier = if right_success > 0 {
+                0
+            } else if right.completed == 0 {
+                1
+            } else {
+                2
+            };
+
+            left_tier
+                .cmp(&right_tier)
+                .then_with(|| {
+                    let left_rate = if left.completed == 0 {
+                        0.0
+                    } else {
+                        left_success as f64 / left.completed as f64
+                    };
+                    let right_rate = if right.completed == 0 {
+                        0.0
+                    } else {
+                        right_success as f64 / right.completed as f64
+                    };
+                    right_rate
+                        .partial_cmp(&left_rate)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| right_success.cmp(&left_success))
+                .then_with(|| {
+                    let left_avg = if left_success == 0 {
+                        f64::INFINITY
+                    } else {
+                        left.samples.iter().sum::<f64>() / left_success as f64
+                    };
+                    let right_avg = if right_success == 0 {
+                        f64::INFINITY
+                    } else {
+                        right.samples.iter().sum::<f64>() / right_success as f64
+                    };
+                    left_avg
+                        .partial_cmp(&right_avg)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then(left_index.cmp(right_index))
+        })
         .map(|(index, _)| index)
-        .collect();
-
-    candidates.sort_by(|&a, &b| {
-        let left = &states[a];
-        let right = &states[b];
-        let left_success = left.samples.len();
-        let right_success = right.samples.len();
-
-        let left_tier = if left_success > 0 {
-            0
-        } else if left.completed == 0 {
-            1
-        } else {
-            2
-        };
-        let right_tier = if right_success > 0 {
-            0
-        } else if right.completed == 0 {
-            1
-        } else {
-            2
-        };
-
-        left_tier
-            .cmp(&right_tier)
-            .then_with(|| {
-                let left_rate = if left.completed == 0 {
-                    0.0
-                } else {
-                    left_success as f64 / left.completed as f64
-                };
-                let right_rate = if right.completed == 0 {
-                    0.0
-                } else {
-                    right_success as f64 / right.completed as f64
-                };
-                right_rate
-                    .partial_cmp(&left_rate)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| right_success.cmp(&left_success))
-            .then_with(|| {
-                let left_avg = if left_success == 0 {
-                    f64::INFINITY
-                } else {
-                    left.samples.iter().sum::<f64>() / left_success as f64
-                };
-                let right_avg = if right_success == 0 {
-                    f64::INFINITY
-                } else {
-                    right.samples.iter().sum::<f64>() / right_success as f64
-                };
-                left_avg
-                    .partial_cmp(&right_avg)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then(a.cmp(&b))
-    });
-
-    candidates.into_iter().next()
 }
 
 /// Run the full scan over `targets`, sending each result through `tx`.
