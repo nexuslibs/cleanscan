@@ -1,5 +1,6 @@
 mod config;
 mod scanner;
+mod speed;
 mod tui;
 
 use clap::Parser;
@@ -87,6 +88,12 @@ fn main() -> Result<()> {
     }
 
     normalize_config(&mut config);
+
+    if config.host.is_empty() && (args.cli || args.ips.is_some() || !args.cidr.is_empty()) {
+        anyhow::bail!(
+            "no host configured — pass --host <domain> or set a host in the TUI settings"
+        );
+    }
 
     if args.cli {
         cli_mode(config, args.cidr, args.ips)
