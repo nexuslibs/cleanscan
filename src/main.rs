@@ -97,6 +97,14 @@ pub struct Args {
     /// Skip the connection-establishment warmup probe (first counted probe includes connection time)
     #[arg(long)]
     pub no_warmup: bool,
+
+    /// Weight applied to latency jitter when ranking results (higher penalizes variable-latency IPs)
+    #[arg(long)]
+    pub stability_weight: Option<f64>,
+
+    /// Weight applied to packet loss when ranking results (higher penalizes lossy IPs)
+    #[arg(long)]
+    pub loss_weight: Option<f64>,
 }
 
 fn main() -> Result<()> {
@@ -132,6 +140,12 @@ fn main() -> Result<()> {
     }
     if args.no_warmup {
         config.warmup = false;
+    }
+    if let Some(weight) = args.stability_weight {
+        config.stability_weight = weight;
+    }
+    if let Some(weight) = args.loss_weight {
+        config.loss_weight = weight;
     }
 
     normalize_config(&mut config);
@@ -273,6 +287,16 @@ fn cli_mode(
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .then_with(|| {
+                a.jitter
+                    .partial_cmp(&b.jitter)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                a.packet_loss
+                    .partial_cmp(&b.packet_loss)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
                 a.avg
                     .partial_cmp(&b.avg)
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -294,7 +318,7 @@ fn cli_mode(
             .collect::<std::result::Result<Vec<_>, _>>()?
             .join("\n"),
         _ => {
-            let mut text = String::from("rank\tip\tcolo\tcountry\tprotocol\tok\tfail\tsuccess_rate\tconfidence\tavg\tp50\tp90\tp95\tmax\tcold_ms\tsamples\tfailures\n");
+            let mut text = String::from("rank\tip\tcolo\tcountry\tprotocol\tok\tfail\tsuccess_rate\tconfidence\tavg\tp50\tp90\tp95\tmax\tjitter\tloss\tpkt_loss\tcold_ms\tsamples\tfailures\n");
             for (i, r) in rows.iter().enumerate() {
                 let samples = r
                     .samples
@@ -304,7 +328,7 @@ fn cli_mode(
                     .join(",");
 
                 text.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.1}\t{}\t{:.1}\t{}\t{}\t{}\n",
                     i + 1,
                     r.ip,
                     r.colo.clone().unwrap_or_default(),
@@ -319,6 +343,9 @@ fn cli_mode(
                     r.p90,
                     r.p95,
                     r.max,
+                    r.jitter * 1000.0,
+                    r.loss,
+                    r.packet_loss * 100.0,
                     r.cold_ms.map(|ms| format!("{:.1}", ms)).unwrap_or_default(),
                     samples,
                     r.failures.join(",")
@@ -372,6 +399,10 @@ mod tests {
             p90: 0.0,
             p95: 0.0,
             max: 0.0,
+            jitter: 0.0,
+            stddev: 0.0,
+            loss: 0,
+            packet_loss: 0.0,
             samples: vec![0.0],
             failures: Vec::new(),
             success_rate: 1.0,

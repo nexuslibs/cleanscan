@@ -216,6 +216,8 @@ latency dashboard.
 | `--colo`                | —                | Only report IPs in the given Cloudflare datacenter (e.g. `FRA`) |
 | `--country`             | —                | Only report IPs in the given country (substring match, e.g. `Germany`) |
 | `--no-warmup`           | off              | Skip the warmup probe; the first measured probe includes connection setup, while later probes may reuse the connection |
+| `--stability-weight`    | `1.0`            | Weight of latency jitter in the recommendation score (higher penalizes variable-latency IPs) |
+| `--loss-weight`         | `1.0`            | Weight of packet loss in the recommendation score (higher penalizes lossy IPs) |
 
 ## Output
 
@@ -224,10 +226,13 @@ at a time per IP: successful IPs receive priority for their remaining probes,
 unexplored IPs are preferred over IPs that have failed, and original order is
 used as a deterministic tie-breaker. CLI results are ranked by success rate
 (descending), then `p95` and average latency (ascending). Each row reports `ok`/`fail` counts and `avg`,
-`p50`, `p90`, `p95`, and `max` latency in seconds, followed by individual
-successful probe samples in the `samples` column. The `colo` column shows the
-Cloudflare datacenter code parsed from `/cdn-cgi/trace` (when probing that
-path), and `cold_ms` reports the one-off TCP + TLS connection-establishment
+`p50`, `p90`, `p95`, and `max` latency in seconds, the `jitter` spread
+(`p95 − p50`, a stability signal robust to single outliers), the `loss` count
+and `pkt_loss` percentage (probes dropped with no response — timeouts and
+connect/TLS failures, distinct from application-level HTTP errors), followed by
+individual successful probe samples in the `samples` column. The `colo` column
+shows the Cloudflare datacenter code parsed from `/cdn-cgi/trace` (when probing
+that path), and `cold_ms` reports the one-off TCP + TLS connection-establishment
 time captured by the warmup probe. Only the top `N` rows are printed, where `N`
 is controlled by `--top`.
 
@@ -256,7 +261,10 @@ one-off cold-request latency is reported separately as `cold_ms`. Pass
 `--no-warmup`, and the first measured probe includes connection setup while later
 probes may reuse the connection. Results are ranked by success rate
 first, then p95 and average latency; failures include categorized diagnostics
-in the details view and machine-readable output.
+in the details view and machine-readable output. The recommendation `score`
+(and therefore the TUI's default order and the CLI's top results) blends
+reliability with latency, jitter, and packet loss, so a slightly slower but
+steadier, loss-free IP outranks a fast-but-jittery or lossy one.
 
 Speed tests use the same direct-IP connection behavior. The default endpoints
 are `/speed-test/100mb.bin` for downloads and `/speed-test/upload` for uploads;

@@ -237,7 +237,7 @@ pub struct App {
     pub show_failures: bool,
     pub colo_filter: Option<String>,
     pub country_filter: Option<String>,
-    pub result_column_visibility: [bool; 12],
+    pub result_column_visibility: [bool; 14],
     pub column_picker_cursor: usize,
     pub start_time: Instant,
     /// Help overlay visibility.
@@ -461,7 +461,7 @@ impl App {
             show_failures: false,
             colo_filter: None,
             country_filter: None,
-            result_column_visibility: [true; 12],
+            result_column_visibility: [true; 14],
             column_picker_cursor: 0,
             start_time: Instant::now(),
             show_help: false,
@@ -785,6 +785,16 @@ impl App {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .then_with(|| {
+                a.jitter
+                    .partial_cmp(&b.jitter)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                a.packet_loss
+                    .partial_cmp(&b.packet_loss)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
                 a.max
                     .partial_cmp(&b.max)
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -857,6 +867,14 @@ impl App {
                     .unwrap_or(std::cmp::Ordering::Equal),
                 10 => a.colo.cmp(&b.colo),
                 11 => a.country.cmp(&b.country),
+                12 => a
+                    .jitter
+                    .partial_cmp(&b.jitter)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                13 => a
+                    .packet_loss
+                    .partial_cmp(&b.packet_loss)
+                    .unwrap_or(std::cmp::Ordering::Equal),
                 _ => std::cmp::Ordering::Equal,
             };
             if self.sort_asc {
@@ -1197,6 +1215,8 @@ pub fn run_tui(
                         speed_repetitions: app.config.speed_repetitions,
                         speed_timeout_ms: app.config.speed_timeout_ms,
                         warmup: app.config.warmup,
+                        stability_weight: app.config.stability_weight,
+                        loss_weight: app.config.loss_weight,
                     });
                     app.set_scan_targets(targets.clone());
                     *scanner = Some(spawn_scanner(targets, scan_config));
@@ -2440,6 +2460,10 @@ mod tests {
             p90: p95,
             p95,
             max: p95,
+            jitter: 0.0,
+            stddev: 0.0,
+            loss: 0,
+            packet_loss: 0.0,
             samples: vec![p95],
             failures: Vec::new(),
             success_rate: 1.0 / (1 + fail) as f64,

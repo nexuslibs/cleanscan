@@ -49,6 +49,17 @@ pub struct ProbeResult {
     pub p90: f64,
     pub p95: f64,
     pub max: f64,
+    /// Tail spread of steady-state latency: `p95 - p50` (seconds). Robust to a
+    /// single outlier and a better stability signal than variance alone.
+    pub jitter: f64,
+    /// Sample standard deviation of successful probe latencies (seconds).
+    pub stddev: f64,
+    /// Number of probes that were dropped (no response): timeouts and
+    /// connect/TLS failures. Distinct from application-level errors such as a
+    /// non-2xx status or a body read failure.
+    pub loss: usize,
+    /// Fraction of attempted probes that were dropped, in `0..=1`.
+    pub packet_loss: f64,
     pub samples: Vec<f64>,
     pub failures: Vec<String>,
     pub success_rate: f64,
@@ -338,6 +349,17 @@ fn parse_colo(body: &str) -> Option<String> {
     None
 }
 
+/// Whether a probe failure reason indicates a dropped probe (no usable
+/// response) rather than an application-level error. Timeouts and
+/// connect/TLS failures reflect packet loss; non-2xx status and body read
+/// failures mean the server *did* respond.
+fn is_loss_reason(reason: &str) -> bool {
+    reason.starts_with("request timeout")
+        || reason.starts_with("connect/TLS failure")
+        || reason.starts_with("request failure")
+        || reason == "cancelled"
+}
+
 struct TargetState {
     ip: String,
     url: String,
@@ -345,6 +367,7 @@ struct TargetState {
     samples: Vec<f64>,
     protocols: Vec<String>,
     fail: usize,
+    loss: usize,
     scheduled: usize,
     completed: usize,
     in_flight: bool,
@@ -362,6 +385,8 @@ struct TargetState {
     /// be discarded so its connection-setup cost is excluded from steady-state
     /// latency and instead recorded as `cold_ms`.
     warmup_discard_first: bool,
+    stability_weight: f64,
+    loss_weight: f64,
 }
 
 impl TargetState {
@@ -369,10 +394,10 @@ impl TargetState {
         let url = format!("https://{}{}", args.host, args.path);
         let client = client_for_ip(&args.host, &ip, args).ok();
         let client_ok = client.is_some();
-        let (fail, scheduled, completed) = if client_ok {
-            (0, 0, 0)
+        let (fail, loss, scheduled, completed) = if client_ok {
+            (0, 0, 0, 0)
         } else {
-            (probe_count, probe_count, probe_count)
+            (probe_count, probe_count, probe_count, probe_count)
         };
 
         Self {
@@ -382,6 +407,7 @@ impl TargetState {
             samples: Vec::new(),
             protocols: Vec::new(),
             fail,
+            loss,
             scheduled,
             completed,
             in_flight: false,
@@ -395,6 +421,8 @@ impl TargetState {
             warmup_done: !args.warmup || !client_ok,
             warmup_in_flight: false,
             warmup_discard_first: false,
+            stability_weight: args.stability_weight,
+            loss_weight: args.loss_weight,
         }
     }
 
@@ -412,29 +440,54 @@ impl TargetState {
             0.0
         };
 
+        let p50 = percentile(&self.samples, 0.50);
+        let p90 = percentile(&self.samples, 0.90);
+        let p95 = percentile(&self.samples, 0.95);
+        let max = self.samples.last().copied().unwrap_or(0.0);
+        let jitter = if ok > 0 { (p95 - p50).max(0.0) } else { 0.0 };
+        let stddev = if ok > 0 {
+            let variance = self.samples.iter().map(|s| (s - avg).powi(2)).sum::<f64>() / ok as f64;
+            variance.sqrt()
+        } else {
+            0.0
+        };
+        let total = (ok + self.fail).max(1);
+        let success_rate = ok as f64 / total as f64;
+        let packet_loss = self.loss as f64 / total as f64;
+        // Blend reliability, latency, jitter, and packet loss into a single
+        // recommendation score. A fast but jittery/lossy IP is penalized so a
+        // slightly slower, steadier one can outrank it.
+        let score = if ok > 0 {
+            let reliability = ok as f64 / total as f64;
+            let latency_penalty = max.max(0.001);
+            let jitter_penalty = jitter.max(0.0001);
+            let loss_penalty = packet_loss.max(0.0);
+            reliability
+                / (latency_penalty
+                    + self.stability_weight * jitter_penalty
+                    + self.loss_weight * loss_penalty)
+        } else {
+            0.0
+        };
+
         ProbeResult {
             ip: self.ip.clone(),
             protocol: summarize_protocols(&self.protocols),
             ok,
             fail: self.fail,
             avg,
-            p50: percentile(&self.samples, 0.50),
-            p90: percentile(&self.samples, 0.90),
-            p95: percentile(&self.samples, 0.95),
-            max: self.samples.last().copied().unwrap_or(0.0),
+            p50,
+            p90,
+            p95,
+            max,
+            jitter,
+            stddev,
+            loss: self.loss,
+            packet_loss,
             samples: self.samples.clone(),
             failures: self.failures.clone(),
-            success_rate: if ok + self.fail > 0 {
-                ok as f64 / (ok + self.fail) as f64
-            } else {
-                0.0
-            },
-            score: if ok > 0 {
-                (ok as f64 / (ok + self.fail).max(1) as f64)
-                    / self.samples.last().copied().unwrap_or(1.0).max(0.001)
-            } else {
-                0.0
-            },
+            success_rate,
+            score,
             colo: self.colo.clone(),
             country: self
                 .colo
@@ -706,6 +759,9 @@ pub async fn run_scan(
                             }
                             Err(reason) => {
                                 state.fail += 1;
+                                if is_loss_reason(&reason) {
+                                    state.loss += 1;
+                                }
                                 state.failures.push(reason);
                             }
                         }
@@ -741,6 +797,7 @@ mod tests {
             samples: samples.to_vec(),
             protocols: Vec::new(),
             fail,
+            loss: 0,
             scheduled,
             completed,
             in_flight: false,
@@ -750,6 +807,8 @@ mod tests {
             warmup_done: true,
             warmup_in_flight: false,
             warmup_discard_first: false,
+            stability_weight: 1.0,
+            loss_weight: 1.0,
         }
     }
 
@@ -877,6 +936,7 @@ mod tests {
             samples: vec![0.2, 0.3, 0.25],
             protocols: vec!["h2".to_string(); 3],
             fail: 0,
+            loss: 0,
             scheduled: 3,
             completed: 3,
             in_flight: false,
@@ -886,11 +946,100 @@ mod tests {
             warmup_done: true,
             warmup_in_flight: false,
             warmup_discard_first: false,
+            stability_weight: 1.0,
+            loss_weight: 1.0,
         };
         let result = state.result();
         // Steady-state only: cold_ms is separate and samples exclude the warmup.
         assert_eq!(result.cold_ms, Some(50.0));
         assert_eq!(result.colo, Some("FRA".to_string()));
         assert_eq!(result.avg, (0.2 + 0.3 + 0.25) / 3.0);
+        // jitter = p95 - p50; with sorted [0.2, 0.25, 0.3] that is 0.30 - 0.25 = 0.05.
+        assert!((result.jitter - 0.05).abs() < f64::EPSILON);
+        assert!((result.packet_loss - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn jitter_stddev_and_packet_loss_are_computed() {
+        let mut state = TargetState {
+            ip: "192.0.2.1".to_string(),
+            url: String::new(),
+            client: None,
+            samples: vec![0.10, 0.20, 0.30],
+            protocols: vec!["h2".to_string(); 3],
+            fail: 1,
+            loss: 1,
+            scheduled: 4,
+            completed: 4,
+            in_flight: false,
+            failures: vec!["request timeout".to_string()],
+            colo: None,
+            cold_ms: None,
+            warmup_done: true,
+            warmup_in_flight: false,
+            warmup_discard_first: false,
+            stability_weight: 1.0,
+            loss_weight: 1.0,
+        };
+        let result = state.result();
+        // sorted samples [0.10, 0.20, 0.30]: p50 = 0.20, p95 = 0.30.
+        assert_eq!(result.p50, 0.20);
+        assert_eq!(result.p95, 0.30);
+        assert!((result.jitter - 0.10).abs() < f64::EPSILON);
+        let mean = 0.20;
+        let expected_stddev =
+            ((0.10f64 - mean).powi(2) + (0.20f64 - mean).powi(2) + (0.30f64 - mean).powi(2)) / 3.0;
+        assert!((result.stddev - expected_stddev.sqrt()).abs() < 1e-9);
+        // 1 lost probe out of 4 attempted => 0.25 packet loss.
+        assert!((result.packet_loss - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn score_penalizes_jitter_and_loss() {
+        // Two IPs with identical p95 but different jitter; the steadier one
+        // must outrank the jittery one once weights are applied.
+        let steady = TargetState {
+            ip: "192.0.2.1".to_string(),
+            url: String::new(),
+            client: None,
+            samples: vec![0.20, 0.20, 0.20],
+            protocols: vec!["h2".to_string(); 3],
+            fail: 0,
+            loss: 0,
+            scheduled: 3,
+            completed: 3,
+            in_flight: false,
+            failures: Vec::new(),
+            colo: None,
+            cold_ms: None,
+            warmup_done: true,
+            warmup_in_flight: false,
+            warmup_discard_first: false,
+            stability_weight: 1.0,
+            loss_weight: 1.0,
+        }
+        .result();
+        let jittery = TargetState {
+            ip: "192.0.2.2".to_string(),
+            url: String::new(),
+            client: None,
+            samples: vec![0.10, 0.20, 0.30],
+            protocols: vec!["h2".to_string(); 3],
+            fail: 0,
+            loss: 0,
+            scheduled: 3,
+            completed: 3,
+            in_flight: false,
+            failures: Vec::new(),
+            colo: None,
+            cold_ms: None,
+            warmup_done: true,
+            warmup_in_flight: false,
+            warmup_discard_first: false,
+            stability_weight: 1.0,
+            loss_weight: 1.0,
+        }
+        .result();
+        assert!(steady.score > jittery.score);
     }
 }

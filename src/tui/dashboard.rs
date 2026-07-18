@@ -15,10 +15,11 @@ use crate::scanner::{result_confidence, result_status, ProbeResult};
 use crate::tui::theme;
 use crate::tui::{widgets, App, ButtonAction, ButtonKind};
 
-pub const RESULT_COLUMNS: [&str; 12] = [
-    "#", "IP", "Proto", "OK", "Fail", "Avg", "P50", "P90", "P95", "Max", "Colo", "Country",
+pub const RESULT_COLUMNS: [&str; 14] = [
+    "#", "IP", "Proto", "OK", "Fail", "Avg", "P50", "P90", "P95", "Max", "Jitter", "Loss", "Colo",
+    "Country",
 ];
-const WIDTHS: [Constraint; 12] = [
+const WIDTHS: [Constraint; 14] = [
     Constraint::Length(5),
     Constraint::Length(25),
     Constraint::Length(8),
@@ -29,6 +30,8 @@ const WIDTHS: [Constraint; 12] = [
     Constraint::Length(10),
     Constraint::Length(10),
     Constraint::Length(10),
+    Constraint::Length(9),
+    Constraint::Length(7),
     Constraint::Length(7),
     Constraint::Length(14),
 ];
@@ -40,10 +43,10 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    // The full 12-column table needs 120 (WIDTHS) + 11 column separators
-    // + 2 border columns = 133 columns to render without clipping, so only
+    // The full 14-column table needs 152 (WIDTHS) + 13 column separators
+    // + 2 border columns = 167 columns to render without clipping, so only
     // enter wide mode once the area is at least that wide.
-    if area.width < 134 {
+    if area.width < 168 {
         render_compact(app, frame, area);
     } else {
         render_wide(app, frame, area);
@@ -319,6 +322,17 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
                 Line::from(format!("Average     : {}", fmt_ms(result.avg))),
                 Line::from(format!("P95         : {}", fmt_ms(result.p95))),
                 Line::from(format!("Max         : {}", fmt_ms(result.max))),
+                Line::from(format!(
+                    "Jitter      : {} (σ {})",
+                    fmt_ms(result.jitter),
+                    fmt_ms(result.stddev)
+                )),
+                Line::from(format!(
+                    "Loss        : {}/{} ({:.1}%)",
+                    result.loss,
+                    result.ok + result.fail,
+                    result.packet_loss * 100.0
+                )),
                 Line::from(format!(
                     "Cold        : {}",
                     result
@@ -810,10 +824,12 @@ fn render_decision_panel(app: &App, frame: &mut Frame, area: Rect) {
     ])];
     if let Some(result) = candidates.first() {
         lines.push(Line::from(format!(
-            "Recommended: {} • {} • p95 {} • confidence {}",
+            "Recommended: {} • {} • p95 {} • jitter {} • loss {:.1}% • confidence {}",
             result.ip,
             result_status(result),
             fmt_ms(result.p95),
+            fmt_ms(result.jitter),
+            result.packet_loss * 100.0,
             result_confidence(result)
         )));
         let backups = candidates
@@ -832,7 +848,7 @@ fn render_decision_panel(app: &App, frame: &mut Frame, area: Rect) {
         )));
     }
     lines.push(Line::from(Span::styled(
-        "Ranking: reliability first, then p95 latency • f: show failures",
+        "Ranking: reliability first, then p95, jitter, and packet loss • f: show failures",
         theme::hint_style(),
     )));
     frame.render_widget(
@@ -1001,6 +1017,18 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
                 }),
                 Cell::from(r.colo.clone().unwrap_or_else(|| "—".to_string())).style(base_style),
                 Cell::from(r.country.clone().unwrap_or_else(|| "—".to_string())).style(base_style),
+                Cell::from(fmt_ms(r.jitter)).style(if is_selected {
+                    base_style
+                } else {
+                    theme::latency_style(r.jitter * 1000.0)
+                }),
+                Cell::from(format!("{:.1}%", r.packet_loss * 100.0)).style(if is_selected {
+                    base_style
+                } else if r.loss > 0 {
+                    theme::bad_style()
+                } else {
+                    base_style
+                }),
             ];
             Row::new(
                 cells
