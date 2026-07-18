@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.7.0](https://github.com/nexuslibs/cleanscan/compare/v0.6.0...v0.7.0) (2026-07-18)
+
+
+### Features
+
+* add country filtering and display in results ([c90aa31](https://github.com/nexuslibs/cleanscan/commit/c90aa313998740f9b56ea83e3cc4f8c50f4b94ed))
+* add datacenter (colo) awareness and steady-state latency via wa… ([9007531](https://github.com/nexuslibs/cleanscan/commit/900753175b3eb453c8bb9c869d1bb07113a93681))
+* add datacenter (colo) awareness and steady-state latency via warmup ([d4f2eac](https://github.com/nexuslibs/cleanscan/commit/d4f2eacccaea6b099098105d50603db166775056))
+
+
+### Bug Fixes
+
+* apply CodeRabbit auto-fixes ([9524d44](https://github.com/nexuslibs/cleanscan/commit/9524d44d0fc9f7a86e1ac1514fa38a0c56a2b6ae))
+* correct country and colo mappings in database and improve case-insensitive filtering ([993a86f](https://github.com/nexuslibs/cleanscan/commit/993a86f481ea2a15f39b7bbe67d792799ff6e276))
+* import scanner module in tests for proper normalization functionality ([55e7d40](https://github.com/nexuslibs/cleanscan/commit/55e7d4046f6485513eee77d4964a9c2e5ab71c98))
+* remove duplicate country argument from Args struct ([acee5c5](https://github.com/nexuslibs/cleanscan/commit/acee5c56ca446f78d68db359151bac052ef2aaf1))
+
 ## [0.6.0](https://github.com/nexuslibs/cleanscan/compare/v0.5.0...v0.6.0) (2026-07-18)
 
 
