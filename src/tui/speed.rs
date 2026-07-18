@@ -49,7 +49,10 @@ fn render_selection(app: &mut App, frame: &mut Frame, area: Rect) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
         .split(area);
-    let block = widgets::panel_block("Successful IPs — click or Space to select", true);
+    let block = widgets::panel_block(
+        "Successful IPs — click or Space to select",
+        app.focus_index == 0,
+    );
     let inner = block.inner(chunks[0]);
     app.speed_list_inner = Some(inner);
 
@@ -150,7 +153,9 @@ fn render_options_panel(app: &mut App, frame: &mut Frame, area: Rect) {
         rows[0],
     );
 
-    // Direction toggle buttons (the active direction is rendered as primary).
+    // Direction toggle buttons. The chosen direction is always rendered as a
+    // filled Primary button; keyboard focus (Tab) highlights exactly one button
+    // at a time, so "what is selected" and "what is focused" never conflate.
     let dir_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -159,21 +164,23 @@ fn render_options_panel(app: &mut App, frame: &mut Frame, area: Rect) {
             Constraint::Percentage(33),
         ])
         .split(rows[1]);
-    let dir_button = |app: &mut App, frame: &mut Frame, rect, label, action, active: bool| {
-        let kind = if active {
-            ButtonKind::Primary
-        } else {
-            ButtonKind::Secondary
+    let dir_button =
+        |app: &mut App, frame: &mut Frame, rect, label, action, selected: bool, focused: bool| {
+            let kind = if selected {
+                ButtonKind::Primary
+            } else {
+                ButtonKind::Secondary
+            };
+            app.button_ex(frame, rect, label, action, kind, focused);
         };
-        app.button_ex(frame, rect, label, action, kind, active);
-    };
     dir_button(
         app,
         frame,
         dir_cols[0],
         "Download",
         ButtonAction::SpeedDirDownload,
-        app.speed_direction == SpeedDirection::Download || app.focus_index == 1,
+        app.speed_direction == SpeedDirection::Download,
+        app.focus_index == 1,
     );
     dir_button(
         app,
@@ -181,7 +188,8 @@ fn render_options_panel(app: &mut App, frame: &mut Frame, area: Rect) {
         dir_cols[1],
         "Upload",
         ButtonAction::SpeedDirUpload,
-        app.speed_direction == SpeedDirection::Upload || app.focus_index == 1,
+        app.speed_direction == SpeedDirection::Upload,
+        app.focus_index == 2,
     );
     dir_button(
         app,
@@ -189,7 +197,8 @@ fn render_options_panel(app: &mut App, frame: &mut Frame, area: Rect) {
         dir_cols[2],
         "Both",
         ButtonAction::SpeedDirBoth,
-        app.speed_direction == SpeedDirection::Both || app.focus_index == 1,
+        app.speed_direction == SpeedDirection::Both,
+        app.focus_index == 3,
     );
 
     let sel_cols = Layout::default()
@@ -201,34 +210,39 @@ fn render_options_panel(app: &mut App, frame: &mut Frame, area: Rect) {
         sel_cols[0],
         "Select all",
         ButtonAction::SpeedAll,
-        app.focus_index == 2,
+        app.focus_index == 4,
     );
     app.button(
         frame,
         sel_cols[1],
         "Clear",
         ButtonAction::SpeedClear,
-        app.focus_index == 2,
+        app.focus_index == 5,
     );
 
     let act_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[3]);
+    let start_kind = if app.speed_selected.is_empty() {
+        ButtonKind::Secondary
+    } else {
+        ButtonKind::Primary
+    };
     app.button_ex(
         frame,
         act_cols[0],
         "Start ⏎",
         ButtonAction::SpeedStart,
-        ButtonKind::Primary,
-        !app.speed_selected.is_empty() || app.focus_index == 3,
+        start_kind,
+        app.focus_index == 6,
     );
     app.button(
         frame,
         act_cols[1],
         "Back",
         ButtonAction::SpeedBack,
-        app.focus_index == 4,
+        app.focus_index == 7,
     );
 }
 
@@ -293,7 +307,7 @@ fn render_testing(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_results(app: &mut App, frame: &mut Frame, area: Rect) {
-    let block = widgets::panel_block("Throughput", true);
+    let block = widgets::panel_block("Throughput", app.focus_index == 0);
     let visible = block.inner(area).height.saturating_sub(1) as usize;
     let max_scroll = app.speed_results.len().saturating_sub(visible);
     app.speed_result_cursor = app
@@ -366,15 +380,25 @@ fn format_measurement(value: Option<&crate::speed::SpeedMeasurement>) -> String 
 }
 
 fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
-    let text = match app.screen {
-        Screen::SpeedSelect => {
-            "Tab focus • Space select • Enter start • / commands • ? help • Esc back"
-        }
-        Screen::SpeedTesting => "Speed test running • q quit",
-        Screen::SpeedResults => {
-            "Tab focus • c copy • Esc back to latency results • / commands • ? help • q quit"
-        }
-        _ => "",
+    let hints: &[widgets::KeyHint] = match app.screen {
+        Screen::SpeedSelect => &[
+            ("Tab", "focus"),
+            ("Space", "select"),
+            ("↵", "start"),
+            ("/", "commands"),
+            ("?", "help"),
+            ("Esc", "back"),
+        ],
+        Screen::SpeedTesting => &[("q", "quit")],
+        Screen::SpeedResults => &[
+            ("Tab", "focus"),
+            ("c", "copy"),
+            ("Esc", "back"),
+            ("/", "commands"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        _ => &[],
     };
-    widgets::status_bar(frame, area, text, app.visible_message());
+    widgets::status_bar(frame, area, hints, app.visible_message());
 }

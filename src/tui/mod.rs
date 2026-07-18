@@ -282,7 +282,7 @@ impl App {
             Screen::Wizard => match self.wizard_step {
                 WizardStep::Ranges => 3,
                 WizardStep::Settings => 3,
-                WizardStep::Review => 2,
+                WizardStep::Review => 3,
             },
             Screen::Scanning => {
                 if self.scan_complete {
@@ -291,7 +291,7 @@ impl App {
                     3
                 }
             }
-            Screen::SpeedSelect => 5,
+            Screen::SpeedSelect => 8,
             Screen::SpeedTesting => 1,
             Screen::SpeedResults => 3,
         }
@@ -337,6 +337,9 @@ impl App {
             .copied()
             .filter(|action| {
                 (self.screen != Screen::SpeedTesting || *action != Action::SpeedTest)
+                    && (self.screen != Screen::Scanning
+                        || self.scan_complete
+                        || *action != Action::Start)
                     && (query.is_empty()
                         || action.label().to_ascii_lowercase().contains(&query)
                         || action.description().to_ascii_lowercase().contains(&query))
@@ -1116,10 +1119,16 @@ impl App {
             return;
         }
 
-        // The help overlay consumes every key, including its toggle and quit
-        // keys, so dismissing it cannot mutate the underlying application.
+        // The help overlay stays open until explicitly dismissed with `?`,
+        // `Esc`, or `q`, so incidental navigation keys don't close it. All keys
+        // are consumed while it is visible.
         if self.show_help {
-            self.show_help = false;
+            if matches!(
+                code,
+                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q')
+            ) {
+                self.show_help = false;
+            }
             return;
         }
 
@@ -1154,8 +1163,13 @@ impl App {
                 return;
             }
             KeyCode::Enter if self.screen == Screen::Scanning => {
-                if self.focus_target == FocusTarget::Table {
-                    self.show_result_details = true;
+                match self.focus_index {
+                    0 => self.show_result_details = true,
+                    1 if self.scan_complete => self.activate_action(Action::Export),
+                    1 => self.activate_action(Action::PauseResume),
+                    2 if self.scan_complete => self.activate_action(Action::SpeedTest),
+                    4 => self.activate_action(Action::Quit),
+                    _ => {}
                 }
                 return;
             }
@@ -1178,11 +1192,16 @@ impl App {
         match action {
             Action::Back => self.activate_button(ButtonAction::Back),
             Action::Next => self.activate_button(ButtonAction::Next),
-            Action::Start => self.activate_button(if self.screen == Screen::SpeedSelect {
-                ButtonAction::SpeedStart
-            } else {
-                ButtonAction::Start
-            }),
+            Action::Start => {
+                if self.screen == Screen::SpeedSelect {
+                    self.activate_button(ButtonAction::SpeedStart);
+                } else if self.screen == Screen::Wizard
+                    && self.wizard_step == WizardStep::Review
+                    && !self.pending_start
+                {
+                    self.activate_button(ButtonAction::Start);
+                }
+            }
             Action::Quit => self.activate_button(ButtonAction::Quit),
             Action::Export => self.save(),
             Action::PauseResume => self.activate_button(ButtonAction::PauseResume),
@@ -1470,15 +1489,30 @@ impl App {
                 self.speed_cursor =
                     (self.speed_cursor + 10).min(self.speed_targets.len().saturating_sub(1))
             }
-            KeyCode::Enter => {
+            KeyCode::Enter => self.speed_select_activate_focused(),
+            KeyCode::Esc => self.screen = Screen::Scanning,
+            _ => {}
+        }
+    }
+
+    /// Activate whichever speed-select control currently holds keyboard focus.
+    /// The list (index 0) and the Start button both begin the test; direction
+    /// and selection buttons apply their respective action.
+    fn speed_select_activate_focused(&mut self) {
+        match self.focus_index {
+            1 => self.speed_direction = SpeedDirection::Download,
+            2 => self.speed_direction = SpeedDirection::Upload,
+            3 => self.speed_direction = SpeedDirection::Both,
+            4 => self.speed_selected = self.speed_targets.iter().cloned().collect(),
+            5 => self.speed_selected.clear(),
+            7 => self.screen = Screen::Scanning,
+            _ => {
                 if self.speed_selected.is_empty() {
                     self.toast_warn("Select at least one successful IP");
                 } else {
                     self.confirm_speed_start = true;
                 }
             }
-            KeyCode::Esc => self.screen = Screen::Scanning,
-            _ => {}
         }
     }
 
@@ -1691,7 +1725,7 @@ impl App {
                 }
             }
             ButtonAction::Start => {
-                if self.wizard_step == WizardStep::Review {
+                if self.screen == Screen::Wizard && self.wizard_step == WizardStep::Review {
                     // Re-run start via the spawn closure is not accessible here;
                     // instead set a flag handled by the run loop.
                     self.pending_start = true;
@@ -1751,7 +1785,7 @@ impl Drop for RestoreGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{ranked_export_results, Action, App, FocusTarget, ProbeResult, Screen};
+    use super::{ranked_export_results, Action, App, FocusTarget, ProbeResult, Screen, WizardStep};
     use crate::config::AppConfig;
     use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::{backend::TestBackend, Terminal};
@@ -1894,6 +1928,26 @@ mod tests {
     }
 
     #[test]
+    fn wizard_review_enter_uses_the_focused_control() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.wizard_step = WizardStep::Review;
+        assert_eq!(app.focus_count(), 3);
+
+        app.focus_index = 1;
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.wizard_step, WizardStep::Settings);
+
+        app.wizard_step = WizardStep::Review;
+        app.focus_index = 2;
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.pending_start);
+    }
+
+    #[test]
     fn compact_dashboard_and_detail_draw_without_panicking() {
         let mut app = App::new(
             AppConfig::default(),
@@ -1905,5 +1959,54 @@ mod tests {
         app.show_result_details = true;
         draw(&mut app, 80, 24);
         draw(&mut app, 79, 23);
+    }
+
+    #[test]
+    fn speed_select_exposes_one_focus_per_control() {
+        use crate::speed::SpeedDirection;
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.open_speed_selection();
+        assert_eq!(app.screen, Screen::SpeedSelect);
+        // List + 3 directions + select-all/clear + start + back.
+        assert_eq!(app.focus_count(), 8);
+
+        app.focus_index = 1;
+        app.speed_select_activate_focused();
+        assert_eq!(app.speed_direction, SpeedDirection::Download);
+
+        app.focus_index = 2;
+        app.speed_select_activate_focused();
+        assert_eq!(app.speed_direction, SpeedDirection::Upload);
+
+        app.focus_index = 3;
+        app.speed_select_activate_focused();
+        assert_eq!(app.speed_direction, SpeedDirection::Both);
+
+        // Back button focus returns to the scanning dashboard.
+        app.focus_index = 7;
+        app.speed_select_activate_focused();
+        assert_eq!(app.screen, Screen::Scanning);
+    }
+
+    #[test]
+    fn help_overlay_closes_only_on_dedicated_keys() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.show_help = true;
+        // Navigation keys are consumed but leave help open.
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert!(app.show_help);
+        app.handle_key(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(app.show_help);
+        // Esc dismisses it.
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!app.show_help);
     }
 }

@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{
         Bar, BarChart, BarGroup, Cell, LineGauge, Paragraph, Row, Scrollbar, ScrollbarState,
@@ -150,7 +150,7 @@ fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
         Constraint::Length(12),
         Constraint::Length(10),
     ];
-    let block = widgets::panel_block("Results — Enter details", true);
+    let block = widgets::panel_block("Results — Enter details", app.focus_index == 0);
     let inner = block.inner(area);
     app.table_inner = Some(inner);
     let visible = inner.height.saturating_sub(1) as usize;
@@ -199,10 +199,27 @@ fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
-    let hints = if app.scan_complete {
-        "Tab focus • Enter details • p pause • e export • t speed test • c copy • / commands • ? help • q quit"
+    let hints: &[widgets::KeyHint] = if app.scan_complete {
+        &[
+            ("Tab", "focus"),
+            ("↵", "details"),
+            ("e", "export"),
+            ("t", "speed test"),
+            ("c", "copy"),
+            ("/", "commands"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
     } else {
-        "Tab focus • Enter details • p pause • c copy • / commands • ? help • q quit"
+        &[
+            ("Tab", "focus"),
+            ("↵", "details"),
+            ("p", "pause"),
+            ("c", "copy"),
+            ("/", "commands"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
     };
     widgets::status_bar(frame, area, hints, app.visible_message());
 }
@@ -220,6 +237,7 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
     let inner = widgets::modal(frame, area, popup, " Selected edge details ");
     let lines = vec![
         Line::from(Span::styled(result.ip.clone(), theme::header_style())),
+        Line::from(Span::styled("Latency profile", theme::subtitle_style())),
         Line::from(""),
         Line::from(format!(
             "Reliability : {}/{} successful",
@@ -237,10 +255,9 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
             theme::hint_style(),
         )),
     ];
-    frame.render_widget(
-        Paragraph::new(lines).block(widgets::panel_block("Latency profile", true)),
-        inner,
-    );
+    // The modal already draws a titled, bordered frame; render the body straight
+    // into its inner rect so there is a single clean border (no nested panel).
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_header(app: &App, frame: &mut Frame, area: Rect) {
@@ -497,7 +514,10 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
-    let block = widgets::panel_block("Results", true);
+    // The table border reads as "focused" only when keyboard focus is actually
+    // on the table (index 0); Tab-ing to a footer button releases it.
+    let focused = app.focus_index == 0;
+    let block = widgets::panel_block("Results", focused);
     let inner = block.inner(area);
     let header_rect = Rect {
         x: inner.x,
@@ -593,9 +613,7 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
             let base_style = if is_selected {
                 theme::row_selected_style()
             } else if is_first {
-                Style::default()
-                    .fg(Color::LightCyan)
-                    .add_modifier(Modifier::BOLD)
+                theme::best_style()
             } else {
                 Style::default()
             };
@@ -773,10 +791,27 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         app.focus_index == 4,
     );
 
-    let hints = if app.scan_complete {
-        "Tab focus • Enter details • c copy • e export • t speed test • / commands • ? help • q quit"
+    let hints: &[widgets::KeyHint] = if app.scan_complete {
+        &[
+            ("Tab", "focus"),
+            ("↵", "details"),
+            ("c", "copy"),
+            ("e", "export"),
+            ("t", "speed test"),
+            ("/", "commands"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
     } else {
-        "Tab focus • Enter details • p pause • c copy • / commands • ? help • q quit"
+        &[
+            ("Tab", "focus"),
+            ("↵", "details"),
+            ("p", "pause"),
+            ("c", "copy"),
+            ("/", "commands"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
     };
     widgets::status_bar(frame, chunks[2], hints, app.visible_message());
 }

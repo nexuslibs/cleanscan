@@ -47,6 +47,9 @@ pub struct Palette {
     pub sel_bg: Color,
     /// Subtle alternating (zebra) row fill.
     pub row_alt: Color,
+    /// The single fastest / "best" edge highlight (paired with a ★ glyph so it
+    /// still reads under NO_COLOR).
+    pub best: Color,
 }
 
 impl Palette {
@@ -66,6 +69,7 @@ impl Palette {
             border_active: Color::Rgb(0x58, 0xa6, 0xff),
             sel_bg: Color::Rgb(0x1f, 0x2a, 0x3d),
             row_alt: Color::Rgb(0x16, 0x1b, 0x22),
+            best: Color::Rgb(0x56, 0xd4, 0xdd),
         }
     }
 
@@ -85,6 +89,7 @@ impl Palette {
             border_active: Color::LightBlue,
             sel_bg: Color::Blue,
             row_alt: Color::Reset,
+            best: Color::LightCyan,
         }
     }
 
@@ -104,13 +109,14 @@ impl Palette {
             border_active: Color::Reset,
             sel_bg: Color::Reset,
             row_alt: Color::Reset,
+            best: Color::Reset,
         }
     }
 }
 
 fn detect_mode() -> ColorMode {
     // Honor the NO_COLOR convention (https://no-color.org/).
-    if std::env::var_os("NO_COLOR").is_some() {
+    if std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()) {
         return ColorMode::None;
     }
     // COLORTERM=truecolor|24bit is the de-facto truecolor signal.
@@ -173,6 +179,15 @@ pub fn warn_style() -> Style {
     Style::default().fg(palette().warn)
 }
 
+/// Highlight for the single fastest edge. Pairs a distinct color with BOLD so
+/// the row still stands out on ANSI-16 terminals and under NO_COLOR (where the
+/// accompanying ★ glyph carries the meaning).
+pub fn best_style() -> Style {
+    Style::default()
+        .fg(palette().best)
+        .add_modifier(Modifier::BOLD)
+}
+
 pub fn bad_style() -> Style {
     Style::default().fg(palette().danger)
 }
@@ -206,7 +221,7 @@ pub fn panel_title_style() -> Style {
 pub fn row_selected_style() -> Style {
     Style::default()
         .bg(palette().sel_bg)
-        .fg(palette().subtitle)
+        .fg(palette().title)
         .add_modifier(Modifier::BOLD)
 }
 

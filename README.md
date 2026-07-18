@@ -94,22 +94,28 @@ cleanscan --cli --cidr 188.114.96.0/20 --top 20
 
 ### TUI controls
 
-When `cleanscan` is run with no `--cidr` / `--ips`, it opens a CIDR
-selection screen first. Built-in Cloudflare ranges are listed and pre-selected;
-toggle the ones you want and press `Enter` to start. When targets are supplied
-on the command line, the scan starts directly with those targets.
+When `cleanscan` is run with no `--cidr` / `--ips`, it opens a guided setup
+wizard (Ranges → Settings → Review). Its top bar shows the step progress, and
+across every screen the panel that currently holds keyboard focus is drawn with
+a highlighted (accent-colored) border so it is always clear where input goes.
+Built-in Cloudflare ranges are listed and pre-selected; toggle the ones you want
+and press `Enter` to advance. When targets are supplied on the command line, the
+scan starts directly with those targets.
 
 **Selection screen**
 
 | Key            | Action                                  |
 |----------------|-----------------------------------------|
 | `Tab` / `Shift+Tab` | Move focus between controls |
-| `↑` / `↓` | Move through the focused list |
+| `↑` / `↓` (or `k` / `j`) | Move through the focused list |
 | `Space` | Toggle the focused CIDR |
+| `a` | Add a custom CIDR range |
+| `A` | Select all ranges |
+| `N` / `n` / `d` | Deselect all ranges |
 | `Enter` | Activate or edit the focused control |
 | `Esc` | Cancel or go back |
 | `/` | Open the command palette |
-| `?` | Open contextual help |
+| `?` | Open contextual help (close with `?`, `Esc`, or `q`) |
 | `q` | Quit |
 
 While the custom CIDR field is focused, typed characters append, `Backspace`
@@ -117,7 +123,7 @@ deletes, `Enter` confirms, and `Esc` cancels.
 
 **Settings screen**
 
-Reached from the selection screen with `c`. Scan parameters can be edited here.
+After advancing from the selection screen, scan parameters can be edited here.
 Navigation mirrors the selection screen:
 
 | Key            | Action                                  |
@@ -129,7 +135,6 @@ Navigation mirrors the selection screen:
 | `Backspace`    | While editing, delete a character       |
 | `Enter`        | While editing, confirm the new value    |
 | `Esc`          | While editing, cancel; otherwise return to the selection screen |
-| `Esc`          | Return to the selection screen          |
 | `q`            | Quit                                    |
 
 The following parameters are editable, with the same meaning as their CLI
@@ -137,7 +142,7 @@ counterparts: `Host` (`--host`), `Path` (`--path`), `Sample per CIDR`
 (`--sample-per-cidr`), `Probes` (`--probes`), `Concurrency` (`--concurrency`),
 `Timeout (ms)` (`--timeout-ms`), `Connect timeout (ms)` (`--connect-timeout-ms`),
 and `Top results` (`--top`). Speed-test settings are also editable: download
-path, upload path, payload size in MB, and repetition count.
+path, upload path, payload size in MB, repetition count, and speed timeout (ms).
 Target-source flags such as `--cidr` and `--ips` are selected before launching
 the TUI and are not edited in this screen.
 
@@ -152,13 +157,20 @@ the TUI and are not edited in this screen.
 | `Enter`   | Open full details for the selected IP |
 | `↑` / `↓` | Select a result IP |
 | `c`       | Copy the selected IP to the clipboard |
+| `/`       | Open the command palette |
+| `?`       | Open contextual help (close with `?`, `Esc`, or `q`) |
 
 **Speed-test screen**
 
-After latency scanning completes, press `t` to select successful IPs. Use
-`Tab`, arrows, `Space`, and `Enter` to select targets, choose a direction, and
-start the test. Results report throughput in Mbps for each direction. Press
-`c` to copy the selected IP and `Esc` to return to the latency dashboard.
+After latency scanning completes, press `t` to select successful IPs. `Tab`
+moves focus through each control individually (the IP list, the three direction
+buttons, select-all/clear, and start/back), and `Enter` activates whichever
+control is focused. The currently chosen direction is always shown as a filled
+button so selection and focus never look alike. Shortcuts: `Space` toggles the
+highlighted IP, `a` / `x` select-all / clear, and `d` / `u` / `b` set the
+download / upload / both direction. Results report throughput in Mbps for each
+direction. Press `c` to copy the selected IP and `Esc` to return to the latency
+dashboard.
 
 ### CLI options
 

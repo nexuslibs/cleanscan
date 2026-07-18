@@ -1,7 +1,7 @@
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
     Frame,
@@ -331,26 +331,12 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_step_bar(app: &App, frame: &mut Frame, area: Rect) {
-    let steps = ["1 Ranges", "2 Settings", "3 Review"];
-    let current = app.wizard_step as usize;
-    let mut spans = vec![Span::styled(
-        format!(" cleanscan v{}  ", env!("CARGO_PKG_VERSION")),
-        theme::header_style(),
-    )];
-    for (i, s) in steps.iter().enumerate() {
-        let style = if i == current {
-            theme::highlight_style()
-        } else {
-            theme::hint_style()
-        };
-        spans.push(Span::styled(format!("  {s}  "), style));
-        if i < steps.len() - 1 {
-            spans.push(Span::styled("›", theme::hint_style()));
-        }
-    }
-    let line = Line::from(spans);
-    let para = Paragraph::new(line).block(widgets::panel_block("", false));
-    frame.render_widget(para, area);
+    widgets::stepper_header(
+        frame,
+        area,
+        &["Ranges", "Settings", "Review"],
+        app.wizard_step as usize,
+    );
 }
 
 fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -414,7 +400,7 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
             let style = if i == app.cursor {
                 theme::row_selected_style()
             } else if e.selected {
-                Style::default().fg(Color::LightCyan)
+                Style::default().fg(theme::palette().info)
             } else {
                 theme::hint_style()
             };
@@ -809,7 +795,7 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         WizardStep::Review => "Start scan",
         _ => "Next",
     };
-    let right_focused = app.focus_index == 2 || app.wizard_step == WizardStep::Review;
+    let right_focused = app.focus_index == 2;
     let right_kind = if right_focused {
         ButtonKind::Primary
     } else {
@@ -826,24 +812,48 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_hint(app: &App, frame: &mut Frame, area: Rect) {
-    let text = match app.wizard_step {
+    let hints: &[widgets::KeyHint] = match app.wizard_step {
         WizardStep::Ranges => {
             if app.custom_input_mode {
-                "type CIDR • Enter confirm • Esc cancel"
+                &[("type", "CIDR"), ("↵", "confirm"), ("Esc", "cancel")]
             } else {
-                "Tab focus • Space toggle • Enter next • / commands • ? help"
+                &[
+                    ("Tab", "focus"),
+                    ("Space", "toggle"),
+                    ("↵", "next"),
+                    ("/", "commands"),
+                    ("?", "help"),
+                ]
             }
         }
         WizardStep::Settings => {
             if app.edit_field.is_some() {
-                "type value • ←/→ move • ↑/↓ step • Enter confirm • Esc cancel"
+                &[
+                    ("type", "value"),
+                    ("←/→", "move"),
+                    ("↑/↓", "step"),
+                    ("↵", "confirm"),
+                    ("Esc", "cancel"),
+                ]
             } else {
-                "Tab focus • Enter edit/next • ↑/↓ adjust • / commands • ? help"
+                &[
+                    ("Tab", "focus"),
+                    ("↵", "edit/next"),
+                    ("↑/↓", "adjust"),
+                    ("/", "commands"),
+                    ("?", "help"),
+                ]
             }
         }
-        WizardStep::Review => "Tab focus • Enter start • Esc back • / commands • ? help",
+        WizardStep::Review => &[
+            ("Tab", "focus"),
+            ("↵", "start"),
+            ("Esc", "back"),
+            ("/", "commands"),
+            ("?", "help"),
+        ],
     };
-    widgets::status_bar(frame, area, text, app.visible_message());
+    widgets::status_bar(frame, area, hints, app.visible_message());
 }
 
 /// Handle a key while on the wizard. Delegates to the active step's editor.
@@ -961,10 +971,17 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
             app.wizard_step = WizardStep::Settings;
             app.cursor = 0;
         }
-        KeyCode::Right | KeyCode::Enter if (app.wizard_step as usize) < 2 => {
+        KeyCode::Right if (app.wizard_step as usize) < 2 => {
             app.wizard_step = WizardStep::Settings;
             app.cursor = 0;
         }
+        KeyCode::Enter => match app.focus_index {
+            1 => app.should_quit = true,
+            _ => {
+                app.wizard_step = WizardStep::Settings;
+                app.cursor = 0;
+            }
+        },
         _ => {}
     }
 }
@@ -1055,9 +1072,17 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             app.wizard_step = WizardStep::Ranges;
             app.cursor = 0;
         }
-        KeyCode::Enter => {
-            app.start_edit(app.cursor);
-        }
+        KeyCode::Enter => match app.focus_index {
+            1 => {
+                app.wizard_step = WizardStep::Ranges;
+                app.cursor = 0;
+            }
+            2 => {
+                app.wizard_step = WizardStep::Review;
+                app.cursor = 0;
+            }
+            _ => app.start_edit(app.cursor),
+        },
         KeyCode::Char('1') => {
             app.config.sample_per_cidr = 100;
             app.config.probes = 8;
@@ -1095,9 +1120,14 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
 
 fn handle_review_key(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Enter => {
-            app.pending_start = true;
-        }
+        KeyCode::Enter => match app.focus_index {
+            1 => {
+                app.wizard_step = WizardStep::Settings;
+                app.cursor = 0;
+            }
+            2 => app.pending_start = true,
+            _ => {}
+        },
         KeyCode::Left | KeyCode::Esc => {
             app.wizard_step = WizardStep::Settings;
             app.cursor = 0;
