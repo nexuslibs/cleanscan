@@ -1,3 +1,4 @@
+mod colo;
 mod config;
 mod scanner;
 mod speed;
@@ -89,6 +90,14 @@ pub struct Args {
     #[arg(long)]
     pub colo: Option<String>,
 
+    /// Only report IPs in the given country (substring match, e.g. "Germany")
+    #[arg(long)]
+    pub country: Option<String>,
+
+    /// Only report IPs in the given country (substring match, e.g. "Germany")
+    #[arg(long)]
+    pub country: Option<String>,
+
     /// Skip the connection-establishment warmup probe (first counted probe includes connection time)
     #[arg(long)]
     pub no_warmup: bool,
@@ -169,6 +178,7 @@ fn main() -> Result<()> {
             args.fail_if_no_healthy_target,
             args.seed,
             args.colo,
+            args.country,
         )
     } else {
         tui::run_tui(config, args.cidr, args.ips, args.seed)
@@ -200,6 +210,7 @@ fn cli_mode(
     fail_if_no_healthy_target: bool,
     seed: Option<u64>,
     colo: Option<String>,
+    country: Option<String>,
 ) -> Result<()> {
     let targets = if let Some(path) = targets_file {
         scanner::load_ip_manifest(&path)?
@@ -236,6 +247,15 @@ fn cli_mode(
             r.colo
                 .as_deref()
                 .is_some_and(|c| c.eq_ignore_ascii_case(&want))
+        });
+    }
+
+    if let Some(country) = &country {
+        let want = country.to_ascii_lowercase();
+        results.retain(|r| {
+            r.country
+                .as_deref()
+                .is_some_and(|c| c.to_ascii_lowercase().contains(&want))
         });
     }
 
@@ -278,7 +298,7 @@ fn cli_mode(
             .collect::<std::result::Result<Vec<_>, _>>()?
             .join("\n"),
         _ => {
-            let mut text = String::from("rank\tip\tcolo\tprotocol\tok\tfail\tsuccess_rate\tconfidence\tavg\tp50\tp90\tp95\tmax\tconnect_ms\tsamples\tfailures\n");
+            let mut text = String::from("rank\tip\tcolo\tcountry\tprotocol\tok\tfail\tsuccess_rate\tconfidence\tavg\tp50\tp90\tp95\tmax\tconnect_ms\tsamples\tfailures\n");
             for (i, r) in rows.iter().enumerate() {
                 let samples = r
                     .samples
@@ -288,10 +308,11 @@ fn cli_mode(
                     .join(",");
 
                 text.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\n",
                     i + 1,
                     r.ip,
                     r.colo.clone().unwrap_or_default(),
+                    r.country.clone().unwrap_or_default(),
                     r.protocol,
                     r.ok,
                     r.fail,

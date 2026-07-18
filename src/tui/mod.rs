@@ -236,7 +236,8 @@ pub struct App {
     pub sort_asc: bool,
     pub show_failures: bool,
     pub colo_filter: Option<String>,
-    pub result_column_visibility: [bool; 11],
+    pub country_filter: Option<String>,
+    pub result_column_visibility: [bool; 12],
     pub column_picker_cursor: usize,
     pub start_time: Instant,
     /// Help overlay visibility.
@@ -459,7 +460,8 @@ impl App {
             sort_asc: true,
             show_failures: false,
             colo_filter: None,
-            result_column_visibility: [true; 11],
+            country_filter: None,
+            result_column_visibility: [true; 12],
             column_picker_cursor: 0,
             start_time: Instant::now(),
             show_help: false,
@@ -796,18 +798,24 @@ impl App {
 
     /// Results sorted for display according to the active sort column.
     pub fn sorted_results(&self) -> Vec<&ProbeResult> {
-        let mut v: Vec<&ProbeResult> = self
-            .results
-            .iter()
-            .filter(|r| self.show_failures || r.ok > 0)
-            .filter(|r| match &self.colo_filter {
-                Some(want) => r
-                    .colo
-                    .as_deref()
-                    .is_some_and(|c| c.eq_ignore_ascii_case(want)),
-                None => true,
-            })
-            .collect();
+        let mut v: Vec<&ProbeResult> =
+            self.results
+                .iter()
+                .filter(|r| self.show_failures || r.ok > 0)
+                .filter(|r| match &self.colo_filter {
+                    Some(want) => r
+                        .colo
+                        .as_deref()
+                        .is_some_and(|c| c.eq_ignore_ascii_case(want)),
+                    None => true,
+                })
+                .filter(|r| match &self.country_filter {
+                    Some(want) => r.country.as_deref().is_some_and(|c| {
+                        c.to_ascii_lowercase().contains(&want.to_ascii_lowercase())
+                    }),
+                    None => true,
+                })
+                .collect();
         if self.sort_col == 0 {
             v.sort_by(|a, b| {
                 let ord = Self::natural_cmp(a, b);
@@ -847,6 +855,7 @@ impl App {
                     .partial_cmp(&b.max)
                     .unwrap_or(std::cmp::Ordering::Equal),
                 10 => a.colo.cmp(&b.colo),
+                11 => a.country.cmp(&b.country),
                 _ => std::cmp::Ordering::Equal,
             };
             if self.sort_asc {
@@ -1377,7 +1386,9 @@ impl App {
                 KeyCode::Up => {
                     self.column_picker_cursor = self.column_picker_cursor.saturating_sub(1)
                 }
-                KeyCode::Down => self.column_picker_cursor = (self.column_picker_cursor + 1).min(10),
+                KeyCode::Down => {
+                    self.column_picker_cursor = (self.column_picker_cursor + 1).min(11)
+                }
                 KeyCode::Char(' ') | KeyCode::Enter => self.toggle_column(),
                 _ => {}
             }
@@ -1407,6 +1418,20 @@ impl App {
                         match &self.colo_filter {
                             Some(c) => self.toast_info(format!("Filtering by colo {c}")),
                             None => self.toast_info("Colo filter cleared"),
+                        }
+                        return;
+                    }
+                    if let Some(code) = query.strip_prefix("country:") {
+                        let code = code.trim();
+                        self.country_filter = if code.is_empty() {
+                            None
+                        } else {
+                            Some(code.to_string())
+                        };
+                        self.close_command_palette();
+                        match &self.country_filter {
+                            Some(c) => self.toast_info(format!("Filtering by country {c}")),
+                            None => self.toast_info("Country filter cleared"),
                         }
                         return;
                     }
@@ -1552,7 +1577,7 @@ impl App {
             Action::ConfigureColumns => {
                 if self.screen == Screen::Scanning {
                     self.show_column_picker = true;
-                    self.column_picker_cursor = self.column_picker_cursor.min(10);
+                    self.column_picker_cursor = self.column_picker_cursor.min(11);
                 }
             }
             Action::Confirm => {
@@ -2419,6 +2444,7 @@ mod tests {
             success_rate: 1.0 / (1 + fail) as f64,
             score: 1.0 / p95.max(0.001),
             colo: None,
+            country: None,
             connect_ms: None,
         }
     }
@@ -2533,9 +2559,9 @@ mod tests {
 
         app.show_command_palette = false;
         app.show_column_picker = true;
-        app.column_picker_cursor = 9;
+        app.column_picker_cursor = 11;
         draw(&mut app, 120, 36);
-        assert_eq!(app.column_picker_list_state.selected(), Some(9));
+        assert_eq!(app.column_picker_list_state.selected(), Some(11));
     }
 
     #[test]

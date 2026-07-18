@@ -167,8 +167,9 @@ the TUI and are not edited in this screen.
 
 In the command palette, type `colo:FRA` (or any datacenter code) to narrow the
 results table to IPs in that Cloudflare colo; `colo:` with no code clears the
-filter. The `Colo` column is shown by default and can be toggled like any other
-result column.
+filter. Type `country:Germany` (substring match) to narrow results to a country;
+`country:` with no code clears it. The `Colo` and `Country` columns are shown by
+default and can be toggled like any other result column.
 
 **Speed-test screen**
 
@@ -213,6 +214,7 @@ latency dashboard.
 | `--max-p95-ms`         | —                | Maximum per-target p95 latency threshold        |
 | `--fail-if-no-healthy-target` | off         | Fail if no target meets thresholds              |
 | `--colo`                | —                | Only report IPs in the given Cloudflare datacenter (e.g. `FRA`) |
+| `--country`             | —                | Only report IPs in the given country (substring match, e.g. `Germany`) |
 | `--no-warmup`           | off              | Skip the connection-establishment warmup probe (measure raw RTT) |
 
 ## Output

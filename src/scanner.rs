@@ -56,6 +56,9 @@ pub struct ProbeResult {
     /// Cloudflare datacenter code (e.g. "FRA") parsed from `/cdn-cgi/trace`,
     /// or `None` when the probed path does not expose it.
     pub colo: Option<String>,
+    /// Country derived from `colo` via the embedded Cloudflare datacenter
+    /// mapping, or `None` when the code is unknown or no colo was captured.
+    pub country: Option<String>,
     /// Round-trip time of the connection-establishment (TCP + TLS) warmup
     /// probe, captured separately from steady-state latency. `None` when the
     /// warmup failed or warmup is disabled.
@@ -428,6 +431,10 @@ impl TargetState {
                 0.0
             },
             colo: self.colo.clone(),
+            country: self
+                .colo
+                .as_ref()
+                .and_then(|code| crate::colo::lookup_country(code).map(str::to_string)),
             connect_ms: self.connect_ms.map(|seconds| seconds * 1000.0),
         }
     }

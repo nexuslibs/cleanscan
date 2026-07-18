@@ -15,10 +15,10 @@ use crate::scanner::{result_confidence, result_status, ProbeResult};
 use crate::tui::theme;
 use crate::tui::{widgets, App, ButtonAction, ButtonKind};
 
-pub const RESULT_COLUMNS: [&str; 11] = [
-    "#", "IP", "Proto", "OK", "Fail", "Avg", "P50", "P90", "P95", "Max", "Colo",
+pub const RESULT_COLUMNS: [&str; 12] = [
+    "#", "IP", "Proto", "OK", "Fail", "Avg", "P50", "P90", "P95", "Max", "Colo", "Country",
 ];
-const WIDTHS: [Constraint; 11] = [
+const WIDTHS: [Constraint; 12] = [
     Constraint::Length(5),
     Constraint::Length(25),
     Constraint::Length(8),
@@ -30,6 +30,7 @@ const WIDTHS: [Constraint; 11] = [
     Constraint::Length(10),
     Constraint::Length(10),
     Constraint::Length(7),
+    Constraint::Length(14),
 ];
 
 /// Render the live scanning dashboard.
@@ -148,10 +149,11 @@ fn render_compact_stats(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
-    const COMPACT_WIDTHS: [Constraint; 7] = [
+    const COMPACT_WIDTHS: [Constraint; 8] = [
         Constraint::Length(5),
         Constraint::Min(15),
         Constraint::Length(7),
+        Constraint::Length(14),
         Constraint::Length(12),
         Constraint::Length(12),
         Constraint::Length(12),
@@ -181,6 +183,7 @@ fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
             Cell::from((index + 1).to_string()),
             Cell::from(r.ip.clone()),
             Cell::from(r.colo.clone().unwrap_or_else(|| "—".to_string())),
+            Cell::from(r.country.clone().unwrap_or_else(|| "—".to_string())),
             Cell::from(reliability),
             Cell::from(fmt_ms(r.avg)),
             Cell::from(fmt_ms(r.p95)),
@@ -204,6 +207,7 @@ fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
                 "#",
                 "IP",
                 "Colo",
+                "Country",
                 "Reliability",
                 "Avg",
                 "P95",
@@ -295,6 +299,13 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
                 Line::from(format!(
                     "Colo        : {}",
                     result.colo.clone().unwrap_or_else(|| "unknown".to_string())
+                )),
+                Line::from(format!(
+                    "Country     : {}",
+                    result
+                        .country
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string())
                 )),
                 Line::from(format!(
                     "Success     : {}/{} ({:.1}%)",
@@ -986,6 +997,7 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
                     theme::latency_style(r.max * 1000.0)
                 }),
                 Cell::from(r.colo.clone().unwrap_or_else(|| "—".to_string())).style(base_style),
+                Cell::from(r.country.clone().unwrap_or_else(|| "—".to_string())).style(base_style),
             ];
             Row::new(
                 cells
