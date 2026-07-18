@@ -20,6 +20,7 @@ use crossterm::event::{self, EnableMouseCapture, Event, KeyCode, KeyEventKind, K
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     symbols::border::ROUNDED,
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
@@ -47,6 +48,118 @@ pub enum WizardStep {
     Ranges = 0,
     Settings = 1,
     Review = 2,
+}
+
+/// Semantic focus target shared by every screen. The concrete index is kept in
+/// `focus_index`, while this enum gives the UI a stable vocabulary for focus
+/// styling, help, and future screen-specific focus maps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusTarget {
+    Panel,
+    List,
+    Table,
+    Button,
+    Field,
+    Dialog,
+}
+
+/// User-facing commands. The command palette, contextual help, keyboard
+/// aliases, and visible buttons all resolve to this same registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Back,
+    Next,
+    Start,
+    Quit,
+    Export,
+    PauseResume,
+    SpeedTest,
+    CopyIp,
+    OpenDetails,
+    CloseDetails,
+    OpenHelp,
+    OpenCommandPalette,
+    Confirm,
+    Cancel,
+    SelectAll,
+    ClearSelection,
+    Download,
+    Upload,
+    Both,
+}
+
+impl Action {
+    pub const ALL: [Action; 19] = [
+        Action::Back,
+        Action::Next,
+        Action::Start,
+        Action::Quit,
+        Action::Export,
+        Action::PauseResume,
+        Action::SpeedTest,
+        Action::CopyIp,
+        Action::OpenDetails,
+        Action::CloseDetails,
+        Action::OpenHelp,
+        Action::OpenCommandPalette,
+        Action::Confirm,
+        Action::Cancel,
+        Action::SelectAll,
+        Action::ClearSelection,
+        Action::Download,
+        Action::Upload,
+        Action::Both,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Action::Back => "Back",
+            Action::Next => "Next",
+            Action::Start => "Start scan",
+            Action::Quit => "Quit",
+            Action::Export => "Export results",
+            Action::PauseResume => "Pause / resume",
+            Action::SpeedTest => "Run speed test",
+            Action::CopyIp => "Copy selected IP",
+            Action::OpenDetails => "Open selected details",
+            Action::CloseDetails => "Close details",
+            Action::OpenHelp => "Open help",
+            Action::OpenCommandPalette => "Open command palette",
+            Action::Confirm => "Confirm",
+            Action::Cancel => "Cancel",
+            Action::SelectAll => "Select all",
+            Action::ClearSelection => "Clear selection",
+            Action::Download => "Download only",
+            Action::Upload => "Upload only",
+            Action::Both => "Download + upload",
+        }
+    }
+
+    pub fn shortcut(self) -> &'static str {
+        match self {
+            Action::Quit => "q",
+            Action::Export => "e",
+            Action::PauseResume => "p",
+            Action::SpeedTest => "t",
+            Action::CopyIp => "c",
+            Action::OpenHelp => "?",
+            Action::OpenCommandPalette => "/",
+            Action::Confirm => "Enter",
+            Action::Cancel => "Esc",
+            _ => "",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Action::OpenDetails => "Show complete latency statistics for the selected result",
+            Action::Export => "Write the ranked results to a TSV file",
+            Action::SpeedTest => "Choose successful IPs for bandwidth testing",
+            Action::PauseResume => "Pause or resume the active scan",
+            Action::CopyIp => "Copy the selected IP address to the clipboard",
+            _ => self.label(),
+        }
+    }
 }
 
 /// Identifies an action button drawn on screen, used for mouse hit-testing.
@@ -104,6 +217,8 @@ pub struct App {
     pub result_cursor: usize,
     /// Scroll offset into the wizard CIDR list.
     pub ranges_scroll: usize,
+    /// Scroll offset into the wizard settings list.
+    pub settings_scroll: usize,
     /// Currently sorted column index in the results table (natural order = 0).
     pub sort_col: usize,
     pub sort_asc: bool,
@@ -146,9 +261,104 @@ pub struct App {
     pub speed_complete: bool,
     pub speed_start_time: Instant,
     pub pending_speed_start: bool,
+    pub confirm_speed_start: bool,
+    /// Active semantic focus target and its position in the current screen's
+    /// focus map. Focus is intentionally independent from list cursors.
+    pub focus_target: FocusTarget,
+    pub focus_index: usize,
+    /// Searchable command palette state.
+    pub show_command_palette: bool,
+    pub command_query: String,
+    pub command_cursor: usize,
+    /// Full statistics drawer for the currently selected latency result.
+    pub show_result_details: bool,
 }
 
 impl App {
+    /// Number of focusable regions on the current screen. Keeping this map
+    /// small and predictable makes Tab useful even when a screen is compact.
+    pub fn focus_count(&self) -> usize {
+        match self.screen {
+            Screen::Wizard => match self.wizard_step {
+                WizardStep::Ranges => 3,
+                WizardStep::Settings => 3,
+                WizardStep::Review => 2,
+            },
+            Screen::Scanning => {
+                if self.scan_complete {
+                    5
+                } else {
+                    3
+                }
+            }
+            Screen::SpeedSelect => 5,
+            Screen::SpeedTesting => 1,
+            Screen::SpeedResults => 3,
+        }
+    }
+
+    pub fn focus_next(&mut self, reverse: bool) {
+        let count = self.focus_count().max(1);
+        if reverse {
+            self.focus_index = if self.focus_index == 0 {
+                count - 1
+            } else {
+                self.focus_index - 1
+            };
+        } else {
+            self.focus_index = (self.focus_index + 1) % count;
+        }
+        self.focus_target = self.focus_target_for(self.focus_index);
+    }
+
+    pub fn focus_target_for(&self, index: usize) -> FocusTarget {
+        if self.confirm_quit || self.show_command_palette || self.show_result_details {
+            return FocusTarget::Dialog;
+        }
+        match self.screen {
+            Screen::Wizard => match (self.wizard_step, index) {
+                (WizardStep::Ranges, 0) => FocusTarget::List,
+                (WizardStep::Settings, 0) => FocusTarget::Field,
+                (WizardStep::Review, 0) => FocusTarget::Panel,
+                _ => FocusTarget::Button,
+            },
+            Screen::Scanning if index == 0 => FocusTarget::Table,
+            Screen::SpeedSelect if index == 0 => FocusTarget::List,
+            Screen::SpeedResults if index == 0 => FocusTarget::Table,
+            Screen::SpeedTesting => FocusTarget::Panel,
+            _ => FocusTarget::Button,
+        }
+    }
+
+    fn filtered_actions(&self) -> Vec<Action> {
+        let query = self.command_query.to_ascii_lowercase();
+        Action::ALL
+            .iter()
+            .copied()
+            .filter(|action| {
+                query.is_empty()
+                    || action.label().to_ascii_lowercase().contains(&query)
+                    || action.description().to_ascii_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    fn selected_action(&self) -> Option<Action> {
+        self.filtered_actions().get(self.command_cursor).copied()
+    }
+
+    fn open_command_palette(&mut self) {
+        self.show_command_palette = true;
+        self.command_query.clear();
+        self.command_cursor = 0;
+    }
+
+    fn close_command_palette(&mut self) {
+        self.show_command_palette = false;
+        self.command_query.clear();
+        self.command_cursor = 0;
+    }
+
     pub fn new(config: AppConfig, has_cli_targets: bool, paused: Arc<AtomicBool>) -> Self {
         let mut cidr_candidates = Vec::new();
 
@@ -205,6 +415,7 @@ impl App {
             scroll: 0,
             result_cursor: 0,
             ranges_scroll: 0,
+            settings_scroll: 0,
             sort_col: 0,
             sort_asc: true,
             start_time: Instant::now(),
@@ -234,6 +445,13 @@ impl App {
             speed_complete: false,
             speed_start_time: Instant::now(),
             pending_speed_start: false,
+            confirm_speed_start: false,
+            focus_target: FocusTarget::List,
+            focus_index: 0,
+            show_command_palette: false,
+            command_query: String::new(),
+            command_cursor: 0,
+            show_result_details: false,
         }
     }
 
@@ -270,6 +488,9 @@ impl App {
     /// Switch to the scanning dashboard once targets are known. Resets per-scan state.
     pub fn begin_scan(&mut self, total: usize) {
         self.screen = Screen::Scanning;
+        self.focus_index = 0;
+        self.focus_target = FocusTarget::Table;
+        self.show_result_details = false;
         self.total_targets = total;
         self.scan_complete = false;
         self.results.clear();
@@ -311,11 +532,6 @@ impl App {
             Ok(destination) => self.toast_success(format!("Copied {ip} to {destination}")),
             Err(error) => self.toast_error(format!("Copy failed: {error}")),
         }
-    }
-
-    /// Show a transient status/toast message (informational severity).
-    pub fn toast(&mut self, msg: impl Into<String>) {
-        self.toast_kind(msg, ToastKind::Info);
     }
 
     /// Show a transient toast with an explicit severity.
@@ -719,16 +935,22 @@ pub fn run_tui(
                             app.speed_complete = true;
                             app.speed_result_cursor = 0;
                             app.scroll = 0;
+                            app.focus_index = 0;
+                            app.focus_target = FocusTarget::Table;
                             app.screen = Screen::SpeedResults;
                         }
                         Ok(Err(e)) => {
                             app.speed_complete = true;
                             app.toast_error(format!("Speed test failed: {e}"));
+                            app.focus_index = 0;
+                            app.focus_target = FocusTarget::Table;
                             app.screen = Screen::SpeedResults;
                         }
                         Err(_) => {
                             app.speed_complete = true;
                             app.toast_error("Speed test worker panicked");
+                            app.focus_index = 0;
+                            app.focus_target = FocusTarget::Table;
                             app.screen = Screen::SpeedResults;
                         }
                     }
@@ -825,10 +1047,78 @@ impl App {
             return;
         }
 
+        if self.confirm_speed_start {
+            match code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirm_speed_start = false;
+                    self.pending_speed_start = true;
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.confirm_speed_start = false;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.show_command_palette {
+            match code {
+                KeyCode::Esc => self.close_command_palette(),
+                KeyCode::Up => {
+                    self.command_cursor = self.command_cursor.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    self.command_cursor = (self.command_cursor + 1)
+                        .min(self.filtered_actions().len().saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    if let Some(action) = self.selected_action() {
+                        self.close_command_palette();
+                        self.activate_action(action);
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.command_query.pop();
+                    self.command_cursor = 0;
+                }
+                KeyCode::Char(c) => {
+                    self.command_query.push(c);
+                    self.command_cursor = 0;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.show_result_details {
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') => self.show_result_details = false,
+                KeyCode::Char('c') => self.activate_action(Action::CopyIp),
+                KeyCode::Char('e') => self.activate_action(Action::Export),
+                KeyCode::Char('t') if self.scan_complete => {
+                    self.show_result_details = false;
+                    self.activate_action(Action::SpeedTest);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // The help overlay consumes every key, including its toggle and quit
+        // keys, so dismissing it cannot mutate the underlying application.
+        if self.show_help {
+            self.show_help = false;
+            return;
+        }
+
         // Global keys work on every screen.
         match code {
             KeyCode::Char('?') => {
                 self.show_help = !self.show_help;
+                return;
+            }
+            KeyCode::Char('/') => {
+                self.open_command_palette();
                 return;
             }
             KeyCode::Char('q') | KeyCode::Char('Q') => {
@@ -842,10 +1132,22 @@ impl App {
             _ => {}
         }
 
-        if self.show_help {
-            // Any key closes the help overlay.
-            self.show_help = false;
-            return;
+        match code {
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.focus_next(code == KeyCode::BackTab);
+                return;
+            }
+            KeyCode::Char(' ') if self.screen == Screen::Scanning => {
+                self.activate_action(Action::PauseResume);
+                return;
+            }
+            KeyCode::Enter if self.screen == Screen::Scanning => {
+                if self.focus_target == FocusTarget::Table {
+                    self.show_result_details = true;
+                }
+                return;
+            }
+            _ => {}
         }
 
         match self.screen {
@@ -854,6 +1156,41 @@ impl App {
             Screen::SpeedSelect => self.handle_speed_select_key(code),
             Screen::SpeedTesting => {}
             Screen::SpeedResults => self.handle_speed_results_key(code),
+        }
+    }
+
+    fn activate_action(&mut self, action: Action) {
+        match action {
+            Action::Back => self.activate_button(ButtonAction::Back),
+            Action::Next => self.activate_button(ButtonAction::Next),
+            Action::Start => self.activate_button(if self.screen == Screen::SpeedSelect {
+                ButtonAction::SpeedStart
+            } else {
+                ButtonAction::Start
+            }),
+            Action::Quit => self.activate_button(ButtonAction::Quit),
+            Action::Export => self.save(),
+            Action::PauseResume => self.activate_button(ButtonAction::PauseResume),
+            Action::SpeedTest => self.activate_button(ButtonAction::SpeedTest),
+            Action::CopyIp => self.copy_selected_ip(),
+            Action::OpenDetails => self.show_result_details = true,
+            Action::CloseDetails => self.show_result_details = false,
+            Action::OpenHelp => self.show_help = true,
+            Action::OpenCommandPalette => self.open_command_palette(),
+            Action::Confirm => {
+                if self.confirm_quit {
+                    self.should_quit = true;
+                }
+            }
+            Action::Cancel => {
+                self.confirm_quit = false;
+                self.show_result_details = false;
+            }
+            Action::SelectAll => self.activate_button(ButtonAction::SpeedAll),
+            Action::ClearSelection => self.activate_button(ButtonAction::SpeedClear),
+            Action::Download => self.activate_button(ButtonAction::SpeedDirDownload),
+            Action::Upload => self.activate_button(ButtonAction::SpeedDirUpload),
+            Action::Both => self.activate_button(ButtonAction::SpeedDirBoth),
         }
     }
 
@@ -884,6 +1221,81 @@ impl App {
         if self.confirm_quit {
             self.render_quit_confirm(frame, frame.area());
         }
+
+        if self.confirm_speed_start {
+            self.render_speed_confirm(frame, frame.area());
+        }
+
+        if self.show_command_palette {
+            self.render_command_palette(frame, frame.area());
+        }
+    }
+
+    fn render_command_palette(&mut self, frame: &mut Frame, area: Rect) {
+        let popup = centered(area, 72, 70);
+        let inner = widgets::modal(frame, area, popup, " Command palette ");
+        let actions = self.filtered_actions();
+        let visible = inner.height.saturating_sub(3) as usize;
+        self.command_cursor = self.command_cursor.min(actions.len().saturating_sub(1));
+        let start = self
+            .command_cursor
+            .saturating_sub(visible.saturating_sub(1));
+        let list = actions
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+            .map(|(i, action)| {
+                let style = if i == self.command_cursor {
+                    theme::row_selected_style()
+                } else {
+                    ratatui::style::Style::default()
+                };
+                Line::from(vec![
+                    Span::styled(format!(" {:<24}", action.label()), style),
+                    Span::styled(
+                        format!(" {:<6}", action.shortcut()),
+                        theme::highlight_style(),
+                    ),
+                    Span::styled(action.description(), theme::hint_style()),
+                ])
+                .style(style)
+            })
+            .collect::<Vec<_>>();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+        frame.render_widget(
+            Paragraph::new(format!(" /{}", self.command_query)).style(theme::title_style()),
+            chunks[0],
+        );
+        frame.render_widget(Paragraph::new(list), chunks[1]);
+        frame.render_widget(
+            Paragraph::new("↑/↓ navigate • Enter run • Esc close").style(theme::hint_style()),
+            chunks[2],
+        );
+    }
+
+    fn render_speed_confirm(&mut self, frame: &mut Frame, area: Rect) {
+        let popup = centered(area, 58, 32);
+        let inner = widgets::modal(frame, area, popup, " Start bandwidth test? ");
+        let lines = vec![
+            Line::from(Span::styled(
+                format!("{} IPs selected", self.speed_selected.len()),
+                theme::title_style(),
+            )),
+            Line::from("This may transfer significant data."),
+            Line::from("Enter / y to continue • Esc / n to cancel"),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center),
+            inner,
+        );
     }
 
     /// Modal shown when the user tries to quit mid-scan.
@@ -946,20 +1358,10 @@ impl App {
 
     fn handle_scan_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Char('p') | KeyCode::Char(' ') => {
-                let next = !self.paused.load(Ordering::Relaxed);
-                self.paused.store(next, Ordering::Relaxed);
-                if next {
-                    self.toast("Paused");
-                } else {
-                    self.toast("Resumed");
-                }
-            }
-            KeyCode::Char('s') | KeyCode::Char('S') => self.save(),
-            KeyCode::Char('v') | KeyCode::Char('V') if self.scan_complete => {
-                self.open_speed_selection();
-            }
-            KeyCode::Char('c') | KeyCode::Char('C') => self.copy_selected_ip(),
+            KeyCode::Char('p') => self.activate_action(Action::PauseResume),
+            KeyCode::Char('e') => self.activate_action(Action::Export),
+            KeyCode::Char('t') if self.scan_complete => self.activate_action(Action::SpeedTest),
+            KeyCode::Char('c') => self.activate_action(Action::CopyIp),
             KeyCode::Up => {
                 self.result_cursor = self.result_cursor.saturating_sub(1);
                 self.scroll = self.scroll.min(self.result_cursor);
@@ -1016,6 +1418,9 @@ impl App {
         self.speed_direction = SpeedDirection::Both;
         self.speed_results.clear();
         self.speed_complete = false;
+        self.confirm_speed_start = false;
+        self.focus_index = 0;
+        self.focus_target = FocusTarget::List;
         self.screen = Screen::SpeedSelect;
     }
 
@@ -1054,7 +1459,7 @@ impl App {
                 if self.speed_selected.is_empty() {
                     self.toast_warn("Select at least one successful IP");
                 } else {
-                    self.pending_speed_start = true;
+                    self.confirm_speed_start = true;
                 }
             }
             KeyCode::Esc => self.screen = Screen::Scanning,
@@ -1237,6 +1642,9 @@ impl App {
             }
             _ => {}
         }
+        if self.wizard_step == WizardStep::Settings {
+            self.ensure_settings_visible();
+        }
     }
 
     fn activate_button(&mut self, action: ButtonAction) {
@@ -1294,7 +1702,7 @@ impl App {
                 if self.speed_selected.is_empty() {
                     self.toast_warn("Select at least one successful IP");
                 } else {
-                    self.pending_speed_start = true;
+                    self.confirm_speed_start = true;
                 }
             }
             ButtonAction::SpeedBack => self.screen = Screen::Scanning,
@@ -1322,8 +1730,9 @@ impl Drop for RestoreGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{ranked_export_results, App, ProbeResult, Screen};
+    use super::{ranked_export_results, Action, App, FocusTarget, ProbeResult, Screen};
     use crate::config::AppConfig;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::{backend::TestBackend, Terminal};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -1417,5 +1826,48 @@ mod tests {
             app.screen = screen;
             draw(&mut app, 120, 36);
         }
+    }
+
+    #[test]
+    fn focus_cycles_and_tracks_semantic_targets() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(app.focus_target, FocusTarget::List);
+        app.focus_next(false);
+        assert_eq!(app.focus_target, FocusTarget::Button);
+        app.focus_next(true);
+        assert_eq!(app.focus_target, FocusTarget::List);
+    }
+
+    #[test]
+    fn command_palette_filters_and_dispatches_actions() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.open_command_palette();
+        app.command_query = "help".to_string();
+        assert_eq!(app.filtered_actions(), vec![Action::OpenHelp]);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!app.show_command_palette);
+        assert!(app.show_help);
+    }
+
+    #[test]
+    fn compact_dashboard_and_detail_draw_without_panicking() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(10);
+        app.add_result(result("192.0.2.1", 0, 0.04));
+        app.show_result_details = true;
+        draw(&mut app, 80, 24);
+        draw(&mut app, 79, 23);
     }
 }

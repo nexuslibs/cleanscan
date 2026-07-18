@@ -35,8 +35,9 @@ fn wizard_lines(step: WizardStep) -> Vec<Line<'static>> {
     let mut v = vec![
         Line::from(Span::styled(" Wizard navigation", theme::header_style())),
         key("↑ / ↓  or  k / j", "Move cursor through the list"),
-        key("→  or  Enter", "Go to the next step"),
-        key("←  or  Esc", "Go back to the previous step"),
+        key("Tab / Shift+Tab", "Move focus between controls"),
+        key("Enter / Esc", "Activate or go back"),
+        key("/", "Search the command palette"),
         key("?  or  any key", "Toggle / close this help"),
         key("q", "Quit cleanscan"),
         Line::from(""),
@@ -48,10 +49,9 @@ fn wizard_lines(step: WizardStep) -> Vec<Line<'static>> {
                 theme::header_style(),
             )));
             v.push(key("space", "Toggle the highlighted range on/off"));
-            v.push(key("A", "Select all ranges"));
-            v.push(key("N", "Deselect all ranges"));
-            v.push(key("a", "Add a custom CIDR (type + Enter)"));
-            v.push(key("c", "Jump to the settings step"));
+            v.push(key("Space", "Toggle the highlighted range"));
+            v.push(key("Enter", "Edit or activate the focused control"));
+            v.push(key("↑ / ↓", "Move through ranges"));
             v.push(key("Esc", "Cancel custom CIDR entry"));
         }
         WizardStep::Settings => {
@@ -88,9 +88,11 @@ fn scanning_lines() -> Vec<Line<'static>> {
         key("c", "Copy the selected IP"),
         key("PageUp / PageDn", "Scroll by a page"),
         key("Home / End", "Jump to top / bottom"),
-        key("space  or  p", "Pause / resume the scan"),
-        key("s", "Save results to a .tsv file (when done)"),
-        key("v", "Select successful IPs for upload/download speed tests"),
+        key("Tab", "Focus table and action buttons"),
+        key("Enter", "Open full details for the selected IP"),
+        key("p", "Pause / resume the scan"),
+        key("e", "Export results to a .tsv file"),
+        key("t", "Run speed tests on successful IPs"),
         key("Click header", "Sort results by that column"),
         key("Mouse wheel", "Scroll the results table"),
         key("?  or  any key", "Toggle / close this help"),
@@ -111,9 +113,9 @@ fn speed_selection_lines() -> Vec<Line<'static>> {
         )),
         key("↑ / ↓", "Move through successful IPs"),
         key("Space / click", "Toggle the highlighted IP"),
-        key("a / N", "Select all / clear selection"),
-        key("d / u / b", "Direction: download / upload / both"),
-        key("Enter", "Start tests"),
+        key("Tab", "Focus list, options, and actions"),
+        key("Space", "Toggle the highlighted IP"),
+        key("Enter", "Start tests after confirmation"),
         key("Esc", "Return to latency results"),
         key("q", "Quit cleanscan"),
     ]

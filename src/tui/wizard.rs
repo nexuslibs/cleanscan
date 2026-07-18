@@ -604,9 +604,24 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
             field_idx += 1;
         }
     }
-    app.settings_row_map = row_map;
 
-    let para = Paragraph::new(lines).block(block);
+    let visible = inner.height as usize;
+    let cursor_row = row_map
+        .iter()
+        .position(|field| *field == Some(app.cursor))
+        .unwrap_or(0);
+    let max_scroll = lines.len().saturating_sub(visible);
+    if cursor_row < app.settings_scroll {
+        app.settings_scroll = cursor_row;
+    } else if visible > 0 && cursor_row >= app.settings_scroll + visible {
+        app.settings_scroll = cursor_row + 1 - visible;
+    }
+    app.settings_scroll = app.settings_scroll.min(max_scroll);
+    let start = app.settings_scroll.min(lines.len());
+    let end = (start + visible).min(lines.len());
+    app.settings_row_map = row_map[start..end].to_vec();
+
+    let para = Paragraph::new(lines[start..end].to_vec()).block(block);
     frame.render_widget(para, main_layout[0]);
 
     // Right Side Description Panel
@@ -774,20 +789,27 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         _ => ButtonAction::Back,
     };
     let left_label = match app.wizard_step {
-        WizardStep::Ranges => "‹ Quit (q)",
-        _ => "‹ Back (←)",
+        WizardStep::Ranges => "Quit (q)",
+        _ => "Back (Esc)",
     };
-    app.button(frame, chunks[0], left_label, left_action, false);
+    app.button_ex(
+        frame,
+        chunks[0],
+        left_label,
+        left_action,
+        ButtonKind::Secondary,
+        app.focus_index == 1,
+    );
 
     let right_action = match app.wizard_step {
         WizardStep::Review => ButtonAction::Start,
         _ => ButtonAction::Next,
     };
     let right_label = match app.wizard_step {
-        WizardStep::Review => "Start scan ⏎",
-        _ => "Next (→) ›",
+        WizardStep::Review => "Start scan",
+        _ => "Next",
     };
-    let right_focused = app.wizard_step == WizardStep::Review;
+    let right_focused = app.focus_index == 2 || app.wizard_step == WizardStep::Review;
     let right_kind = if right_focused {
         ButtonKind::Primary
     } else {
@@ -809,17 +831,17 @@ fn render_hint(app: &App, frame: &mut Frame, area: Rect) {
             if app.custom_input_mode {
                 "type CIDR • Enter confirm • Esc cancel"
             } else {
-                "↑/↓ move • space toggle • a add • A all • N none • → next • ? help"
+                "Tab focus • Space toggle • Enter next • / commands • ? help"
             }
         }
         WizardStep::Settings => {
             if app.edit_field.is_some() {
                 "type value • ←/→ move • ↑/↓ step • Enter confirm • Esc cancel"
             } else {
-                "j/k move • ↑/↓ adjust numeric • Enter edit • 1/2/3 presets • → next • ? help"
+                "Tab focus • Enter edit/next • ↑/↓ adjust • / commands • ? help"
             }
         }
-        WizardStep::Review => "Enter start • ← back • ? help",
+        WizardStep::Review => "Tab focus • Enter start • Esc back • / commands • ? help",
     };
     widgets::status_bar(frame, area, text, app.visible_message());
 }
@@ -1068,6 +1090,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
         }
         _ => {}
     }
+    app.ensure_settings_visible();
 }
 
 fn handle_review_key(app: &mut App, code: KeyCode) {
@@ -1084,6 +1107,23 @@ fn handle_review_key(app: &mut App, code: KeyCode) {
 }
 
 impl App {
+    /// Keep the selected settings field inside the last rendered viewport.
+    pub fn ensure_settings_visible(&mut self) {
+        let Some(inner) = self.settings_inner else {
+            return;
+        };
+        let visible = inner.height as usize;
+        if visible == 0 {
+            return;
+        }
+        let row = settings_display_row(self.cursor);
+        if row < self.settings_scroll {
+            self.settings_scroll = row;
+        } else if row >= self.settings_scroll + visible {
+            self.settings_scroll = row + 1 - visible;
+        }
+    }
+
     /// Begin editing the setting at `idx` (used by keyboard Enter and mouse click).
     pub fn start_edit(&mut self, idx: usize) {
         if idx < SettingField::ALL.len() {
@@ -1093,6 +1133,20 @@ impl App {
             self.edit_caret = self.edit_buffer.len();
         }
     }
+}
+
+fn settings_display_row(field_idx: usize) -> usize {
+    let mut row = 0;
+    let mut first_field = 0;
+    for (_, count) in SettingField::GROUPS {
+        row += 1;
+        if field_idx < first_field + count {
+            return row + field_idx - first_field;
+        }
+        row += count;
+        first_field += count;
+    }
+    row.saturating_sub(1)
 }
 
 fn previous_char_boundary(s: &str, index: usize) -> usize {

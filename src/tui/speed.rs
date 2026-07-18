@@ -171,38 +171,44 @@ fn render_options_panel(app: &mut App, frame: &mut Frame, area: Rect) {
         app,
         frame,
         dir_cols[0],
-        "Down (d)",
+        "Download",
         ButtonAction::SpeedDirDownload,
-        app.speed_direction == SpeedDirection::Download,
+        app.speed_direction == SpeedDirection::Download || app.focus_index == 1,
     );
     dir_button(
         app,
         frame,
         dir_cols[1],
-        "Up (u)",
+        "Upload",
         ButtonAction::SpeedDirUpload,
-        app.speed_direction == SpeedDirection::Upload,
+        app.speed_direction == SpeedDirection::Upload || app.focus_index == 1,
     );
     dir_button(
         app,
         frame,
         dir_cols[2],
-        "Both (b)",
+        "Both",
         ButtonAction::SpeedDirBoth,
-        app.speed_direction == SpeedDirection::Both,
+        app.speed_direction == SpeedDirection::Both || app.focus_index == 1,
     );
 
     let sel_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[2]);
-    app.button(frame, sel_cols[0], "All (a)", ButtonAction::SpeedAll, false);
+    app.button(
+        frame,
+        sel_cols[0],
+        "Select all",
+        ButtonAction::SpeedAll,
+        app.focus_index == 2,
+    );
     app.button(
         frame,
         sel_cols[1],
-        "Clear (N)",
+        "Clear",
         ButtonAction::SpeedClear,
-        false,
+        app.focus_index == 2,
     );
 
     let act_cols = Layout::default()
@@ -215,14 +221,14 @@ fn render_options_panel(app: &mut App, frame: &mut Frame, area: Rect) {
         "Start ⏎",
         ButtonAction::SpeedStart,
         ButtonKind::Primary,
-        !app.speed_selected.is_empty(),
+        !app.speed_selected.is_empty() || app.focus_index == 3,
     );
     app.button(
         frame,
         act_cols[1],
-        "Back (Esc)",
+        "Back",
         ButtonAction::SpeedBack,
-        false,
+        app.focus_index == 4,
     );
 }
 
@@ -362,10 +368,12 @@ fn format_measurement(value: Option<&crate::speed::SpeedMeasurement>) -> String 
 fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
     let text = match app.screen {
         Screen::SpeedSelect => {
-            "↑/↓ move • Space select • a all • N clear • d/u/b direction • Enter start • Esc back"
+            "Tab focus • Space select • Enter start • / commands • ? help • Esc back"
         }
         Screen::SpeedTesting => "Speed test running • q quit",
-        Screen::SpeedResults => "↑/↓ select • c copy IP • Esc/B back to latency results • q quit",
+        Screen::SpeedResults => {
+            "Tab focus • c copy • Esc back to latency results • / commands • ? help • q quit"
+        }
         _ => "",
     };
     widgets::status_bar(frame, area, text, app.visible_message());

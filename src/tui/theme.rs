@@ -94,7 +94,7 @@ impl Palette {
             accent: Color::Reset,
             title: Color::Reset,
             subtitle: Color::Reset,
-            muted: Color::DarkGray,
+            muted: Color::Reset,
             highlight: Color::Reset,
             success: Color::Reset,
             warn: Color::Reset,

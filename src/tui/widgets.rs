@@ -4,7 +4,7 @@
 
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
@@ -141,7 +141,7 @@ pub fn button_style(kind: ButtonKind, active: bool) -> Style {
     match (kind, active) {
         (ButtonKind::Primary, true) => Style::default()
             .bg(p.accent)
-            .fg(Color::Rgb(0x0d, 0x11, 0x17))
+            .fg(p.row_alt)
             .add_modifier(Modifier::BOLD),
         (ButtonKind::Primary, false) => Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
         (ButtonKind::Secondary, true) => Style::default()

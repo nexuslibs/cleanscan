@@ -103,17 +103,17 @@ on the command line, the scan starts directly with those targets.
 
 | Key            | Action                                  |
 |----------------|-----------------------------------------|
-| `↑` / `↓` (`k`/`j`) | Move the cursor through the CIDR list |
-| `space`        | Toggle selection of the highlighted CIDR |
-| `A`            | Select **all** CIDRs                    |
-| `N`            | Deselect **all** CIDRs                  |
-| `a`            | Add a custom CIDR via the inline text field |
-| `c`            | Open the **settings** screen to tweak scan parameters |
-| `Enter`        | Start the scan with the selected CIDRs  |
-| `q`            | Quit                                    |
+| `Tab` / `Shift+Tab` | Move focus between controls |
+| `↑` / `↓` | Move through the focused list |
+| `Space` | Toggle the focused CIDR |
+| `Enter` | Activate or edit the focused control |
+| `Esc` | Cancel or go back |
+| `/` | Open the command palette |
+| `?` | Open contextual help |
+| `q` | Quit |
 
-While typing a custom CIDR (`a`), `char` appends, `Backspace` deletes,
-`Enter` confirms, and `Esc` cancels.
+While the custom CIDR field is focused, typed characters append, `Backspace`
+deletes, `Enter` confirms, and `Esc` cancels.
 
 **Settings screen**
 
@@ -122,14 +122,14 @@ Navigation mirrors the selection screen:
 
 | Key            | Action                                  |
 |----------------|-----------------------------------------|
-| `j` / `k` | Move the cursor through the parameters |
+| `Tab` / `Shift+Tab` | Move focus between controls |
 | `↑` / `↓` | Increase/decrease the highlighted numeric parameter immediately |
-| `Enter`        | Edit the highlighted parameter          |
+| `Enter`        | Edit or activate the highlighted parameter |
 | `char`         | While editing, append to the value      |
 | `Backspace`    | While editing, delete a character       |
 | `Enter`        | While editing, confirm the new value    |
 | `Esc`          | While editing, cancel; otherwise return to the selection screen |
-| `b`            | Return to the selection screen          |
+| `Esc`          | Return to the selection screen          |
 | `q`            | Quit                                    |
 
 The following parameters are editable, with the same meaning as their CLI
@@ -146,19 +146,19 @@ the TUI and are not edited in this screen.
 | Key       | Action                          |
 |-----------|---------------------------------|
 | `q`       | Quit                            |
-| `p` / `␣` | Pause / resume the scan         |
-| `s`       | Save results to a `.tsv` file (after the scan finishes) |
-| `v`       | Select successful IPs for speed testing (after the scan finishes) |
+| `p`       | Pause / resume the scan         |
+| `e`       | Export results to a `.tsv` file (after the scan finishes) |
+| `t`       | Select successful IPs for speed testing (after the scan finishes) |
+| `Enter`   | Open full details for the selected IP |
 | `↑` / `↓` | Select a result IP |
 | `c`       | Copy the selected IP to the clipboard |
 
 **Speed-test screen**
 
-After latency scanning completes, press `v` to select successful IPs. Press
-`space` to toggle an IP, `A` to select all, `N` to clear the selection, `d` for
-download, `u` for upload, `b` for both, and `Enter` to start. Results report
-throughput in Mbps for each direction. Use `↑` / `↓` to select an IP and `c` to
-copy it; `Esc` or `b` returns to the latency dashboard.
+After latency scanning completes, press `t` to select successful IPs. Use
+`Tab`, arrows, `Space`, and `Enter` to select targets, choose a direction, and
+start the test. Results report throughput in Mbps for each direction. Press
+`c` to copy the selected IP and `Esc` to return to the latency dashboard.
 
 ### CLI options
 

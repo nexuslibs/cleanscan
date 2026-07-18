@@ -28,6 +28,23 @@ const WIDTHS: [Constraint; 9] = [
 
 /// Render the live scanning dashboard.
 pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
+    if area.width < 80 || area.height < 24 {
+        render_terminal_too_small(frame, area);
+        return;
+    }
+
+    if area.width < 100 {
+        render_compact(app, frame, area);
+    } else {
+        render_wide(app, frame, area);
+    }
+
+    if app.show_result_details {
+        render_result_details(app, frame, area);
+    }
+}
+
+fn render_wide(app: &mut App, frame: &mut Frame, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -42,6 +59,188 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
     render_stats_panel(app, frame, chunks[1]);
     render_table(app, frame, chunks[2]);
     render_footer(app, frame, chunks[3]);
+}
+
+fn render_terminal_too_small(frame: &mut Frame, area: Rect) {
+    let block = widgets::panel_block("Terminal size", true);
+    let lines = vec![
+        Line::from(Span::styled(
+            "cleanscan needs at least 80×24",
+            theme::header_style(),
+        )),
+        Line::from("Resize the terminal to continue."),
+        Line::from(Span::styled(
+            format!("Current size: {}×{}", area.width, area.height),
+            theme::hint_style(),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(ratatui::layout::Alignment::Center)
+            .block(block),
+        area,
+    );
+}
+
+fn render_compact(app: &mut App, frame: &mut Frame, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(4),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
+        .split(area);
+    render_header(app, frame, chunks[0]);
+    render_compact_stats(app, frame, chunks[1]);
+    render_compact_table(app, frame, chunks[2]);
+    render_compact_footer(app, frame, chunks[3]);
+}
+
+fn render_compact_stats(app: &App, frame: &mut Frame, area: Rect) {
+    let total = app.total_targets;
+    let done = app.results.len();
+    let success = app.results.iter().map(|r| r.ok).sum::<usize>();
+    let failures = app.results.iter().map(|r| r.fail).sum::<usize>();
+    let ratio = if total > 0 {
+        done as f64 / total as f64
+    } else {
+        0.0
+    };
+    let block = widgets::panel_block("Scan status", false);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(42),
+            Constraint::Percentage(29),
+            Constraint::Percentage(29),
+        ])
+        .split(inner);
+    frame.render_widget(
+        ratatui::widgets::LineGauge::default()
+            .ratio(ratio.clamp(0.0, 1.0))
+            .filled_style(theme::status_style("SCANNING"))
+            .unfilled_style(theme::hint_style())
+            .label(format!("{done}/{total}")),
+        cols[0],
+    );
+    frame.render_widget(
+        Paragraph::new(format!("{} ok", success)).style(theme::good_style()),
+        cols[1],
+    );
+    frame.render_widget(
+        Paragraph::new(format!("{} fail", failures)).style(if failures > 0 {
+            theme::bad_style()
+        } else {
+            theme::hint_style()
+        }),
+        cols[2],
+    );
+}
+
+fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
+    const COMPACT_WIDTHS: [Constraint; 6] = [
+        Constraint::Length(5),
+        Constraint::Min(15),
+        Constraint::Length(12),
+        Constraint::Length(12),
+        Constraint::Length(12),
+        Constraint::Length(10),
+    ];
+    let block = widgets::panel_block("Results — Enter details", true);
+    let inner = block.inner(area);
+    app.table_inner = Some(inner);
+    let visible = inner.height.saturating_sub(1) as usize;
+    let display_len = app.sorted_results().len().min(app.config.top);
+    let max_start = display_len.saturating_sub(visible);
+    app.result_cursor = app.result_cursor.min(display_len.saturating_sub(1));
+    app.scroll = app.scroll.min(max_start);
+    app.scroll = app
+        .scroll
+        .max(app.result_cursor.saturating_sub(visible.saturating_sub(1)))
+        .min(max_start);
+    let sorted = app.sorted_results();
+    let page = sorted.iter().skip(app.scroll).take(visible);
+    let rows = page.enumerate().map(|(i, r)| {
+        let index = app.scroll + i;
+        let selected = index == app.result_cursor;
+        let reliability = format!("{}/{}", r.ok, r.ok + r.fail);
+        let status = if r.fail == 0 { "READY" } else { "DEGRADED" };
+        Row::new(vec![
+            Cell::from((index + 1).to_string()),
+            Cell::from(r.ip.clone()),
+            Cell::from(reliability),
+            Cell::from(fmt_ms(r.avg)),
+            Cell::from(fmt_ms(r.p95)),
+            Cell::from(status).style(if r.fail == 0 {
+                theme::good_style()
+            } else {
+                theme::warn_style()
+            }),
+        ])
+        .style(if selected {
+            theme::row_selected_style()
+        } else if index % 2 == 1 {
+            theme::row_alt_style()
+        } else {
+            Style::default()
+        })
+    });
+    let table = Table::new(rows, COMPACT_WIDTHS)
+        .header(
+            Row::new(vec!["#", "IP", "Reliability", "Avg", "P95", "Status"])
+                .style(theme::title_style()),
+        )
+        .block(block);
+    frame.render_widget(table, area);
+}
+
+fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
+    let hints = if app.scan_complete {
+        "Tab focus • Enter details • p pause • e export • t speed test • c copy • / commands • ? help • q quit"
+    } else {
+        "Tab focus • Enter details • p pause • c copy • / commands • ? help • q quit"
+    };
+    widgets::status_bar(frame, area, hints, app.visible_message());
+}
+
+fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
+    let Some(result) = app
+        .sorted_results()
+        .into_iter()
+        .take(app.config.top)
+        .nth(app.result_cursor)
+    else {
+        return;
+    };
+    let popup = crate::tui::centered(area, 64, 62);
+    let inner = widgets::modal(frame, area, popup, " Selected edge details ");
+    let lines = vec![
+        Line::from(Span::styled(result.ip.clone(), theme::header_style())),
+        Line::from(""),
+        Line::from(format!(
+            "Reliability : {}/{} successful",
+            result.ok,
+            result.ok + result.fail
+        )),
+        Line::from(format!("Average     : {}", fmt_ms(result.avg))),
+        Line::from(format!("P50         : {}", fmt_ms(result.p50))),
+        Line::from(format!("P90         : {}", fmt_ms(result.p90))),
+        Line::from(format!("P95         : {}", fmt_ms(result.p95))),
+        Line::from(format!("Max         : {}", fmt_ms(result.max))),
+        Line::from(""),
+        Line::from(Span::styled(
+            "c copy • e export • t speed test • Esc close",
+            theme::hint_style(),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(widgets::panel_block("Latency profile", true)),
+        inner,
+    );
 }
 
 fn render_header(app: &App, frame: &mut Frame, area: Rect) {
@@ -338,10 +537,10 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
     let sorted = app.sorted_results();
     let display: Vec<&ProbeResult> = sorted.iter().take(display_len).copied().collect();
 
-    // The natural #1 (fastest, zero-fail) edge, starred wherever it appears.
+    // The fastest successful edge by average latency, starred wherever it appears.
     let best_ip: Option<String> = {
         let mut v: Vec<&ProbeResult> = app.results.iter().filter(|r| r.ok > 0).collect();
-        v.sort_by(|a, b| App::natural_cmp(a, b));
+        v.sort_by(|a, b| a.avg.partial_cmp(&b.avg).unwrap());
         v.first().map(|r| r.ip.clone())
     };
 
@@ -383,7 +582,7 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
             let rank = start + i + 1;
             let is_selected = start + i == app.result_cursor;
 
-            // Star the fastest edge (natural #1) wherever it lands in the sort.
+            // Star the fastest average-latency edge wherever it lands in the sort.
             let is_first = best_ip.as_deref() == Some(r.ip.as_str());
             let (ip_text, rank_text) = if is_first {
                 (format!("★ {}", r.ip), format!(" {rank}"))
@@ -535,7 +734,7 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         ButtonAction::PauseResume
     };
     let left_label = if app.scan_complete {
-        "Save (s)"
+        "Export (e)"
     } else if app.paused.load(std::sync::atomic::Ordering::Relaxed) {
         "Resume (p)"
     } else {
@@ -546,24 +745,38 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     } else {
         ButtonKind::Secondary
     };
-    app.button_ex(frame, chunks[0], left_label, left_action, left_kind, false);
+    app.button_ex(
+        frame,
+        chunks[0],
+        left_label,
+        left_action,
+        left_kind,
+        app.focus_index == 1,
+    );
 
     if app.scan_complete {
         app.button_ex(
             frame,
             chunks[1],
-            "Speed test (v)",
+            "Speed test (t)",
             ButtonAction::SpeedTest,
             ButtonKind::Primary,
-            false,
+            app.focus_index == 2,
         );
     }
-    app.button(frame, chunks[3], "Quit (q)", ButtonAction::Quit, false);
+    app.button_ex(
+        frame,
+        chunks[3],
+        "Quit (q)",
+        ButtonAction::Quit,
+        ButtonKind::Secondary,
+        app.focus_index == 4,
+    );
 
     let hints = if app.scan_complete {
-        "↑/↓ select • c copy IP • s save • v speed test • ? help • q quit"
+        "Tab focus • Enter details • c copy • e export • t speed test • / commands • ? help • q quit"
     } else {
-        "↑/↓ select • c copy IP • space pause • ? help • q quit"
+        "Tab focus • Enter details • p pause • c copy • / commands • ? help • q quit"
     };
     widgets::status_bar(frame, chunks[2], hints, app.visible_message());
 }
