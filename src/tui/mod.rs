@@ -235,7 +235,8 @@ pub struct App {
     pub sort_col: usize,
     pub sort_asc: bool,
     pub show_failures: bool,
-    pub result_column_visibility: [bool; 10],
+    pub colo_filter: Option<String>,
+    pub result_column_visibility: [bool; 11],
     pub column_picker_cursor: usize,
     pub start_time: Instant,
     /// Help overlay visibility.
@@ -457,7 +458,8 @@ impl App {
             sort_col: 0,
             sort_asc: true,
             show_failures: false,
-            result_column_visibility: [true; 10],
+            colo_filter: None,
+            result_column_visibility: [true; 11],
             column_picker_cursor: 0,
             start_time: Instant::now(),
             show_help: false,
@@ -798,6 +800,13 @@ impl App {
             .results
             .iter()
             .filter(|r| self.show_failures || r.ok > 0)
+            .filter(|r| match &self.colo_filter {
+                Some(want) => r
+                    .colo
+                    .as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(want)),
+                None => true,
+            })
             .collect();
         if self.sort_col == 0 {
             v.sort_by(|a, b| {
@@ -835,10 +844,11 @@ impl App {
                     .p95
                     .partial_cmp(&b.p95)
                     .unwrap_or(std::cmp::Ordering::Equal),
-                8 => a
+                9 => a
                     .max
                     .partial_cmp(&b.max)
                     .unwrap_or(std::cmp::Ordering::Equal),
+                10 => a.colo.cmp(&b.colo),
                 _ => std::cmp::Ordering::Equal,
             };
             if self.sort_asc {
@@ -1178,6 +1188,7 @@ pub fn run_tui(
                         speed_payload_bytes: app.config.speed_payload_bytes,
                         speed_repetitions: app.config.speed_repetitions,
                         speed_timeout_ms: app.config.speed_timeout_ms,
+                        warmup: app.config.warmup,
                     });
                     app.set_scan_targets(targets.clone());
                     *scanner = Some(spawn_scanner(targets, scan_config));
@@ -1386,6 +1397,21 @@ impl App {
                         .min(self.filtered_actions().len().saturating_sub(1));
                 }
                 KeyCode::Enter => {
+                    let query = self.command_query.trim();
+                    if let Some(code) = query.strip_prefix("colo:") {
+                        let code = code.trim();
+                        self.colo_filter = if code.is_empty() {
+                            None
+                        } else {
+                            Some(code.to_ascii_uppercase())
+                        };
+                        self.close_command_palette();
+                        match &self.colo_filter {
+                            Some(c) => self.toast_info(format!("Filtering by colo {c}")),
+                            None => self.toast_info("Colo filter cleared"),
+                        }
+                        return;
+                    }
                     if let Some(action) = self.selected_action() {
                         self.close_command_palette();
                         self.activate_action(action);
@@ -2394,6 +2420,8 @@ mod tests {
             failures: Vec::new(),
             success_rate: 1.0 / (1 + fail) as f64,
             score: 1.0 / p95.max(0.001),
+            colo: None,
+            connect_ms: None,
         }
     }
 

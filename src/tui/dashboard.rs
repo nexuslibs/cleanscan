@@ -15,10 +15,10 @@ use crate::scanner::{result_confidence, result_status, ProbeResult};
 use crate::tui::theme;
 use crate::tui::{widgets, App, ButtonAction, ButtonKind};
 
-pub const RESULT_COLUMNS: [&str; 10] = [
-    "#", "IP", "Proto", "OK", "Fail", "Avg", "P50", "P90", "P95", "Max",
+pub const RESULT_COLUMNS: [&str; 11] = [
+    "#", "IP", "Proto", "OK", "Fail", "Avg", "P50", "P90", "P95", "Max", "Colo",
 ];
-const WIDTHS: [Constraint; 10] = [
+const WIDTHS: [Constraint; 11] = [
     Constraint::Length(5),
     Constraint::Length(25),
     Constraint::Length(8),
@@ -29,6 +29,7 @@ const WIDTHS: [Constraint; 10] = [
     Constraint::Length(10),
     Constraint::Length(10),
     Constraint::Length(10),
+    Constraint::Length(7),
 ];
 
 /// Render the live scanning dashboard.
@@ -147,9 +148,10 @@ fn render_compact_stats(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
-    const COMPACT_WIDTHS: [Constraint; 6] = [
+    const COMPACT_WIDTHS: [Constraint; 7] = [
         Constraint::Length(5),
         Constraint::Min(15),
+        Constraint::Length(7),
         Constraint::Length(12),
         Constraint::Length(12),
         Constraint::Length(12),
@@ -178,6 +180,7 @@ fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
         Row::new(vec![
             Cell::from((index + 1).to_string()),
             Cell::from(r.ip.clone()),
+            Cell::from(r.colo.clone().unwrap_or_else(|| "—".to_string())),
             Cell::from(reliability),
             Cell::from(fmt_ms(r.avg)),
             Cell::from(fmt_ms(r.p95)),
@@ -197,8 +200,16 @@ fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
     });
     let table = Table::new(rows, COMPACT_WIDTHS)
         .header(
-            Row::new(vec!["#", "IP", "Reliability", "Avg", "P95", "Status"])
-                .style(theme::title_style()),
+            Row::new(vec![
+                "#",
+                "IP",
+                "Colo",
+                "Reliability",
+                "Avg",
+                "P95",
+                "Status",
+            ])
+            .style(theme::title_style()),
         )
         .block(block);
     frame.render_widget(table, area);
@@ -282,6 +293,10 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
                 Line::from(format!("Status      : {}", result_status(result))),
                 Line::from(format!("Protocol    : {}", result.protocol)),
                 Line::from(format!(
+                    "Colo        : {}",
+                    result.colo.clone().unwrap_or_else(|| "unknown".to_string())
+                )),
+                Line::from(format!(
                     "Success     : {}/{} ({:.1}%)",
                     result.ok,
                     result.ok + result.fail,
@@ -290,6 +305,13 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
                 Line::from(format!("Average     : {}", fmt_ms(result.avg))),
                 Line::from(format!("P95         : {}", fmt_ms(result.p95))),
                 Line::from(format!("Max         : {}", fmt_ms(result.max))),
+                Line::from(format!(
+                    "Connect     : {}",
+                    result
+                        .connect_ms
+                        .map(|ms| format!("{:.1}ms", ms))
+                        .unwrap_or_else(|| "n/a".to_string())
+                )),
                 Line::from(format!("Confidence  : {}", result_confidence(result))),
             ];
             render_detail_text(frame, chunks[2], lines);
@@ -963,6 +985,7 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
                 } else {
                     theme::latency_style(r.max * 1000.0)
                 }),
+                Cell::from(r.colo.clone().unwrap_or_else(|| "—".to_string())).style(base_style),
             ];
             Row::new(
                 cells

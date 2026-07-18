@@ -84,6 +84,14 @@ pub struct Args {
     /// Exit with an error when no target meets the configured thresholds
     #[arg(long)]
     pub fail_if_no_healthy_target: bool,
+
+    /// Only report IPs in the given Cloudflare datacenter (e.g. FRA)
+    #[arg(long)]
+    pub colo: Option<String>,
+
+    /// Skip the connection-establishment warmup probe (measure raw RTT)
+    #[arg(long)]
+    pub no_warmup: bool,
 }
 
 fn main() -> Result<()> {
@@ -116,6 +124,9 @@ fn main() -> Result<()> {
     }
     if let Some(seed) = args.seed {
         config.seed = seed;
+    }
+    if args.no_warmup {
+        config.warmup = false;
     }
 
     normalize_config(&mut config);
@@ -157,6 +168,7 @@ fn main() -> Result<()> {
             args.max_p95_ms,
             args.fail_if_no_healthy_target,
             args.seed,
+            args.colo,
         )
     } else {
         tui::run_tui(config, args.cidr, args.ips, args.seed)
@@ -187,6 +199,7 @@ fn cli_mode(
     max_p95_ms: Option<f64>,
     fail_if_no_healthy_target: bool,
     seed: Option<u64>,
+    colo: Option<String>,
 ) -> Result<()> {
     let targets = if let Some(path) = targets_file {
         scanner::load_ip_manifest(&path)?
@@ -216,6 +229,15 @@ fn cli_mode(
     // inspect their categorized diagnostics and distinguish them from targets
     // that were never sampled.
     let mut results: Vec<scanner::ProbeResult> = rx.iter().collect();
+
+    if let Some(colo) = &colo {
+        let want = colo.to_ascii_uppercase();
+        results.retain(|r| {
+            r.colo
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&want))
+        });
+    }
 
     results.sort_by(|a, b| {
         a.fail
@@ -256,7 +278,7 @@ fn cli_mode(
             .collect::<std::result::Result<Vec<_>, _>>()?
             .join("\n"),
         _ => {
-            let mut text = String::from("rank\tip\tprotocol\tok\tfail\tsuccess_rate\tconfidence\tavg\tp50\tp90\tp95\tmax\tsamples\tfailures\n");
+            let mut text = String::from("rank\tip\tcolo\tprotocol\tok\tfail\tsuccess_rate\tconfidence\tavg\tp50\tp90\tp95\tmax\tconnect_ms\tsamples\tfailures\n");
             for (i, r) in rows.iter().enumerate() {
                 let samples = r
                     .samples
@@ -266,9 +288,10 @@ fn cli_mode(
                     .join(",");
 
                 text.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\n",
                     i + 1,
                     r.ip,
+                    r.colo.clone().unwrap_or_default(),
                     r.protocol,
                     r.ok,
                     r.fail,
@@ -279,6 +302,7 @@ fn cli_mode(
                     r.p90,
                     r.p95,
                     r.max,
+                    r.connect_ms.map(|ms| format!("{:.1}", ms)).unwrap_or_default(),
                     samples,
                     r.failures.join(",")
                 ));
