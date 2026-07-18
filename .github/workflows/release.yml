@@ -164,5 +164,6 @@ jobs:
       - name: Publish the fully built release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
-        run: gh release edit "$TAG_NAME" --draft=false --latest
+        run: gh release edit "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
