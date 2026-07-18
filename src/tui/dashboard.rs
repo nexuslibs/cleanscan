@@ -9,7 +9,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::scanner::ProbeResult;
+use crate::scanner::{result_confidence, result_status, ProbeResult};
 use crate::tui::theme;
 use crate::tui::{widgets, App, ButtonAction, ButtonKind};
 
@@ -209,6 +209,9 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
             ("↵", "details"),
             ("e", "export"),
             ("t", "speed test"),
+            ("f", "show failures"),
+            ("r", "rerun targets"),
+            ("n", "new sample"),
             ("c", "copy"),
             ("/", "commands"),
             ("?", "help"),
@@ -239,27 +242,82 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
     };
     let popup = crate::tui::centered(area, 64, 62);
     let inner = widgets::modal(frame, area, popup, " Selected edge details ");
-    let lines = vec![
+    let tabs = ["Overview", "Diagnostics", "Distribution", "Speed"];
+    let mut lines = vec![
         Line::from(Span::styled(result.ip.clone(), theme::header_style())),
-        Line::from(Span::styled("Latency profile", theme::subtitle_style())),
-        Line::from(""),
-        Line::from(format!(
-            "Reliability : {}/{} successful",
-            result.ok,
-            result.ok + result.fail
+        Line::from(Span::styled(
+            tabs.iter()
+                .enumerate()
+                .map(|(index, label)| {
+                    if index == app.detail_tab {
+                        format!("[{}]", label)
+                    } else {
+                        format!(" {} ", label)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            theme::highlight_style(),
         )),
-        Line::from(format!("Protocol    : {}", result.protocol)),
-        Line::from(format!("Average     : {}", fmt_ms(result.avg))),
-        Line::from(format!("P50         : {}", fmt_ms(result.p50))),
-        Line::from(format!("P90         : {}", fmt_ms(result.p90))),
-        Line::from(format!("P95         : {}", fmt_ms(result.p95))),
-        Line::from(format!("Max         : {}", fmt_ms(result.max))),
+        Line::from(""),
+    ];
+    match app.detail_tab {
+        0 => lines.extend([
+            Line::from(format!("Status      : {}", result_status(result))),
+            Line::from(format!("Protocol    : {}", result.protocol)),
+            Line::from(format!(
+                "Success     : {}/{} ({:.1}%)",
+                result.ok,
+                result.ok + result.fail,
+                result.success_rate * 100.0
+            )),
+            Line::from(format!("Average     : {}", fmt_ms(result.avg))),
+            Line::from(format!("P95         : {}", fmt_ms(result.p95))),
+            Line::from(format!("Max         : {}", fmt_ms(result.max))),
+            Line::from(format!("Confidence  : {}", result_confidence(result))),
+        ]),
+        1 => {
+            lines.push(Line::from(Span::styled(
+                "Failure breakdown",
+                theme::subtitle_style(),
+            )));
+            if result.failures.is_empty() {
+                lines.push(Line::from("  No failed probes"));
+            } else {
+                let mut failures = std::collections::BTreeMap::<&str, usize>::new();
+                for failure in &result.failures {
+                    *failures.entry(failure.as_str()).or_default() += 1;
+                }
+                for (reason, count) in failures {
+                    lines.push(Line::from(format!("  {reason:<24} {count}")));
+                }
+            }
+        }
+        2 => lines.extend([
+            Line::from(Span::styled(
+                "Latency distribution",
+                theme::subtitle_style(),
+            )),
+            Line::from(format!(
+                "Min         : {}",
+                fmt_ms(result.samples.first().copied().unwrap_or(0.0))
+            )),
+            Line::from(format!("P50         : {}", fmt_ms(result.p50))),
+            Line::from(format!("P90         : {}", fmt_ms(result.p90))),
+            Line::from(format!("P95         : {}", fmt_ms(result.p95))),
+            Line::from(format!("Samples     : {}", result.samples.len())),
+        ]),
+        _ => lines.push(Line::from(
+            "Run a speed test to populate throughput details.",
+        )),
+    }
+    lines.extend([
         Line::from(""),
         Line::from(Span::styled(
             "c copy • e export • t speed test • Esc close",
             theme::hint_style(),
         )),
-    ];
+    ]);
     // The modal already draws a titled, bordered frame; render the body straight
     // into its inner rect so there is a single clean border (no nested panel).
     frame.render_widget(Paragraph::new(lines), inner);
@@ -301,6 +359,10 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
+    if app.scan_complete {
+        render_decision_panel(app, frame, area);
+        return;
+    }
     let col_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -516,6 +578,69 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
         .max((total_ok as u64).max(1))
         .label_style(theme::hint_style());
     frame.render_widget(chart, col_chunks[2]);
+}
+
+fn render_decision_panel(app: &App, frame: &mut Frame, area: Rect) {
+    let ready = app
+        .results
+        .iter()
+        .filter(|r| result_status(r) == "READY")
+        .count();
+    let degraded = app
+        .results
+        .iter()
+        .filter(|r| result_status(r) == "DEGRADED")
+        .count();
+    let failed = app
+        .results
+        .iter()
+        .filter(|r| result_status(r) == "FAILED")
+        .count();
+    let total: usize = app.results.iter().map(|r| r.ok + r.fail).sum();
+    let ok: usize = app.results.iter().map(|r| r.ok).sum();
+    let rate = if total > 0 {
+        ok as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    };
+    let ranked = app.sorted_results();
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!("READY {ready}  "), theme::good_style()),
+        Span::styled(format!("DEGRADED {degraded}  "), theme::warn_style()),
+        Span::styled(format!("FAILED {failed}  "), theme::bad_style()),
+        Span::raw(format!("{rate:.1}% probe success")),
+    ])];
+    if let Some(result) = ranked.first() {
+        lines.push(Line::from(format!(
+            "Recommended: {} • {} • p95 {} • confidence {}",
+            result.ip,
+            result_status(result),
+            fmt_ms(result.p95),
+            result_confidence(result)
+        )));
+        let backups = ranked
+            .iter()
+            .skip(1)
+            .take(2)
+            .map(|r| r.ip.as_str())
+            .collect::<Vec<_>>();
+        if !backups.is_empty() {
+            lines.push(Line::from(format!("Backups: {}", backups.join(" • "))));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "No successful targets — press f to inspect failures",
+            theme::warn_style(),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "Ranking: reliability first, then p95 latency • f: show failures",
+        theme::hint_style(),
+    )));
+    frame.render_widget(
+        Paragraph::new(lines).block(widgets::panel_block("Scan result — decision view", false)),
+        area,
+    );
 }
 
 fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -819,6 +944,9 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
             ("c", "copy"),
             ("e", "export"),
             ("t", "speed test"),
+            ("f", "show failures"),
+            ("r", "rerun targets"),
+            ("n", "new sample"),
             ("/", "commands"),
             ("?", "help"),
             ("q", "quit"),

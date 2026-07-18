@@ -158,6 +158,10 @@ the TUI and are not edited in this screen.
 | `Enter`   | Open full details for the selected IP |
 | `↑` / `↓` | Select a result IP |
 | `c`       | Copy the selected IP to the clipboard |
+| `f`       | Include failed targets for diagnosis |
+| `r`       | Re-run the identical sampled target set |
+| `n`       | Generate a new sample with the same settings |
+| `m`       | Export runs for comparison |
 | `/`       | Open the command palette |
 | `?`       | Open contextual help (close with `?`, `Esc`, or `q`) |
 
@@ -196,6 +200,13 @@ latency dashboard.
 | `--timeout-ms`         | `2500`           | Request timeout (ms)                             |
 | `--connect-timeout-ms` | `1000`           | Connect timeout (ms)                             |
 | `--top`                | `50`             | Number of top results to display                 |
+| `--seed`               | random           | Reproducible CIDR sampling seed                 |
+| `--targets-file`       | —                | Exact target list for a reproducible run        |
+| `--format`             | `tsv`            | CLI output format: `tsv`, `json`, or `ndjson`   |
+| `--output`             | stdout           | Write CLI output to a file                     |
+| `--min-success-rate`   | —                | Minimum per-target success rate threshold       |
+| `--max-p95-ms`         | —                | Maximum per-target p95 latency threshold        |
+| `--fail-if-no-healthy-target` | off         | Fail if no target meets thresholds              |
 
 ## Output
 
@@ -208,6 +219,15 @@ used as a deterministic tie-breaker. CLI results are ranked by failure count
 successful probe samples in the `samples` column. Only the top `N` rows are
 printed, where `N` is controlled by `--top`.
 
+Completed scans show a decision summary with READY, DEGRADED, and FAILED
+counts, a recommended target, backups, success rate, p95 latency, and
+confidence. The selected-IP details modal supports `1`–`4` / `Tab` tabs for
+overview, failure diagnostics, latency distribution, and speed context.
+
+The Review screen shows the random seed and exact deduplicated target count.
+Press `s` for a new sample or `c` to save the exact targets to
+`cleanscan_targets_<seed>.txt`.
+
 The TUI displays the same latency statistics. Its save action writes the top
 successful results to a timestamped
 `cleanscan_<timestamp>.tsv` file in the current directory.
@@ -215,7 +235,9 @@ successful results to a timestamped
 CIDR ranges are sampled randomly, so overlapping samples may produce fewer
 unique targets than `sample-per-cidr` suggests. Each probe is an HTTPS request
 to the configured host and path, using the candidate IP for the connection
-while retaining the hostname for TLS SNI and the Host header.
+while retaining the hostname for TLS SNI and the Host header. Results are
+ranked by success rate first, then p95 and average latency; failures include
+categorized diagnostics in the details view and machine-readable output.
 
 Speed tests use the same direct-IP connection behavior. The default endpoints
 are `/speed-test/100mb.bin` for downloads and `/speed-test/upload` for uploads;

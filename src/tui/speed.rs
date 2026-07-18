@@ -472,8 +472,10 @@ fn format_measurement(value: Option<&crate::speed::SpeedMeasurement>) -> String 
     value
         .map(|measurement| {
             format!(
-                "{:.2} Mbps",
-                measurement.bytes_per_second * 8.0 / 1_000_000.0
+                "{:.2} Mbps (p10 {:.2} / p90 {:.2})",
+                measurement.median_bytes_per_second * 8.0 / 1_000_000.0,
+                measurement.p10_bytes_per_second * 8.0 / 1_000_000.0,
+                measurement.p90_bytes_per_second * 8.0 / 1_000_000.0
             )
         })
         .unwrap_or_else(|| "—".to_string())

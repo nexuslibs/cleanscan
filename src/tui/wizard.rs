@@ -168,7 +168,7 @@ impl SettingField {
             .clamp(1, self.max_value())
     }
 
-    /// Adjust this numeric field directly in the application config.
+    #[allow(dead_code)]
     fn nudge_config(&self, args: &mut AppConfig, direction: i64) {
         let value = self.value_string(args).parse::<i64>().unwrap_or(1);
         let value = self.nudged_value(value, direction);
@@ -644,16 +644,23 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     frame.render_widget(desc_widget, main_layout[1]);
 }
 
-fn render_review(app: &App, frame: &mut Frame, area: Rect) {
-    let selected: Vec<&str> = app
+fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
+    let selected: Vec<String> = app
         .cidr_candidates
         .iter()
         .filter(|e| e.selected)
-        .map(|e| e.cidr.as_str())
+        .map(|e| e.cidr.clone())
         .collect();
 
     let selected_count = selected.len();
-    let total_ips = selected_count.saturating_mul(app.config.sample_per_cidr);
+    if app.preview_targets.is_empty() && selected_count > 0 {
+        app.regenerate_preview();
+    }
+    let total_ips = if app.preview_targets.is_empty() {
+        selected_count.saturating_mul(app.config.sample_per_cidr)
+    } else {
+        app.preview_targets.len()
+    };
     let total_probes = total_ips.saturating_mul(app.config.probes);
 
     // Ideal scan duration estimate
@@ -749,6 +756,25 @@ fn render_review(app: &App, frame: &mut Frame, area: Rect) {
             Span::styled("Est Duration: ", theme::title_style()),
             Span::raw(format!("~{}", est_duration_str)),
         ]),
+        Line::from(vec![
+            Span::styled("Seed        : ", theme::title_style()),
+            Span::raw(app.scan_seed.to_string()),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            if app.config.concurrency > 500 {
+                "Warning: very high concurrency may trigger rate limits"
+            } else if total_ips > 10_000 {
+                "Warning: large target set; this scan may take significant time"
+            } else {
+                "Ready: sampled targets are stable for this review"
+            },
+            if app.config.concurrency > 500 || total_ips > 10_000 {
+                theme::warn_style()
+            } else {
+                theme::good_style()
+            },
+        )),
     ];
 
     let block_left = widgets::panel_block("Target configuration", false);
@@ -848,6 +874,8 @@ fn render_hint(app: &App, frame: &mut Frame, area: Rect) {
         WizardStep::Review => &[
             ("Tab", "focus"),
             ("↵", "start"),
+            ("s", "new sample"),
+            ("c", "save targets"),
             ("Esc", "back"),
             ("/", "commands"),
             ("?", "help"),
@@ -895,6 +923,7 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
                             app.cursor = app.cidr_candidates.len() - 1;
                             app.toast_success(format!("Added {s}"));
                         }
+                        app.invalidate_preview();
                         app.input_buffer.clear();
                         app.edit_caret = 0;
                         app.custom_input_mode = false;
@@ -947,6 +976,7 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
         KeyCode::Char(' ') => {
             if let Some(e) = app.cidr_candidates.get_mut(app.cursor) {
                 e.selected = !e.selected;
+                app.invalidate_preview();
                 app.save_config();
             }
         }
@@ -959,12 +989,14 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
             for e in app.cidr_candidates.iter_mut() {
                 e.selected = true;
             }
+            app.invalidate_preview();
             app.save_config();
         }
         KeyCode::Char('N') | KeyCode::Char('n') | KeyCode::Char('d') | KeyCode::Char('D') => {
             for e in app.cidr_candidates.iter_mut() {
                 e.selected = false;
             }
+            app.invalidate_preview();
             app.save_config();
         }
         KeyCode::Char('c') => {
@@ -1078,6 +1110,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             app.config.timeout_ms = 2500;
             app.config.connect_timeout_ms = 1000;
             app.config.top = 50;
+            app.invalidate_preview();
             app.toast_success("Preset Applied: Default");
             app.save_config();
         }
@@ -1088,6 +1121,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             app.config.timeout_ms = 1500;
             app.config.connect_timeout_ms = 500;
             app.config.top = 25;
+            app.invalidate_preview();
             app.toast_success("Preset Applied: Fast Scan");
             app.save_config();
         }
@@ -1098,6 +1132,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             app.config.timeout_ms = 3500;
             app.config.connect_timeout_ms = 1500;
             app.config.top = 100;
+            app.invalidate_preview();
             app.toast_success("Preset Applied: Thorough Scan");
             app.save_config();
         }
@@ -1108,6 +1143,8 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
 
 fn handle_review_key(app: &mut App, code: KeyCode) {
     match code {
+        KeyCode::Char('s') => app.regenerate_preview(),
+        KeyCode::Char('c') => app.save_target_manifest(),
         KeyCode::Enter => match app.focus_index {
             1 => {
                 app.wizard_step = WizardStep::Settings;
@@ -1139,6 +1176,7 @@ impl App {
                 self.edit_field = None;
                 self.edit_buffer.clear();
                 self.edit_caret = 0;
+                self.invalidate_preview();
                 self.save_config();
                 true
             }

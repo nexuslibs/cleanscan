@@ -11,7 +11,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
 use ipnet::IpNet;
-use rand::Rng;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use reqwest::Client;
 use tokio::sync::Semaphore;
 
@@ -38,7 +38,7 @@ pub const DEFAULT_CLOUDFLARE_CIDRS: &[&str] = &[
     "198.41.192.0/23",
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ProbeResult {
     pub ip: String,
     pub protocol: String,
@@ -50,6 +50,28 @@ pub struct ProbeResult {
     pub p95: f64,
     pub max: f64,
     pub samples: Vec<f64>,
+    pub failures: Vec<String>,
+    pub success_rate: f64,
+    pub score: f64,
+}
+
+pub fn result_status(result: &ProbeResult) -> &'static str {
+    if result.ok == 0 {
+        "FAILED"
+    } else if result.success_rate >= 0.95 {
+        "READY"
+    } else {
+        "DEGRADED"
+    }
+}
+
+pub fn result_confidence(result: &ProbeResult) -> &'static str {
+    match result.ok + result.fail {
+        0..=2 => "UNKNOWN",
+        3..=7 => "LOW",
+        8..=19 => "MEDIUM",
+        _ => "HIGH",
+    }
 }
 
 fn percentile(sorted: &[f64], pct: f64) -> f64 {
@@ -60,9 +82,7 @@ fn percentile(sorted: &[f64], pct: f64) -> f64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
-fn random_ip_from_net(net: IpNet) -> Option<IpAddr> {
-    let mut rng = rand::thread_rng();
-
+fn random_ip_from_net(net: IpNet, rng: &mut impl Rng) -> Option<IpAddr> {
     match net {
         IpNet::V4(v4) => {
             let network = u32::from(v4.network());
@@ -110,7 +130,12 @@ fn random_ip_from_net(net: IpNet) -> Option<IpAddr> {
     }
 }
 
-fn add_ip_or_cidr(s: &str, out: &mut BTreeSet<String>, sample_per_cidr: usize) -> Result<()> {
+fn add_ip_or_cidr(
+    s: &str,
+    out: &mut BTreeSet<String>,
+    sample_per_cidr: usize,
+    rng: &mut impl Rng,
+) -> Result<()> {
     let s = s.trim();
 
     if s.is_empty() || s.starts_with('#') {
@@ -125,7 +150,7 @@ fn add_ip_or_cidr(s: &str, out: &mut BTreeSet<String>, sample_per_cidr: usize) -
     let net = IpNet::from_str(s).map_err(|_| anyhow!("invalid IP/CIDR: {}", s))?;
 
     for _ in 0..sample_per_cidr {
-        if let Some(ip) = random_ip_from_net(net) {
+        if let Some(ip) = random_ip_from_net(net, rng) {
             out.insert(ip.to_string());
         }
     }
@@ -138,17 +163,32 @@ pub fn collect_targets(
     cli_cidrs: &[String],
     cli_ips: &Option<String>,
 ) -> Result<Vec<String>> {
+    let seed = if config.seed == 0 {
+        rand::random()
+    } else {
+        config.seed
+    };
+    collect_targets_with_seed(config, cli_cidrs, cli_ips, seed)
+}
+
+pub fn collect_targets_with_seed(
+    config: &AppConfig,
+    cli_cidrs: &[String],
+    cli_ips: &Option<String>,
+    seed: u64,
+) -> Result<Vec<String>> {
     let mut targets = BTreeSet::new();
+    let mut rng = StdRng::seed_from_u64(seed);
 
     if let Some(path) = cli_ips {
         let text = fs::read_to_string(path)?;
         for line in text.lines() {
-            add_ip_or_cidr(line, &mut targets, config.sample_per_cidr)?;
+            add_ip_or_cidr(line, &mut targets, config.sample_per_cidr, &mut rng)?;
         }
     }
 
     for cidr in cli_cidrs {
-        add_ip_or_cidr(cidr, &mut targets, config.sample_per_cidr)?;
+        add_ip_or_cidr(cidr, &mut targets, config.sample_per_cidr, &mut rng)?;
     }
 
     if targets.is_empty() {
@@ -173,11 +213,16 @@ pub fn cidr_valid(s: &str) -> Result<IpNet> {
 
 /// Build a target set from an explicit list of CIDR strings (used by the TUI
 /// CIDR selection screen). Each CIDR is sampled as in `collect_targets`.
-pub fn collect_from_cidrs(cidrs: &[String], sample_per_cidr: usize) -> Result<Vec<String>> {
+pub fn collect_from_cidrs_with_seed(
+    cidrs: &[String],
+    sample_per_cidr: usize,
+    seed: u64,
+) -> Result<Vec<String>> {
     let mut targets = BTreeSet::new();
+    let mut rng = StdRng::seed_from_u64(seed);
 
     for cidr in cidrs {
-        add_ip_or_cidr(cidr, &mut targets, sample_per_cidr)?;
+        add_ip_or_cidr(cidr, &mut targets, sample_per_cidr, &mut rng)?;
     }
 
     if targets.is_empty() {
@@ -202,13 +247,26 @@ fn client_for_ip(host: &str, ip: &str, args: &AppConfig) -> Result<Client> {
     Ok(client)
 }
 
-async fn probe_once(client: &Client, url: &str) -> Option<(f64, String)> {
+async fn probe_once(client: &Client, url: &str) -> Result<(f64, String), String> {
     let start = Instant::now();
 
-    let resp = client.get(url).header("accept", "*/*").send().await.ok()?;
+    let resp = client
+        .get(url)
+        .header("accept", "*/*")
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                "request timeout".to_string()
+            } else if error.is_connect() {
+                "connect/TLS failure".to_string()
+            } else {
+                "request failure".to_string()
+            }
+        })?;
 
     if !resp.status().is_success() {
-        return None;
+        return Err(format!("HTTP {}", resp.status()));
     }
 
     let protocol = match resp.version() {
@@ -220,9 +278,11 @@ async fn probe_once(client: &Client, url: &str) -> Option<(f64, String)> {
         _ => "unknown",
     };
 
-    let _ = resp.bytes().await.ok()?;
+    resp.bytes()
+        .await
+        .map_err(|_| "response body failure".to_string())?;
 
-    Some((start.elapsed().as_secs_f64(), protocol.to_string()))
+    Ok((start.elapsed().as_secs_f64(), protocol.to_string()))
 }
 
 struct TargetState {
@@ -235,13 +295,15 @@ struct TargetState {
     scheduled: usize,
     completed: usize,
     in_flight: bool,
+    failures: Vec<String>,
 }
 
 impl TargetState {
     fn new(ip: String, args: &AppConfig, probe_count: usize) -> Self {
         let url = format!("https://{}{}", args.host, args.path);
         let client = client_for_ip(&args.host, &ip, args).ok();
-        let (fail, scheduled, completed) = if client.is_some() {
+        let client_ok = client.is_some();
+        let (fail, scheduled, completed) = if client_ok {
             (0, 0, 0)
         } else {
             (probe_count, probe_count, probe_count)
@@ -257,6 +319,11 @@ impl TargetState {
             scheduled,
             completed,
             in_flight: false,
+            failures: if client_ok {
+                Vec::new()
+            } else {
+                vec!["invalid target/client setup".to_string(); probe_count]
+            },
         }
     }
 
@@ -285,6 +352,18 @@ impl TargetState {
             p95: percentile(&self.samples, 0.95),
             max: self.samples.last().copied().unwrap_or(0.0),
             samples: self.samples.clone(),
+            failures: self.failures.clone(),
+            success_rate: if ok + self.fail > 0 {
+                ok as f64 / (ok + self.fail) as f64
+            } else {
+                0.0
+            },
+            score: if ok > 0 {
+                (ok as f64 / (ok + self.fail).max(1) as f64)
+                    / self.samples.last().copied().unwrap_or(1.0).max(0.001)
+            } else {
+                0.0
+            },
         }
     }
 }
@@ -431,7 +510,7 @@ pub async fn run_scan(
                 };
                 let sample = match permit {
                     Some(_permit) => probe_once(&client, &url).await,
-                    None => None,
+                    None => Err("cancelled".to_string()),
                 };
                 (index, sample)
             }));
@@ -455,11 +534,15 @@ pub async fn run_scan(
                 let state = &mut states[index];
                 state.in_flight = false;
                 state.completed += 1;
-                if let Some((value, protocol)) = sample {
-                    state.samples.push(value);
-                    state.protocols.push(protocol);
-                } else {
-                    state.fail += 1;
+                match sample {
+                    Ok((value, protocol)) => {
+                        state.samples.push(value);
+                        state.protocols.push(protocol);
+                    }
+                    Err(reason) => {
+                        state.fail += 1;
+                        state.failures.push(reason);
+                    }
                 }
                 if state.completed == probe_count {
                     let _ = tx.send(state.result());
@@ -471,7 +554,10 @@ pub async fn run_scan(
 
 #[cfg(test)]
 mod tests {
-    use super::{cidr_valid, select_next_target, TargetState};
+    use super::{
+        cidr_valid, collect_from_cidrs_with_seed, result_confidence, result_status,
+        select_next_target, TargetState,
+    };
 
     fn state(
         ip: &str,
@@ -490,6 +576,7 @@ mod tests {
             scheduled,
             completed,
             in_flight: false,
+            failures: Vec::new(),
         }
     }
 
@@ -538,5 +625,32 @@ mod tests {
         let states = vec![in_flight, state("192.0.2.2", 0, 0, &[], 0)];
 
         assert_eq!(select_next_target(&states, 3), Some(1));
+    }
+
+    #[test]
+    fn seeded_sampling_is_reproducible_and_deduplicated() {
+        let first = collect_from_cidrs_with_seed(
+            &["192.0.2.0/24".to_string(), "192.0.2.0/24".to_string()],
+            20,
+            42,
+        )
+        .unwrap();
+        let second = collect_from_cidrs_with_seed(
+            &["192.0.2.0/24".to_string(), "192.0.2.0/24".to_string()],
+            20,
+            42,
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert!(first.len() <= 40);
+    }
+
+    #[test]
+    fn result_status_and_confidence_reflect_reliability() {
+        let mut state = state("192.0.2.1", 20, 20, &[0.1; 20], 0);
+        let result = state.result();
+        assert_eq!(result_status(&result), "READY");
+        assert_eq!(result_confidence(&result), "HIGH");
+        assert_eq!(result.success_rate, 1.0);
     }
 }

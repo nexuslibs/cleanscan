@@ -37,6 +37,9 @@ pub struct SpeedMeasurement {
     pub bytes: u64,
     pub seconds: f64,
     pub bytes_per_second: f64,
+    pub median_bytes_per_second: f64,
+    pub p10_bytes_per_second: f64,
+    pub p90_bytes_per_second: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +108,9 @@ async fn download_once(
         bytes: expected_bytes,
         seconds,
         bytes_per_second: expected_bytes as f64 / seconds,
+        median_bytes_per_second: expected_bytes as f64 / seconds,
+        p10_bytes_per_second: expected_bytes as f64 / seconds,
+        p90_bytes_per_second: expected_bytes as f64 / seconds,
     })
 }
 
@@ -134,6 +140,9 @@ async fn upload_once(client: &Client, url: &str, payload_bytes: u64) -> Result<S
         bytes: payload_bytes,
         seconds,
         bytes_per_second: payload_bytes as f64 / seconds,
+        median_bytes_per_second: payload_bytes as f64 / seconds,
+        p10_bytes_per_second: payload_bytes as f64 / seconds,
+        p90_bytes_per_second: payload_bytes as f64 / seconds,
     })
 }
 
@@ -145,10 +154,29 @@ fn average_measurements(values: Vec<SpeedMeasurement>) -> Option<SpeedMeasuremen
     let seconds = values.iter().map(|v| v.seconds).sum::<f64>() / values.len() as f64;
     let bytes_per_second =
         values.iter().map(|v| v.bytes_per_second).sum::<f64>() / values.len() as f64;
+    let mut rates = values
+        .iter()
+        .map(|v| v.bytes_per_second)
+        .collect::<Vec<_>>();
+    rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let percentile = |pct: f64| {
+        let index = ((rates.len() as f64 * pct).ceil() as usize)
+            .saturating_sub(1)
+            .min(rates.len() - 1);
+        rates[index]
+    };
+    let median_bytes_per_second = if rates.len().is_multiple_of(2) {
+        (rates[rates.len() / 2 - 1] + rates[rates.len() / 2]) / 2.0
+    } else {
+        rates[rates.len() / 2]
+    };
     Some(SpeedMeasurement {
         bytes,
         seconds,
         bytes_per_second,
+        median_bytes_per_second,
+        p10_bytes_per_second: percentile(0.10),
+        p90_bytes_per_second: percentile(0.90),
     })
 }
 
@@ -267,11 +295,17 @@ mod tests {
                 bytes: 100,
                 seconds: 1.0,
                 bytes_per_second: 100.0,
+                median_bytes_per_second: 100.0,
+                p10_bytes_per_second: 100.0,
+                p90_bytes_per_second: 100.0,
             },
             SpeedMeasurement {
                 bytes: 100,
                 seconds: 2.0,
                 bytes_per_second: 50.0,
+                median_bytes_per_second: 50.0,
+                p10_bytes_per_second: 50.0,
+                p90_bytes_per_second: 50.0,
             },
         ])
         .unwrap();

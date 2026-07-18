@@ -94,11 +94,16 @@ fn scanning_lines(app: &App) -> Vec<Line<'static>> {
         key("Home / End", "Jump to top / bottom"),
         key("Tab", "Focus table and action buttons"),
         key("Enter", "Open full details for the selected IP"),
+        key("1–4 / Tab", "Switch detail tabs in the selected-IP modal"),
     ];
 
     if app.scan_complete {
         lines.push(key("e", "Export results to a .tsv file"));
         lines.push(key("t", "Run speed tests on successful IPs"));
+        lines.push(key("f", "Show failed targets for diagnosis"));
+        lines.push(key("r", "Repeat the identical sampled target set"));
+        lines.push(key("n", "Generate a new sample with the same settings"));
+        lines.push(key("m", "Export runs for comparison"));
     } else {
         lines.push(key("p", "Pause / resume the scan"));
     }

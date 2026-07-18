@@ -211,6 +211,10 @@ pub struct App {
     pub edit_caret: usize,
     pub results: Vec<ProbeResult>,
     pub total_targets: usize,
+    /// Exact sampled targets shown in the review screen and used for the run.
+    pub preview_targets: Vec<String>,
+    pub last_targets: Vec<String>,
+    pub scan_seed: u64,
     pub scan_complete: bool,
     pub should_quit: bool,
     pub paused: Arc<AtomicBool>,
@@ -227,6 +231,7 @@ pub struct App {
     /// Currently sorted column index in the results table (natural order = 0).
     pub sort_col: usize,
     pub sort_asc: bool,
+    pub show_failures: bool,
     pub result_column_visibility: [bool; 10],
     pub column_picker_cursor: usize,
     pub start_time: Instant,
@@ -262,6 +267,7 @@ pub struct App {
     pub confirm_quit: bool,
     /// Set when the wizard's Start action fires; the run loop performs the spawn.
     pub pending_start: bool,
+    pub rescan_targets: Option<Vec<String>>,
     pub speed_targets: Vec<String>,
     pub speed_selected: std::collections::HashSet<String>,
     pub speed_cursor: usize,
@@ -287,6 +293,7 @@ pub struct App {
     pub command_cursor: usize,
     /// Full statistics drawer for the currently selected latency result.
     pub show_result_details: bool,
+    pub detail_tab: usize,
 }
 
 impl App {
@@ -378,7 +385,11 @@ impl App {
         self.command_cursor = 0;
     }
 
-    pub fn new(config: AppConfig, has_cli_targets: bool, paused: Arc<AtomicBool>) -> Self {
+    pub fn new(mut config: AppConfig, has_cli_targets: bool, paused: Arc<AtomicBool>) -> Self {
+        if config.seed == 0 {
+            config.seed = rand::random();
+        }
+        let scan_seed = config.seed;
         let mut cidr_candidates = Vec::new();
 
         let default_set: std::collections::HashSet<String> =
@@ -425,6 +436,9 @@ impl App {
             edit_caret: 0,
             results: Vec::new(),
             total_targets: 0,
+            preview_targets: Vec::new(),
+            last_targets: Vec::new(),
+            scan_seed,
             scan_complete: false,
             should_quit: false,
             paused,
@@ -437,6 +451,7 @@ impl App {
             settings_scroll: 0,
             sort_col: 0,
             sort_asc: true,
+            show_failures: false,
             result_column_visibility: [true; 10],
             column_picker_cursor: 0,
             start_time: Instant::now(),
@@ -460,6 +475,7 @@ impl App {
             speed_table_col_bounds: Vec::new(),
             confirm_quit: false,
             pending_start: false,
+            rescan_targets: None,
             speed_targets: Vec::new(),
             speed_selected: std::collections::HashSet::new(),
             speed_cursor: 0,
@@ -481,6 +497,7 @@ impl App {
             command_query: String::new(),
             command_cursor: 0,
             show_result_details: false,
+            detail_tab: 0,
         }
     }
 
@@ -548,6 +565,7 @@ impl App {
         self.focus_index = 0;
         self.focus_target = FocusTarget::Table;
         self.show_result_details = false;
+        self.detail_tab = 0;
         self.total_targets = total;
         self.scan_complete = false;
         self.results.clear();
@@ -555,12 +573,56 @@ impl App {
         self.result_cursor = 0;
         self.sort_col = 0;
         self.sort_asc = true;
+        self.show_failures = false;
         self.message = None;
         self.message_time = None;
         self.start_time = Instant::now();
         self.throughput.clear();
         self.last_tp_instant = Instant::now();
         self.last_tp_count = 0;
+    }
+
+    pub fn set_scan_targets(&mut self, targets: Vec<String>) {
+        self.last_targets = targets.clone();
+        self.preview_targets = targets;
+    }
+
+    pub fn invalidate_preview(&mut self) {
+        self.preview_targets.clear();
+    }
+
+    pub fn regenerate_preview(&mut self) {
+        self.scan_seed = rand::random();
+        self.config.seed = self.scan_seed;
+        let cidrs: Vec<String> = self
+            .cidr_candidates
+            .iter()
+            .filter(|entry| entry.selected)
+            .map(|entry| entry.cidr.clone())
+            .collect();
+        match crate::scanner::collect_from_cidrs_with_seed(
+            &cidrs,
+            self.config.sample_per_cidr,
+            self.scan_seed,
+        ) {
+            Ok(targets) => {
+                self.preview_targets = targets;
+                self.toast_success(format!("Generated {} targets", self.preview_targets.len()));
+            }
+            Err(error) => self.toast_error(format!("Preview failed: {error}")),
+        }
+    }
+
+    pub fn save_target_manifest(&mut self) {
+        if self.preview_targets.is_empty() {
+            self.toast_warn("No sampled targets available");
+            return;
+        }
+        let name = format!("cleanscan_targets_{}.txt", self.scan_seed);
+        match fs::write(&name, self.preview_targets.join("\n") + "\n") {
+            Ok(()) => self.toast_success(format!("Targets saved to {name}")),
+            Err(error) => self.toast_error(format!("Target save failed: {error}")),
+        }
     }
 
     pub fn add_result(&mut self, result: ProbeResult) {
@@ -602,6 +664,10 @@ impl App {
         self.toast_kind(msg, ToastKind::Success);
     }
 
+    pub fn toast_info(&mut self, msg: impl Into<String>) {
+        self.toast_kind(msg, ToastKind::Info);
+    }
+
     pub fn toast_warn(&mut self, msg: impl Into<String>) {
         self.toast_kind(msg, ToastKind::Warn);
     }
@@ -633,8 +699,9 @@ impl App {
 
     /// Natural ranking used as the default results order.
     pub fn natural_cmp(a: &ProbeResult, b: &ProbeResult) -> std::cmp::Ordering {
-        a.fail
-            .cmp(&b.fail)
+        b.success_rate
+            .partial_cmp(&a.success_rate)
+            .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| {
                 a.p95
                     .partial_cmp(&b.p95)
@@ -654,7 +721,11 @@ impl App {
 
     /// Results sorted for display according to the active sort column.
     pub fn sorted_results(&self) -> Vec<&ProbeResult> {
-        let mut v: Vec<&ProbeResult> = self.results.iter().filter(|r| r.ok > 0).collect();
+        let mut v: Vec<&ProbeResult> = self
+            .results
+            .iter()
+            .filter(|r| self.show_failures || r.ok > 0)
+            .collect();
         if self.sort_col == 0 {
             v.sort_by(|a, b| {
                 let ord = Self::natural_cmp(a, b);
@@ -671,7 +742,10 @@ impl App {
             let ord = match self.sort_col {
                 1 => a.ip.cmp(&b.ip),
                 2 => a.ok.cmp(&b.ok),
-                3 => a.fail.cmp(&b.fail),
+                3 => a
+                    .success_rate
+                    .partial_cmp(&b.success_rate)
+                    .unwrap_or(std::cmp::Ordering::Equal),
                 4 => a
                     .avg
                     .partial_cmp(&b.avg)
@@ -786,6 +860,53 @@ impl App {
             )?;
         }
         Ok(filename)
+    }
+
+    fn save_comparison_to_file(&self) -> Result<String, io::Error> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let base = format!("cleanscan_comparison_{ts}");
+        let mut suffix = 0usize;
+        let (filename, mut file) = loop {
+            let candidate = if suffix == 0 {
+                format!("{base}.json")
+            } else {
+                format!("{base}_{suffix}.json")
+            };
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => break (candidate, file),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => suffix += 1,
+                Err(e) => return Err(e),
+            }
+        };
+
+        let snapshot = serde_json::json!({
+            "seed": self.scan_seed,
+            "targets": self.last_targets,
+            "results": self.results,
+        });
+        let content = serde_json::to_vec_pretty(&snapshot)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        file.write_all(&content)?;
+        file.write_all(b"\n")?;
+        Ok(filename)
+    }
+
+    pub fn export_comparison(&mut self) {
+        if !self.scan_complete {
+            self.toast_warn("Scan still running — wait for it to finish before exporting");
+            return;
+        }
+        match self.save_comparison_to_file() {
+            Ok(name) => self.toast_success(format!("Comparison saved to {name}")),
+            Err(e) => self.toast_error(format!("Comparison export failed: {e}")),
+        }
     }
 
     /// Save results to a TSV file (only meaningful when the scan is done).
@@ -906,6 +1027,7 @@ pub fn run_tui(
         } else {
             let targets = crate::scanner::collect_targets(&config_arc, &cli_cidr, &cli_ips)?;
             let total = targets.len();
+            app.set_scan_targets(targets.clone());
             scanner = Some(spawn_scanner(targets, config_arc.clone()));
             app.begin_scan(total);
         }
@@ -919,13 +1041,14 @@ pub fn run_tui(
             Vec<String>,
             Arc<AppConfig>,
         ) -> std::thread::JoinHandle<Result<(), String>>| {
+            let exact_targets = app.rescan_targets.take();
             let cidrs: Vec<String> = app
                 .cidr_candidates
                 .iter()
                 .filter(|e| e.selected)
                 .map(|e| e.cidr.clone())
                 .collect();
-            if cidrs.is_empty() {
+            if exact_targets.is_none() && cidrs.is_empty() {
                 app.toast_warn("Select at least one CIDR (space) before starting");
                 return;
             }
@@ -933,7 +1056,18 @@ pub fn run_tui(
                 app.toast_warn("Set a Host before starting the scan");
                 return;
             }
-            match crate::scanner::collect_from_cidrs(&cidrs, app.config.sample_per_cidr) {
+            let targets = if let Some(targets) = exact_targets {
+                Ok(targets)
+            } else if app.preview_targets.is_empty() {
+                crate::scanner::collect_from_cidrs_with_seed(
+                    &cidrs,
+                    app.config.sample_per_cidr,
+                    app.scan_seed,
+                )
+            } else {
+                Ok(app.preview_targets.clone())
+            };
+            match targets {
                 Ok(targets) => {
                     let total = targets.len();
                     let scan_config = Arc::new(AppConfig {
@@ -948,12 +1082,14 @@ pub fn run_tui(
                         timeout_ms: app.config.timeout_ms,
                         connect_timeout_ms: app.config.connect_timeout_ms,
                         top: app.config.top,
+                        seed: app.config.seed,
                         download_path: app.config.download_path.clone(),
                         upload_path: app.config.upload_path.clone(),
                         speed_payload_bytes: app.config.speed_payload_bytes,
                         speed_repetitions: app.config.speed_repetitions,
                         speed_timeout_ms: app.config.speed_timeout_ms,
                     });
+                    app.set_scan_targets(targets.clone());
                     *scanner = Some(spawn_scanner(targets, scan_config));
                     app.begin_scan(total);
                 }
@@ -1175,6 +1311,11 @@ impl App {
         if self.show_result_details {
             match code {
                 KeyCode::Esc | KeyCode::Char('q') => self.show_result_details = false,
+                KeyCode::Tab => self.detail_tab = (self.detail_tab + 1) % 4,
+                KeyCode::Char('1') => self.detail_tab = 0,
+                KeyCode::Char('2') => self.detail_tab = 1,
+                KeyCode::Char('3') => self.detail_tab = 2,
+                KeyCode::Char('4') => self.detail_tab = 3,
                 KeyCode::Char('c') => self.activate_action(Action::CopyIp),
                 KeyCode::Char('e') => self.activate_action(Action::Export),
                 KeyCode::Char('t') if self.scan_complete => {
@@ -1437,10 +1578,20 @@ impl App {
     fn render_speed_confirm(&mut self, frame: &mut Frame, area: Rect) {
         let popup = centered(area, 58, 32);
         let inner = widgets::modal(frame, area, popup, " Start bandwidth test? ");
+        let directions = match self.speed_direction {
+            SpeedDirection::Download | SpeedDirection::Upload => 1,
+            SpeedDirection::Both => 2,
+        } as u64;
+        let estimated_bytes =
+            self.speed_selected.len() as u64 * self.config.speed_payload_bytes * directions;
         let lines = vec![
             Line::from(Span::styled(
                 format!("{} IPs selected", self.speed_selected.len()),
                 theme::title_style(),
+            )),
+            Line::from(format!(
+                "Estimated minimum transfer: {:.2} GB",
+                estimated_bytes as f64 / 1_000_000_000.0
             )),
             Line::from("This may transfer significant data."),
             Line::from("Enter / y to continue • Esc / n to cancel"),
@@ -1511,6 +1662,38 @@ impl App {
 
     fn handle_scan_key(&mut self, code: KeyCode) {
         match code {
+            KeyCode::Char('r') if self.scan_complete => {
+                if self.last_targets.is_empty() {
+                    self.toast_warn("No previous target manifest available");
+                } else {
+                    self.rescan_targets = Some(self.last_targets.clone());
+                    self.pending_start = true;
+                    self.toast_info("Re-running the identical target set");
+                }
+            }
+            KeyCode::Char('n') if self.scan_complete => {
+                self.regenerate_preview();
+                if !self.preview_targets.is_empty() {
+                    self.rescan_targets = Some(self.preview_targets.clone());
+                    self.pending_start = true;
+                }
+            }
+            KeyCode::Char('m') if self.scan_complete => {
+                self.export_comparison();
+            }
+            KeyCode::Char('f') => {
+                self.show_failures = !self.show_failures;
+                self.result_cursor = 0;
+                self.scroll = 0;
+                self.toast_kind(
+                    if self.show_failures {
+                        "Showing all targets, including failures"
+                    } else {
+                        "Showing successful targets"
+                    },
+                    ToastKind::Info,
+                );
+            }
             KeyCode::Char('v') => self.activate_action(Action::ConfigureColumns),
             KeyCode::Char('p') => self.activate_action(Action::PauseResume),
             KeyCode::Char('e') => self.activate_action(Action::Export),
@@ -2079,6 +2262,9 @@ mod tests {
             p95,
             max: p95,
             samples: vec![p95],
+            failures: Vec::new(),
+            success_rate: 1.0 / (1 + fail) as f64,
+            score: 1.0 / p95.max(0.001),
         }
     }
 
