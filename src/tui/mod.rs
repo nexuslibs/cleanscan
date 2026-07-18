@@ -843,10 +843,14 @@ pub fn run_tui(
 
     // CLI-provided targets start scanning immediately (legacy behavior).
     if has_cli_targets {
-        let targets = crate::scanner::collect_targets(&config_arc, &cli_cidr, &cli_ips)?;
-        let total = targets.len();
-        scanner = Some(spawn_scanner(targets, config_arc.clone()));
-        app.begin_scan(total);
+        if app.config.host.is_empty() {
+            app.toast_warn("Set a Host before starting the scan");
+        } else {
+            let targets = crate::scanner::collect_targets(&config_arc, &cli_cidr, &cli_ips)?;
+            let total = targets.len();
+            scanner = Some(spawn_scanner(targets, config_arc.clone()));
+            app.begin_scan(total);
+        }
     }
 
     // Launch a scan from the wizard's (possibly edited) configuration.
@@ -865,6 +869,10 @@ pub fn run_tui(
                 .collect();
             if cidrs.is_empty() {
                 app.toast_warn("Select at least one CIDR (space) before starting");
+                return;
+            }
+            if app.config.host.is_empty() {
+                app.toast_warn("Set a Host before starting the scan");
                 return;
             }
             match crate::scanner::collect_from_cidrs(&cidrs, app.config.sample_per_cidr) {
@@ -1519,6 +1527,12 @@ impl App {
                     }
                 }
             }
+            return;
+        }
+
+        // Other overlays consume all mouse input so clicks cannot activate
+        // controls rendered underneath them.
+        if self.confirm_speed_start || self.show_command_palette || self.show_result_details {
             return;
         }
 

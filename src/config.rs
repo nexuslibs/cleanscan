@@ -53,7 +53,7 @@ fn default_speed_timeout_ms() -> u64 {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            host: "app.iplat.ir".to_string(),
+            host: String::new(),
             path: "/cdn-cgi/trace".to_string(),
             sample_per_cidr: 100,
             probes: 8,

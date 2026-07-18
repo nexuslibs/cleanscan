@@ -12,7 +12,7 @@ use crate::tui::{centered, theme, widgets, App, Screen, WizardStep};
 pub fn overlay(app: &App, frame: &mut Frame, area: Rect) {
     let lines: Vec<Line> = match app.screen {
         Screen::Wizard => wizard_lines(app.wizard_step),
-        Screen::Scanning => scanning_lines(),
+        Screen::Scanning => scanning_lines(app),
         Screen::SpeedSelect => speed_selection_lines(),
         Screen::SpeedTesting => speed_testing_lines(),
         Screen::SpeedResults => speed_results_lines(),
@@ -48,7 +48,6 @@ fn wizard_lines(step: WizardStep) -> Vec<Line<'static>> {
                 " Step 1 — CIDR ranges",
                 theme::header_style(),
             )));
-            v.push(key("space", "Toggle the highlighted range on/off"));
             v.push(key("Space", "Toggle the highlighted range"));
             v.push(key("Enter", "Edit or activate the focused control"));
             v.push(key("↑ / ↓", "Move through ranges"));
@@ -81,8 +80,8 @@ fn wizard_lines(step: WizardStep) -> Vec<Line<'static>> {
     v
 }
 
-fn scanning_lines() -> Vec<Line<'static>> {
-    vec![
+fn scanning_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines = vec![
         Line::from(Span::styled(" Scanning dashboard", theme::header_style())),
         key("↑ / ↓", "Select a result IP"),
         key("c", "Copy the selected IP"),
@@ -90,9 +89,16 @@ fn scanning_lines() -> Vec<Line<'static>> {
         key("Home / End", "Jump to top / bottom"),
         key("Tab", "Focus table and action buttons"),
         key("Enter", "Open full details for the selected IP"),
-        key("p", "Pause / resume the scan"),
-        key("e", "Export results to a .tsv file"),
-        key("t", "Run speed tests on successful IPs"),
+    ];
+
+    if app.scan_complete {
+        lines.push(key("e", "Export results to a .tsv file"));
+        lines.push(key("t", "Run speed tests on successful IPs"));
+    } else {
+        lines.push(key("p", "Pause / resume the scan"));
+    }
+
+    lines.extend([
         key("Click header", "Sort results by that column"),
         key("Mouse wheel", "Scroll the results table"),
         key("?  or  any key", "Toggle / close this help"),
@@ -102,7 +108,9 @@ fn scanning_lines() -> Vec<Line<'static>> {
             " Colors: green = fast, yellow = ok, red = slow/failing",
             theme::hint_style(),
         )),
-    ]
+    ]);
+
+    lines
 }
 
 fn speed_selection_lines() -> Vec<Line<'static>> {
@@ -114,7 +122,6 @@ fn speed_selection_lines() -> Vec<Line<'static>> {
         key("↑ / ↓", "Move through successful IPs"),
         key("Space / click", "Toggle the highlighted IP"),
         key("Tab", "Focus list, options, and actions"),
-        key("Space", "Toggle the highlighted IP"),
         key("Enter", "Start tests after confirmation"),
         key("Esc", "Return to latency results"),
         key("q", "Quit cleanscan"),

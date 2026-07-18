@@ -165,7 +165,7 @@ start the test. Results report throughput in Mbps for each direction. Press
 | Flag                   | Default          | Description                                      |
 |------------------------|------------------|--------------------------------------------------|
 | `--cli`                | off              | Use tab-separated CLI output instead of the TUI  |
-| `--host`               | `app.iplat.ir`   | Hostname for HTTPS / SNI / Host header           |
+| `--host`               | required         | Hostname for HTTPS / SNI / Host header (no built-in default) |
 | `--path`               | `/cdn-cgi/trace` | Path to probe                                    |
 | `--ips`                | —                | File with one IP or CIDR per line                |
 | `--cidr`               | —                | CIDR block to sample (repeatable)                |
