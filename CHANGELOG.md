@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/nexuslibs/cleanscan/compare/v0.2.0...v0.3.0) (2026-07-18)
+
+
+### Features
+
+* enhance numeric parameter adjustments in settings wizard ([1fe7820](https://github.com/nexuslibs/cleanscan/commit/1fe78202a936433192303594dd59e6ece68f64ce))
+
 ## [0.2.0](https://github.com/nexuslibs/cleanscan/compare/v0.1.3...v0.2.0) (2026-07-18)
 
 
