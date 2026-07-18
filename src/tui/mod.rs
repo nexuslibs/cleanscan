@@ -798,24 +798,25 @@ impl App {
 
     /// Results sorted for display according to the active sort column.
     pub fn sorted_results(&self) -> Vec<&ProbeResult> {
-        let mut v: Vec<&ProbeResult> =
-            self.results
-                .iter()
-                .filter(|r| self.show_failures || r.ok > 0)
-                .filter(|r| match &self.colo_filter {
-                    Some(want) => r
-                        .colo
-                        .as_deref()
-                        .is_some_and(|c| c.eq_ignore_ascii_case(want)),
-                    None => true,
-                })
-                .filter(|r| match &self.country_filter {
-                    Some(want) => r.country.as_deref().is_some_and(|c| {
-                        c.to_lowercase().contains(&want.to_lowercase())
-                    }),
-                    None => true,
-                })
-                .collect();
+        let mut v: Vec<&ProbeResult> = self
+            .results
+            .iter()
+            .filter(|r| self.show_failures || r.ok > 0)
+            .filter(|r| match &self.colo_filter {
+                Some(want) => r
+                    .colo
+                    .as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(want)),
+                None => true,
+            })
+            .filter(|r| match &self.country_filter {
+                Some(want) => r
+                    .country
+                    .as_deref()
+                    .is_some_and(|c| c.to_lowercase().contains(&want.to_lowercase())),
+                None => true,
+            })
+            .collect();
         if self.sort_col == 0 {
             v.sort_by(|a, b| {
                 let ord = Self::natural_cmp(a, b);
