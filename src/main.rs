@@ -342,9 +342,9 @@ fn cli_mode(
 
 #[cfg(test)]
 mod tests {
-    use crate::scanner;
     use super::normalize_config;
     use crate::config::AppConfig;
+    use crate::scanner;
 
     #[test]
     fn zero_numeric_values_are_normalized() {
