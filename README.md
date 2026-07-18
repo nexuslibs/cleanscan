@@ -224,9 +224,9 @@ latency dashboard.
 All sampled IPs are shown, including targets with no successful probes. Probes are scheduled one
 at a time per IP: successful IPs receive priority for their remaining probes,
 unexplored IPs are preferred over IPs that have failed, and original order is
-used as a deterministic tie-breaker. CLI results are ranked by success rate
-(descending), then `p95` and average latency (ascending). Each row reports `ok`/`fail` counts and `avg`,
-`p50`, `p90`, `p95`, and `max` latency in seconds, the `jitter` spread
+used as a deterministic tie-breaker. CLI results are ranked by recommendation score (descending), then success
+rate, `p95`, and average latency as deterministic tie-breakers. Each row reports `ok`/`fail` counts and `avg`,
+`p50`, `p90`, `p95`, and `max` latency in seconds, the `jitter` spread in seconds
 (`p95 − p50`, a stability signal robust to single outliers), the `loss` count
 and `pkt_loss` percentage (probes dropped with no response — timeouts and
 connect/TLS failures, distinct from application-level HTTP errors), followed by
@@ -259,8 +259,8 @@ the TCP + TLS connection is established; the reported `avg`/`p50`/`p90`/`p95`/`m
 latencies reflect steady-state RTT rather than connection-setup cost, and the
 one-off cold-request latency is reported separately as `cold_ms`. Pass
 `--no-warmup`, and the first measured probe includes connection setup while later
-probes may reuse the connection. Results are ranked by success rate
-first, then p95 and average latency; failures include categorized diagnostics
+probes may reuse the connection. Results are ranked by recommendation score
+first, then success rate, p95, and average latency; failures include categorized diagnostics
 in the details view and machine-readable output. The recommendation `score`
 (and therefore the TUI's default order and the CLI's top results) blends
 reliability with latency, jitter, and packet loss, so a slightly slower but

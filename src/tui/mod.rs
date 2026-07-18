@@ -776,9 +776,14 @@ impl App {
 
     /// Natural ranking used as the default results order.
     pub fn natural_cmp(a: &ProbeResult, b: &ProbeResult) -> std::cmp::Ordering {
-        b.success_rate
-            .partial_cmp(&a.success_rate)
+        b.score
+            .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.success_rate
+                    .partial_cmp(&a.success_rate)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .then_with(|| {
                 a.p95
                     .partial_cmp(&b.p95)
@@ -2483,7 +2488,7 @@ mod tests {
     #[test]
     fn export_ranks_successes_and_applies_top_limit() {
         let results = vec![
-            result("failed", 1, 0.001),
+            result("failed", 1, 0.5),
             result("slow", 0, 0.2),
             result("fast", 0, 0.1),
         ];

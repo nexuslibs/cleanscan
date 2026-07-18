@@ -148,6 +148,13 @@ fn main() -> Result<()> {
         config.loss_weight = weight;
     }
 
+    if !config.stability_weight.is_finite() || config.stability_weight < 0.0 {
+        anyhow::bail!("--stability-weight must be a finite, non-negative value");
+    }
+    if !config.loss_weight.is_finite() || config.loss_weight < 0.0 {
+        anyhow::bail!("--loss-weight must be a finite, non-negative value");
+    }
+
     normalize_config(&mut config);
 
     if let Some(min) = args.min_success_rate {
@@ -278,9 +285,14 @@ fn cli_mode(
     });
 
     results.sort_by(|a, b| {
-        b.success_rate
-            .partial_cmp(&a.success_rate)
+        b.score
+            .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.success_rate
+                    .partial_cmp(&a.success_rate)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .then_with(|| {
                 a.p95
                     .partial_cmp(&b.p95)
@@ -343,7 +355,7 @@ fn cli_mode(
                     r.p90,
                     r.p95,
                     r.max,
-                    r.jitter * 1000.0,
+                    r.jitter,
                     r.loss,
                     r.packet_loss * 100.0,
                     r.cold_ms.map(|ms| format!("{:.1}", ms)).unwrap_or_default(),

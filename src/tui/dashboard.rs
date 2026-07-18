@@ -16,8 +16,8 @@ use crate::tui::theme;
 use crate::tui::{widgets, App, ButtonAction, ButtonKind};
 
 pub const RESULT_COLUMNS: [&str; 14] = [
-    "#", "IP", "Proto", "OK", "Fail", "Avg", "P50", "P90", "P95", "Max", "Jitter", "Loss", "Colo",
-    "Country",
+    "#", "IP", "Proto", "OK", "Fail", "Avg", "P50", "P90", "P95", "Max", "Colo", "Country",
+    "Jitter", "Loss",
 ];
 const WIDTHS: [Constraint; 14] = [
     Constraint::Length(5),
@@ -30,10 +30,10 @@ const WIDTHS: [Constraint; 14] = [
     Constraint::Length(10),
     Constraint::Length(10),
     Constraint::Length(10),
-    Constraint::Length(9),
-    Constraint::Length(7),
     Constraint::Length(7),
     Constraint::Length(14),
+    Constraint::Length(9),
+    Constraint::Length(7),
 ];
 
 /// Render the live scanning dashboard.
@@ -848,7 +848,7 @@ fn render_decision_panel(app: &App, frame: &mut Frame, area: Rect) {
         )));
     }
     lines.push(Line::from(Span::styled(
-        "Ranking: reliability first, then p95, jitter, and packet loss • f: show failures",
+        "Ranking: recommendation score first, then p95, jitter, and packet loss • f: show failures",
         theme::hint_style(),
     )));
     frame.render_widget(

@@ -397,7 +397,7 @@ impl TargetState {
         let (fail, loss, scheduled, completed) = if client_ok {
             (0, 0, 0, 0)
         } else {
-            (probe_count, probe_count, probe_count, probe_count)
+            (probe_count, 0, probe_count, probe_count)
         };
 
         Self {
@@ -445,13 +445,14 @@ impl TargetState {
         let p95 = percentile(&self.samples, 0.95);
         let max = self.samples.last().copied().unwrap_or(0.0);
         let jitter = if ok > 0 { (p95 - p50).max(0.0) } else { 0.0 };
-        let stddev = if ok > 0 {
-            let variance = self.samples.iter().map(|s| (s - avg).powi(2)).sum::<f64>() / ok as f64;
+        let stddev = if ok > 1 {
+            let variance =
+                self.samples.iter().map(|s| (s - avg).powi(2)).sum::<f64>() / (ok - 1) as f64;
             variance.sqrt()
         } else {
             0.0
         };
-        let total = (ok + self.fail).max(1);
+        let total = self.completed.max(1);
         let success_rate = ok as f64 / total as f64;
         let packet_loss = self.loss as f64 / total as f64;
         // Blend reliability, latency, jitter, and packet loss into a single
@@ -988,7 +989,7 @@ mod tests {
         assert!((result.jitter - 0.10).abs() < f64::EPSILON);
         let mean = 0.20;
         let expected_stddev =
-            ((0.10f64 - mean).powi(2) + (0.20f64 - mean).powi(2) + (0.30f64 - mean).powi(2)) / 3.0;
+            ((0.10f64 - mean).powi(2) + (0.20f64 - mean).powi(2) + (0.30f64 - mean).powi(2)) / 2.0;
         assert!((result.stddev - expected_stddev.sqrt()).abs() < 1e-9);
         // 1 lost probe out of 4 attempted => 0.25 packet loss.
         assert!((result.packet_loss - 0.25).abs() < f64::EPSILON);
