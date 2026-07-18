@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/nexuslibs/cleanscan/compare/v0.1.2...v0.1.3) (2026-07-18)
+
+
+### Bug Fixes
+
+* specify repository in release edit command for better context ([b9db6e8](https://github.com/nexuslibs/cleanscan/commit/b9db6e84bfe742acdab906e77851a65ad79c0a62))
+
 ## [0.1.2](https://github.com/nexuslibs/cleanscan/compare/v0.1.1...v0.1.2) (2026-07-18)
 
 
