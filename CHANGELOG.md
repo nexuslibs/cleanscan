@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.6.0](https://github.com/nexuslibs/cleanscan/compare/v0.5.0...v0.6.0) (2026-07-18)
+
+
+### Features
+
+* enhance result details rendering with speed test data and improve latency map selection ([9afd5c9](https://github.com/nexuslibs/cleanscan/commit/9afd5c922ca1dc47c6847d4aa6b83fac09f2b898))
+* enhance scanning results and dashboard features ([9cf5388](https://github.com/nexuslibs/cleanscan/commit/9cf53887e4d22b492a7c4b6419f3ccd8396dd285))
+* enhance TUI with improved speed testing and navigation ([becf80d](https://github.com/nexuslibs/cleanscan/commit/becf80d76671726dbec7da78a796a2da73ccc571))
+* enhance TUI with improved speed testing and navigation ([223b71f](https://github.com/nexuslibs/cleanscan/commit/223b71fb39e48d20dacdd88630d30a242f54a38a))
+* enhance TUI with new detail tabs, improved navigation, and additional data visualizations ([e70944c](https://github.com/nexuslibs/cleanscan/commit/e70944c69cd5a25261870a5cb42c37746cfc9c3c))
+* enhance TUI with new targets file loading and improved result rendering ([b09dc67](https://github.com/nexuslibs/cleanscan/commit/b09dc6784a954b2dca20465ceef9ab4492791eda))
+* optimize speed selection rendering and improve column widths ([01ab518](https://github.com/nexuslibs/cleanscan/commit/01ab5186a04d37268f1a476804a4d6eb846cfaca))
+
 ## [0.5.0](https://github.com/nexuslibs/cleanscan/compare/v0.4.0...v0.5.0) (2026-07-18)
 
 
