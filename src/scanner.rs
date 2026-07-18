@@ -41,6 +41,7 @@ pub const DEFAULT_CLOUDFLARE_CIDRS: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct ProbeResult {
     pub ip: String,
+    pub protocol: String,
     pub ok: usize,
     pub fail: usize,
     pub avg: f64,
@@ -201,7 +202,7 @@ fn client_for_ip(host: &str, ip: &str, args: &AppConfig) -> Result<Client> {
     Ok(client)
 }
 
-async fn probe_once(client: &Client, url: &str) -> Option<f64> {
+async fn probe_once(client: &Client, url: &str) -> Option<(f64, String)> {
     let start = Instant::now();
 
     let resp = client.get(url).header("accept", "*/*").send().await.ok()?;
@@ -210,9 +211,18 @@ async fn probe_once(client: &Client, url: &str) -> Option<f64> {
         return None;
     }
 
+    let protocol = match resp.version() {
+        reqwest::Version::HTTP_09 => "http/0.9",
+        reqwest::Version::HTTP_10 => "http/1.0",
+        reqwest::Version::HTTP_11 => "http/1.1",
+        reqwest::Version::HTTP_2 => "h2",
+        reqwest::Version::HTTP_3 => "h3",
+        _ => "unknown",
+    };
+
     let _ = resp.bytes().await.ok()?;
 
-    Some(start.elapsed().as_secs_f64())
+    Some((start.elapsed().as_secs_f64(), protocol.to_string()))
 }
 
 struct TargetState {
@@ -220,6 +230,7 @@ struct TargetState {
     url: String,
     client: Option<Client>,
     samples: Vec<f64>,
+    protocols: Vec<String>,
     fail: usize,
     scheduled: usize,
     completed: usize,
@@ -241,6 +252,7 @@ impl TargetState {
             url,
             client,
             samples: Vec::new(),
+            protocols: Vec::new(),
             fail,
             scheduled,
             completed,
@@ -264,6 +276,7 @@ impl TargetState {
 
         ProbeResult {
             ip: self.ip.clone(),
+            protocol: summarize_protocols(&self.protocols),
             ok,
             fail: self.fail,
             avg,
@@ -273,6 +286,18 @@ impl TargetState {
             max: self.samples.last().copied().unwrap_or(0.0),
             samples: self.samples.clone(),
         }
+    }
+}
+
+fn summarize_protocols(protocols: &[String]) -> String {
+    let Some(first) = protocols.first() else {
+        return "—".to_string();
+    };
+
+    if protocols.iter().all(|protocol| protocol == first) {
+        first.clone()
+    } else {
+        "mixed".to_string()
     }
 }
 
@@ -430,8 +455,9 @@ pub async fn run_scan(
                 let state = &mut states[index];
                 state.in_flight = false;
                 state.completed += 1;
-                if let Some(value) = sample {
+                if let Some((value, protocol)) = sample {
                     state.samples.push(value);
+                    state.protocols.push(protocol);
                 } else {
                     state.fail += 1;
                 }
@@ -459,6 +485,7 @@ mod tests {
             url: String::new(),
             client: None,
             samples: samples.to_vec(),
+            protocols: Vec::new(),
             fail,
             scheduled,
             completed,

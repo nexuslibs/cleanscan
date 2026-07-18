@@ -632,7 +632,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     desc_para_lines.push(Line::from("  Press Enter to edit directly."));
     if current_field.is_numeric() {
         desc_para_lines.push(Line::from(
-            "  Use ↑/↓ arrows to adjust this value immediately.",
+            "  Press Enter to edit; then use ↑/↓ to adjust the numeric value.",
         ));
         desc_para_lines.push(Line::from("  Use j/k to move between fields."));
     }
@@ -839,7 +839,7 @@ fn render_hint(app: &App, frame: &mut Frame, area: Rect) {
                 &[
                     ("Tab", "focus"),
                     ("↵", "edit/next"),
-                    ("↑/↓", "adjust"),
+                    ("↑/↓", "move"),
                     ("/", "commands"),
                     ("?", "help"),
                 ]
@@ -988,18 +988,12 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
 
 fn handle_settings_key(app: &mut App, code: KeyCode) {
     if app.edit_field.is_some() {
-        let i = app.edit_field.unwrap();
+        let i = app.edit_field.expect("edit_field checked above");
         let field = SettingField::ALL[i];
         match code {
-            KeyCode::Enter => match field.apply(&app.edit_buffer, &mut app.config) {
-                Ok(()) => {
-                    app.edit_field = None;
-                    app.edit_buffer.clear();
-                    app.edit_caret = 0;
-                    app.save_config();
-                }
-                Err(e) => app.toast_error(format!("Invalid {}: {}", field.label(), e)),
-            },
+            KeyCode::Enter => {
+                app.commit_edit();
+            }
             KeyCode::Esc => {
                 app.edit_field = None;
                 app.edit_buffer.clear();
@@ -1039,13 +1033,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
         return;
     }
 
-    let field = SettingField::ALL[app.cursor.min(SettingField::ALL.len() - 1)];
     match code {
-        KeyCode::Up | KeyCode::Down if field.is_numeric() => {
-            let direction = if code == KeyCode::Up { 1 } else { -1 };
-            field.nudge_config(&mut app.config, direction);
-            app.save_config();
-        }
         KeyCode::Char('k') if app.cursor > 0 => {
             app.cursor -= 1;
         }
@@ -1137,6 +1125,30 @@ fn handle_review_key(app: &mut App, code: KeyCode) {
 }
 
 impl App {
+    /// Apply and save the currently edited settings field.
+    ///
+    /// Returns `true` when the draft was valid and the edit mode was closed.
+    /// Invalid drafts remain active so the user can correct them.
+    pub fn commit_edit(&mut self) -> bool {
+        let Some(i) = self.edit_field else {
+            return true;
+        };
+        let field = SettingField::ALL[i];
+        match field.apply(&self.edit_buffer, &mut self.config) {
+            Ok(()) => {
+                self.edit_field = None;
+                self.edit_buffer.clear();
+                self.edit_caret = 0;
+                self.save_config();
+                true
+            }
+            Err(e) => {
+                self.toast_error(format!("Invalid {}: {}", field.label(), e));
+                false
+            }
+        }
+    }
+
     /// Keep the selected settings field inside the last rendered viewport.
     pub fn ensure_settings_visible(&mut self) {
         let Some(inner) = self.settings_inner else {
@@ -1197,8 +1209,20 @@ fn next_char_boundary(s: &str, index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_char_boundary, previous_char_boundary, SettingField};
+    use super::{
+        handle_settings_key, next_char_boundary, previous_char_boundary, SettingField,
+    };
     use crate::config::AppConfig;
+    use crate::tui::App;
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    fn settings_app() -> App {
+        App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
 
     #[test]
     fn host_and_path_validation_match_url_construction() {
@@ -1246,5 +1270,46 @@ mod tests {
         SettingField::SamplePerCidr.nudge_config(&mut config, -1);
         assert_eq!(config.timeout_ms, 2600);
         assert_eq!(config.sample_per_cidr, 90);
+    }
+
+    #[test]
+    fn arrows_traverse_numeric_settings_when_not_editing() {
+        let mut app = settings_app();
+        app.wizard_step = crate::tui::WizardStep::Settings;
+        app.cursor = 1;
+
+        handle_settings_key(&mut app, crossterm::event::KeyCode::Down);
+        assert_eq!(app.cursor, 2);
+        assert_eq!(app.config.sample_per_cidr, 100);
+
+        handle_settings_key(&mut app, crossterm::event::KeyCode::Up);
+        assert_eq!(app.cursor, 1);
+        assert_eq!(app.config.sample_per_cidr, 100);
+    }
+
+    #[test]
+    fn arrows_step_numeric_draft_while_editing() {
+        let mut app = settings_app();
+        app.wizard_step = crate::tui::WizardStep::Settings;
+        app.start_edit(2);
+        app.edit_buffer = "100".to_string();
+        app.edit_caret = app.edit_buffer.len();
+
+        handle_settings_key(&mut app, crossterm::event::KeyCode::Up);
+
+        assert_eq!(app.edit_field, Some(2));
+        assert_eq!(app.edit_buffer, "110");
+        assert_eq!(app.config.sample_per_cidr, 100);
+    }
+
+    #[test]
+    fn invalid_edit_remains_active_when_committing() {
+        let mut app = settings_app();
+        app.start_edit(1);
+        app.edit_buffer = "invalid/path".to_string();
+
+        assert!(!app.commit_edit());
+        assert_eq!(app.edit_field, Some(1));
+        assert_eq!(app.config.path, "/cdn-cgi/trace");
     }
 }

@@ -13,10 +13,13 @@ use crate::scanner::ProbeResult;
 use crate::tui::theme;
 use crate::tui::{widgets, App, ButtonAction, ButtonKind};
 
-const COLS: [&str; 9] = ["#", "IP", "OK", "Fail", "Avg", "P50", "P90", "P95", "Max"];
-const WIDTHS: [Constraint; 9] = [
+pub const RESULT_COLUMNS: [&str; 10] = [
+    "#", "IP", "Proto", "OK", "Fail", "Avg", "P50", "P90", "P95", "Max",
+];
+const WIDTHS: [Constraint; 10] = [
     Constraint::Length(5),
     Constraint::Length(25),
+    Constraint::Length(8),
     Constraint::Length(5),
     Constraint::Length(6),
     Constraint::Length(10),
@@ -245,6 +248,7 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
             result.ok,
             result.ok + result.fail
         )),
+        Line::from(format!("Protocol    : {}", result.protocol)),
         Line::from(format!("Average     : {}", fmt_ms(result.avg))),
         Line::from(format!("P50         : {}", fmt_ms(result.p50))),
         Line::from(format!("P90         : {}", fmt_ms(result.p90))),
@@ -520,6 +524,12 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
     let focused = app.focus_index == 0;
     let block = widgets::panel_block("Results", focused);
     let inner = block.inner(area);
+    let visible_columns = app.visible_result_columns();
+    let visible_widths: Vec<Constraint> = visible_columns
+        .iter()
+        .map(|column| WIDTHS[*column])
+        .collect();
+    app.table_col_indices = visible_columns.clone();
     let header_rect = Rect {
         x: inner.x,
         y: inner.y,
@@ -531,7 +541,7 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
     // Compute column x-bounds for mouse header sorting.
     let mut bounds = Vec::new();
     let mut x = inner.x;
-    for (i, w) in WIDTHS.iter().enumerate() {
+    for (i, w) in visible_widths.iter().enumerate() {
         if let Constraint::Length(len) = w {
             let len = (*len).min(inner.width.saturating_sub(x - inner.x));
             bounds.push((x, x + len));
@@ -569,10 +579,11 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
     let end = (start + visible).min(display.len());
     let page: Vec<&ProbeResult> = display[start..end].to_vec();
 
-    let header_cells: Vec<Cell> = COLS
+    let header_cells: Vec<Cell> = visible_columns
         .iter()
-        .enumerate()
-        .map(|(i, c)| {
+        .map(|column| {
+            let i = *column;
+            let c = RESULT_COLUMNS[i];
             let style = if i == app.sort_col {
                 theme::highlight_style()
             } else {
@@ -628,9 +639,10 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
                 Style::default()
             };
 
-            Row::new(vec![
+            let cells = vec![
                 Cell::from(rank_text).style(base_style),
                 Cell::from(ip_text).style(base_style),
+                Cell::from(r.protocol.clone()).style(base_style),
                 Cell::from(r.ok.to_string()).style(base_style),
                 Cell::from(r.fail.to_string()).style(if is_selected {
                     base_style
@@ -664,12 +676,20 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
                 } else {
                     theme::latency_style(r.max * 1000.0)
                 }),
-            ])
+            ];
+            Row::new(
+                cells
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(column, _)| app.column_visible(*column))
+                    .map(|(_, cell)| cell)
+                    .collect::<Vec<_>>(),
+            )
             .style(row_style)
         })
         .collect();
 
-    let table = Table::new(rows, WIDTHS).header(header).block(block);
+    let table = Table::new(rows, visible_widths).header(header).block(block);
     frame.render_widget(table, area);
 
     // Empty state: no successful results to show yet.

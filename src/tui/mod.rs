@@ -86,10 +86,11 @@ pub enum Action {
     Download,
     Upload,
     Both,
+    ConfigureColumns,
 }
 
 impl Action {
-    pub const ALL: [Action; 19] = [
+    pub const ALL: [Action; 20] = [
         Action::Back,
         Action::Next,
         Action::Start,
@@ -109,6 +110,7 @@ impl Action {
         Action::Download,
         Action::Upload,
         Action::Both,
+        Action::ConfigureColumns,
     ];
 
     pub fn label(self) -> &'static str {
@@ -132,6 +134,7 @@ impl Action {
             Action::Download => "Download only",
             Action::Upload => "Upload only",
             Action::Both => "Download + upload",
+            Action::ConfigureColumns => "Configure result columns",
         }
     }
 
@@ -146,6 +149,7 @@ impl Action {
             Action::OpenCommandPalette => "/",
             Action::Confirm => "Enter",
             Action::Cancel => "Esc",
+            Action::ConfigureColumns => "v",
             _ => "",
         }
     }
@@ -157,6 +161,7 @@ impl Action {
             Action::SpeedTest => "Choose successful IPs for bandwidth testing",
             Action::PauseResume => "Pause or resume the active scan",
             Action::CopyIp => "Copy the selected IP address to the clipboard",
+            Action::ConfigureColumns => "Show or hide columns in the results table",
             _ => self.label(),
         }
     }
@@ -222,6 +227,8 @@ pub struct App {
     /// Currently sorted column index in the results table (natural order = 0).
     pub sort_col: usize,
     pub sort_asc: bool,
+    pub result_column_visibility: [bool; 10],
+    pub column_picker_cursor: usize,
     pub start_time: Instant,
     /// Help overlay visibility.
     pub show_help: bool,
@@ -244,6 +251,7 @@ pub struct App {
     pub table_inner: Option<Rect>,
     pub table_header: Option<Rect>,
     pub table_col_bounds: Vec<(u16, u16)>,
+    pub table_col_indices: Vec<usize>,
     /// Speed-select list inner rect + first visible index, for mouse hit-testing.
     pub speed_list_inner: Option<Rect>,
     pub speed_list_start: usize,
@@ -268,6 +276,7 @@ pub struct App {
     pub focus_index: usize,
     /// Searchable command palette state.
     pub show_command_palette: bool,
+    pub show_column_picker: bool,
     pub command_query: String,
     pub command_cursor: usize,
     /// Full statistics drawer for the currently selected latency result.
@@ -422,6 +431,8 @@ impl App {
             settings_scroll: 0,
             sort_col: 0,
             sort_asc: true,
+            result_column_visibility: [true; 10],
+            column_picker_cursor: 0,
             start_time: Instant::now(),
             show_help: false,
             tick: 0,
@@ -436,6 +447,7 @@ impl App {
             table_inner: None,
             table_header: None,
             table_col_bounds: Vec::new(),
+            table_col_indices: Vec::new(),
             speed_list_inner: None,
             speed_list_start: 0,
             confirm_quit: false,
@@ -453,9 +465,38 @@ impl App {
             focus_target: FocusTarget::List,
             focus_index: 0,
             show_command_palette: false,
+            show_column_picker: false,
             command_query: String::new(),
             command_cursor: 0,
             show_result_details: false,
+        }
+    }
+
+    pub fn visible_result_columns(&self) -> Vec<usize> {
+        self.result_column_visibility
+            .iter()
+            .enumerate()
+            .filter_map(|(index, visible)| visible.then_some(index))
+            .collect()
+    }
+
+    pub fn column_visible(&self, column: usize) -> bool {
+        self.result_column_visibility
+            .get(column)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn toggle_column(&mut self) {
+        let column = self.column_picker_cursor;
+        if self.result_column_visibility[column] && self.visible_result_columns().len() == 1 {
+            self.toast_warn("At least one result column must remain visible");
+            return;
+        }
+        self.result_column_visibility[column] = !self.result_column_visibility[column];
+        if !self.column_visible(self.sort_col) {
+            self.sort_col = 0;
+            self.sort_asc = true;
         }
     }
 
@@ -712,16 +753,17 @@ impl App {
                 Err(e) => return Err(e),
             }
         };
-        writeln!(f, "rank\tip\tok\tfail\tavg\tp50\tp90\tp95\tmax")?;
+        writeln!(f, "rank\tip\tprotocol\tok\tfail\tavg\tp50\tp90\tp95\tmax")?;
         for (i, r) in ranked_export_results(&self.results, self.config.top)
             .into_iter()
             .enumerate()
         {
             writeln!(
                 f,
-                "{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}",
+                "{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}",
                 i + 1,
                 r.ip,
+                r.protocol,
                 r.ok,
                 r.fail,
                 r.avg,
@@ -1076,6 +1118,19 @@ impl App {
             return;
         }
 
+        if self.show_column_picker {
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') => self.show_column_picker = false,
+                KeyCode::Up => {
+                    self.column_picker_cursor = self.column_picker_cursor.saturating_sub(1)
+                }
+                KeyCode::Down => self.column_picker_cursor = (self.column_picker_cursor + 1).min(9),
+                KeyCode::Char(' ') | KeyCode::Enter => self.toggle_column(),
+                _ => {}
+            }
+            return;
+        }
+
         if self.show_command_palette {
             match code {
                 KeyCode::Esc => self.close_command_palette(),
@@ -1211,6 +1266,12 @@ impl App {
             Action::CloseDetails => self.show_result_details = false,
             Action::OpenHelp => self.show_help = true,
             Action::OpenCommandPalette => self.open_command_palette(),
+            Action::ConfigureColumns => {
+                if self.screen == Screen::Scanning {
+                    self.show_column_picker = true;
+                    self.column_picker_cursor = self.column_picker_cursor.min(9);
+                }
+            }
             Action::Confirm => {
                 if self.confirm_quit {
                     self.should_quit = true;
@@ -1238,6 +1299,7 @@ impl App {
         self.table_inner = None;
         self.table_header = None;
         self.table_col_bounds.clear();
+        self.table_col_indices.clear();
         self.speed_list_inner = None;
 
         match self.screen {
@@ -1263,6 +1325,40 @@ impl App {
         if self.show_command_palette {
             self.render_command_palette(frame, frame.area());
         }
+        if self.show_column_picker {
+            self.render_column_picker(frame, frame.area());
+        }
+    }
+
+    fn render_column_picker(&self, frame: &mut Frame, area: Rect) {
+        let popup = centered(area, 56, 46);
+        let inner = widgets::modal(frame, area, popup, " Result columns ");
+        let lines = dashboard::RESULT_COLUMNS
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let marker = if self.column_visible(index) {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
+                let style = if index == self.column_picker_cursor {
+                    theme::row_selected_style()
+                } else {
+                    ratatui::style::Style::default()
+                };
+                Line::from(format!(" {marker} {name:<8}")).style(style)
+            })
+            .collect::<Vec<_>>();
+        let body = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(2)])
+            .split(inner);
+        frame.render_widget(Paragraph::new(lines), body[0]);
+        frame.render_widget(
+            Paragraph::new("↑/↓ move • Space toggle • Esc close").style(theme::hint_style()),
+            body[1],
+        );
     }
 
     fn render_command_palette(&mut self, frame: &mut Frame, area: Rect) {
@@ -1392,6 +1488,7 @@ impl App {
 
     fn handle_scan_key(&mut self, code: KeyCode) {
         match code {
+            KeyCode::Char('v') => self.activate_action(Action::ConfigureColumns),
             KeyCode::Char('p') => self.activate_action(Action::PauseResume),
             KeyCode::Char('e') => self.activate_action(Action::Export),
             KeyCode::Char('t') if self.scan_complete => self.activate_action(Action::SpeedTest),
@@ -1577,7 +1674,7 @@ impl App {
             return;
         }
 
-        if self.show_help || self.edit_field.is_some() || self.custom_input_mode {
+        if self.show_help || self.custom_input_mode {
             return;
         }
         match m.kind {
@@ -1636,9 +1733,12 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 let p = (m.column, m.row);
                 // Buttons take priority.
-                for (rect, action) in &self.buttons {
-                    if point_in(*rect, p) {
-                        self.activate_button(*action);
+                for (rect, action) in self.buttons.clone() {
+                    if point_in(rect, p) {
+                        if self.edit_field.is_some() && !self.commit_edit() {
+                            return;
+                        }
+                        self.activate_button(action);
                         return;
                     }
                 }
@@ -1659,9 +1759,12 @@ impl App {
                         }
                     } else if self.wizard_step == WizardStep::Settings {
                         if let Some(inner) = self.settings_inner {
-                            if point_in(inner, p) && self.edit_field.is_none() {
+                            if point_in(inner, p) {
                                 let row = (m.row - inner.y) as usize;
                                 if let Some(Some(idx)) = self.settings_row_map.get(row).copied() {
+                                    if self.edit_field.is_some() && !self.commit_edit() {
+                                        return;
+                                    }
                                     self.cursor = idx;
                                     self.start_edit(idx);
                                 }
@@ -1675,7 +1778,8 @@ impl App {
                                 if col == self.sort_col {
                                     self.sort_asc = !self.sort_asc;
                                 } else {
-                                    self.sort_col = col;
+                                    self.sort_col =
+                                        self.table_col_indices.get(col).copied().unwrap_or(0);
                                     self.sort_asc = true;
                                 }
                             }
@@ -1795,6 +1899,7 @@ mod tests {
     fn result(ip: &str, fail: usize, p95: f64) -> ProbeResult {
         ProbeResult {
             ip: ip.to_string(),
+            protocol: "h2".to_string(),
             ok: 1,
             fail,
             avg: p95,

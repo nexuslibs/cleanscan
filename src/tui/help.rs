@@ -64,7 +64,8 @@ fn wizard_lines(step: WizardStep) -> Vec<Line<'static>> {
             )));
             v.push(key("Enter", "Edit the highlighted parameter"));
             v.push(key("← / →", "Move the text cursor while editing"));
-            v.push(key("↑ / ↓", "Step a numeric value up / down"));
+            v.push(key("↑ / ↓", "Move between parameters"));
+            v.push(key("↑ / ↓ while editing", "Step a numeric value up / down"));
             v.push(key("Backspace / Del", "Delete a character"));
             v.push(key("Enter", "Confirm edit   Esc: cancel edit"));
         }

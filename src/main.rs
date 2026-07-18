@@ -145,7 +145,7 @@ fn cli_mode(config: AppConfig, cidr: Vec<String>, ips: Option<String>) -> Result
             .then_with(|| a.avg.partial_cmp(&b.avg).unwrap())
     });
 
-    println!("rank\tip\tok\tfail\tavg\tp50\tp90\tp95\tmax\tsamples");
+    println!("rank\tip\tprotocol\tok\tfail\tavg\tp50\tp90\tp95\tmax\tsamples");
 
     for (i, r) in results.iter().take(config.top).enumerate() {
         let samples = r
@@ -156,9 +156,10 @@ fn cli_mode(config: AppConfig, cidr: Vec<String>, ips: Option<String>) -> Result
             .join(",");
 
         println!(
-            "{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}",
             i + 1,
             r.ip,
+            r.protocol,
             r.ok,
             r.fail,
             r.avg,

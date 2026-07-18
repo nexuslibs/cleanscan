@@ -129,7 +129,8 @@ Navigation mirrors the selection screen:
 | Key            | Action                                  |
 |----------------|-----------------------------------------|
 | `Tab` / `Shift+Tab` | Move focus between controls |
-| `↑` / `↓` | Increase/decrease the highlighted numeric parameter immediately |
+| `↑` / `↓` | Move through the parameters |
+| `j` / `k` | Move through the parameters |
 | `Enter`        | Edit or activate the highlighted parameter |
 | `char`         | While editing, append to the value      |
 | `Backspace`    | While editing, delete a character       |
