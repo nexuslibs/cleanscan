@@ -82,6 +82,8 @@ pub struct App {
     pub message_time: Option<Instant>,
     /// Scroll offset into the results table.
     pub scroll: usize,
+    /// Scroll offset into the wizard CIDR list.
+    pub ranges_scroll: usize,
     /// Currently sorted column index in the results table (natural order = 0).
     pub sort_col: usize,
     pub sort_asc: bool,
@@ -156,6 +158,7 @@ impl App {
             message: None,
             message_time: None,
             scroll: 0,
+            ranges_scroll: 0,
             sort_col: 0,
             sort_asc: true,
             start_time: Instant::now(),
@@ -269,7 +272,14 @@ impl App {
     pub fn sorted_results(&self) -> Vec<&ProbeResult> {
         let mut v: Vec<&ProbeResult> = self.results.iter().collect();
         if self.sort_col == 0 {
-            v.sort_by(|a, b| Self::natural_cmp(a, b));
+            v.sort_by(|a, b| {
+                let ord = Self::natural_cmp(a, b);
+                if self.sort_asc {
+                    ord
+                } else {
+                    ord.reverse()
+                }
+            });
             return v;
         }
         let cmp = |a: &&ProbeResult, b: &&ProbeResult| -> std::cmp::Ordering {
@@ -342,8 +352,24 @@ impl App {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let filename = format!("cleanscan_{ts}.tsv");
-        let mut f = fs::File::create(&filename)?;
+        let base = format!("cleanscan_{ts}");
+        let mut suffix = 0usize;
+        let (filename, mut f) = loop {
+            let candidate = if suffix == 0 {
+                format!("{base}.tsv")
+            } else {
+                format!("{base}_{suffix}.tsv")
+            };
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => break (candidate, file),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => suffix += 1,
+                Err(e) => return Err(e),
+            }
+        };
         writeln!(f, "rank\tip\tok\tfail\tavg\tp50\tp90\tp95\tmax")?;
         for (i, r) in ranked_export_results(&self.results, self.config.top)
             .into_iter()
@@ -426,31 +452,33 @@ pub fn run_tui(
     let _guard = RestoreGuard;
     let mut app = App::new((*config_arc).clone(), has_cli_targets, paused.clone());
 
-    let spawn_scanner =
-        |targets: Vec<String>, scan_config: Arc<AppConfig>| -> std::thread::JoinHandle<()> {
-            let scanner_config = scan_config;
-            let scanner_paused = paused.clone();
-            let scanner_cancel = cancel.clone();
-            let scanner_tx = tx.clone();
-            std::thread::spawn(move || {
-                let rt = match tokio::runtime::Runtime::new() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("failed to create tokio runtime: {e}");
-                        return;
-                    }
-                };
-                rt.block_on(crate::scanner::run_scan(
-                    targets,
-                    scanner_config,
-                    scanner_tx,
-                    scanner_cancel,
-                    scanner_paused,
-                ));
-            })
-        };
+    let spawn_scanner = |targets: Vec<String>,
+                         scan_config: Arc<AppConfig>|
+     -> std::thread::JoinHandle<Result<(), String>> {
+        let scanner_config = scan_config;
+        let scanner_paused = paused.clone();
+        let scanner_cancel = cancel.clone();
+        let scanner_tx = tx.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("failed to create tokio runtime: {e}");
+                    return Err(format!("failed to create tokio runtime: {e}"));
+                }
+            };
+            rt.block_on(crate::scanner::run_scan(
+                targets,
+                scanner_config,
+                scanner_tx,
+                scanner_cancel,
+                scanner_paused,
+            ));
+            Ok(())
+        })
+    };
 
-    let mut scanner: Option<std::thread::JoinHandle<()>> = None;
+    let mut scanner: Option<std::thread::JoinHandle<Result<(), String>>> = None;
 
     // CLI-provided targets start scanning immediately (legacy behavior).
     if has_cli_targets {
@@ -461,44 +489,45 @@ pub fn run_tui(
     }
 
     // Launch a scan from the wizard's (possibly edited) configuration.
-    let start_wizard_scan = |app: &mut App,
-                             scanner: &mut Option<std::thread::JoinHandle<()>>,
-                             spawn_scanner: &dyn Fn(
-        Vec<String>,
-        Arc<AppConfig>,
-    ) -> std::thread::JoinHandle<()>| {
-        let cidrs: Vec<String> = app
-            .cidr_candidates
-            .iter()
-            .filter(|e| e.selected)
-            .map(|e| e.cidr.clone())
-            .collect();
-        if cidrs.is_empty() {
-            app.toast("Select at least one CIDR (space) before starting");
-            return;
-        }
-        match crate::scanner::collect_from_cidrs(&cidrs, app.config.sample_per_cidr) {
-            Ok(targets) => {
-                let total = targets.len();
-                let scan_config = Arc::new(AppConfig {
-                    host: app.config.host.clone(),
-                    path: app.config.path.clone(),
-                    custom_cidrs: app.config.custom_cidrs.clone(),
-                    selected_cidrs: app.config.selected_cidrs.clone(),
-                    selected_cidrs_persisted: app.config.selected_cidrs_persisted,
-                    sample_per_cidr: app.config.sample_per_cidr,
-                    probes: app.config.probes,
-                    concurrency: app.config.concurrency,
-                    timeout_ms: app.config.timeout_ms,
-                    connect_timeout_ms: app.config.connect_timeout_ms,
-                    top: app.config.top,
-                });
-                *scanner = Some(spawn_scanner(targets, scan_config));
-                app.begin_scan(total);
+    let start_wizard_scan =
+        |app: &mut App,
+         scanner: &mut Option<std::thread::JoinHandle<Result<(), String>>>,
+         spawn_scanner: &dyn Fn(
+            Vec<String>,
+            Arc<AppConfig>,
+        ) -> std::thread::JoinHandle<Result<(), String>>| {
+            let cidrs: Vec<String> = app
+                .cidr_candidates
+                .iter()
+                .filter(|e| e.selected)
+                .map(|e| e.cidr.clone())
+                .collect();
+            if cidrs.is_empty() {
+                app.toast("Select at least one CIDR (space) before starting");
+                return;
             }
-            Err(e) => app.toast(format!("Error: {e}")),
-        }
-    };
+            match crate::scanner::collect_from_cidrs(&cidrs, app.config.sample_per_cidr) {
+                Ok(targets) => {
+                    let total = targets.len();
+                    let scan_config = Arc::new(AppConfig {
+                        host: app.config.host.clone(),
+                        path: app.config.path.clone(),
+                        custom_cidrs: app.config.custom_cidrs.clone(),
+                        selected_cidrs: app.config.selected_cidrs.clone(),
+                        selected_cidrs_persisted: app.config.selected_cidrs_persisted,
+                        sample_per_cidr: app.config.sample_per_cidr,
+                        probes: app.config.probes,
+                        concurrency: app.config.concurrency,
+                        timeout_ms: app.config.timeout_ms,
+                        connect_timeout_ms: app.config.connect_timeout_ms,
+                        top: app.config.top,
+                    });
+                    *scanner = Some(spawn_scanner(targets, scan_config));
+                    app.begin_scan(total);
+                }
+                Err(e) => app.toast(format!("Error: {e}")),
+            }
+        };
 
     let mut run = || -> anyhow::Result<()> {
         loop {
@@ -510,7 +539,19 @@ pub fn run_tui(
                 while let Ok(r) = rx.try_recv() {
                     app.add_result(r);
                 }
-                app.scan_complete = true;
+                if let Some(handle) = scanner.take() {
+                    match handle.join() {
+                        Ok(Ok(())) => app.scan_complete = true,
+                        Ok(Err(e)) => {
+                            app.scan_complete = true;
+                            app.toast(format!("Scan failed: {e}"));
+                        }
+                        Err(_) => {
+                            app.scan_complete = true;
+                            app.toast("Scan worker panicked");
+                        }
+                    }
+                }
             }
 
             app.tick_message();
@@ -559,6 +600,7 @@ impl App {
         // Global keys work on every screen.
         match code {
             KeyCode::Char('?') => {
+                self.confirm_quit = false;
                 self.show_help = !self.show_help;
                 return;
             }
@@ -581,6 +623,7 @@ impl App {
         if self.show_help {
             // Any key closes the help overlay.
             self.show_help = false;
+            self.confirm_quit = false;
             return;
         }
 
@@ -641,6 +684,9 @@ impl App {
 
     fn handle_mouse(&mut self, m: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
+        if self.show_help || self.edit_field.is_some() || self.custom_input_mode {
+            return;
+        }
         match m.kind {
             MouseEventKind::ScrollUp => {
                 if self.screen == Screen::Scanning {
@@ -686,7 +732,7 @@ impl App {
                     if self.wizard_step == WizardStep::Ranges {
                         if let Some(inner) = self.ranges_inner {
                             if point_in(inner, p) {
-                                let idx = (m.row - inner.y) as usize;
+                                let idx = self.ranges_scroll + (m.row - inner.y) as usize;
                                 if idx < self.cidr_candidates.len() {
                                     self.cursor = idx;
                                     if !self.custom_input_mode {

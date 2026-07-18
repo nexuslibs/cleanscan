@@ -6,7 +6,8 @@
 #   curl -sSfL https://raw.githubusercontent.com/nexuslibs/cleanscan/main/install.sh | bash
 #
 # Options (environment variables):
-#   CLEANASCAN_VERSION   tag to install, e.g. v1.0.0 (default: latest)
+#   CLEANSCAN_VERSION     tag to install, e.g. v1.0.0 (default: latest)
+#   CLEANASCAN_VERSION    deprecated alias for CLEANSCAN_VERSION
 #   INSTALL_DIR          where to install (default: /usr/local/bin or ~/.local/bin)
 #   BIN_DIR              alias for INSTALL_DIR
 
@@ -14,7 +15,7 @@ set -euo pipefail
 
 REPO="nexuslibs/cleanscan"
 BINARY="cleanscan"
-VERSION="${CLEANASCAN_VERSION:-latest}"
+VERSION="${CLEANSCAN_VERSION:-${CLEANASCAN_VERSION:-latest}}"
 
 err()  { echo "error: $*" >&2; exit 1; }
 info() { echo "==> $*"; }

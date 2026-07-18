@@ -24,6 +24,13 @@ pub enum SettingField {
     Top,
 }
 
+const MAX_SAMPLE_PER_CIDR: usize = 10_000;
+const MAX_PROBES: usize = 1_000;
+const MAX_CONCURRENCY: usize = 10_000;
+const MAX_TIMEOUT_MS: u64 = 600_000;
+const MAX_CONNECT_TIMEOUT_MS: u64 = 600_000;
+const MAX_TOP: usize = 10_000;
+
 impl SettingField {
     /// All settings fields in display order.
     pub const ALL: [SettingField; 8] = [
@@ -90,6 +97,18 @@ impl SettingField {
         }
     }
 
+    fn max_value(&self) -> i64 {
+        match self {
+            SettingField::SamplePerCidr => MAX_SAMPLE_PER_CIDR as i64,
+            SettingField::Probes => MAX_PROBES as i64,
+            SettingField::Concurrency => MAX_CONCURRENCY as i64,
+            SettingField::TimeoutMs => MAX_TIMEOUT_MS as i64,
+            SettingField::ConnectTimeoutMs => MAX_CONNECT_TIMEOUT_MS as i64,
+            SettingField::Top => MAX_TOP as i64,
+            SettingField::Host | SettingField::Path => i64::MAX,
+        }
+    }
+
     /// Parse `raw` and apply it to `args`. Returns an error message on failure.
     pub fn apply(&self, raw: &str, args: &mut AppConfig) -> Result<(), String> {
         let raw = raw.trim();
@@ -113,8 +132,8 @@ impl SettingField {
                 let v = raw
                     .parse::<usize>()
                     .map_err(|_| "invalid number".to_string())?;
-                if v == 0 {
-                    return Err("must be at least 1".to_string());
+                if !(1..=MAX_SAMPLE_PER_CIDR).contains(&v) {
+                    return Err(format!("must be between 1 and {MAX_SAMPLE_PER_CIDR}"));
                 }
                 args.sample_per_cidr = v;
             }
@@ -122,8 +141,8 @@ impl SettingField {
                 let v = raw
                     .parse::<usize>()
                     .map_err(|_| "invalid number".to_string())?;
-                if v == 0 {
-                    return Err("must be at least 1".to_string());
+                if !(1..=MAX_PROBES).contains(&v) {
+                    return Err(format!("must be between 1 and {MAX_PROBES}"));
                 }
                 args.probes = v;
             }
@@ -131,8 +150,8 @@ impl SettingField {
                 let v = raw
                     .parse::<usize>()
                     .map_err(|_| "invalid number".to_string())?;
-                if v == 0 {
-                    return Err("must be at least 1".to_string());
+                if !(1..=MAX_CONCURRENCY).contains(&v) {
+                    return Err(format!("must be between 1 and {MAX_CONCURRENCY}"));
                 }
                 args.concurrency = v;
             }
@@ -140,8 +159,8 @@ impl SettingField {
                 let v = raw
                     .parse::<u64>()
                     .map_err(|_| "invalid number".to_string())?;
-                if v == 0 {
-                    return Err("must be at least 1".to_string());
+                if !(1..=MAX_TIMEOUT_MS).contains(&v) {
+                    return Err(format!("must be between 1 and {MAX_TIMEOUT_MS}"));
                 }
                 args.timeout_ms = v;
             }
@@ -149,8 +168,8 @@ impl SettingField {
                 let v = raw
                     .parse::<u64>()
                     .map_err(|_| "invalid number".to_string())?;
-                if v == 0 {
-                    return Err("must be at least 1".to_string());
+                if !(1..=MAX_CONNECT_TIMEOUT_MS).contains(&v) {
+                    return Err(format!("must be between 1 and {MAX_CONNECT_TIMEOUT_MS}"));
                 }
                 args.connect_timeout_ms = v;
             }
@@ -158,8 +177,8 @@ impl SettingField {
                 let v = raw
                     .parse::<usize>()
                     .map_err(|_| "invalid number".to_string())?;
-                if v == 0 {
-                    return Err("must be at least 1".to_string());
+                if !(1..=MAX_TOP).contains(&v) {
+                    return Err(format!("must be between 1 and {MAX_TOP}"));
                 }
                 args.top = v;
             }
@@ -236,10 +255,22 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
     let inner = list_block.inner(main_layout[0]);
     app.ranges_inner = Some(inner);
 
+    let visible = inner.height as usize;
+    let max_scroll = app.cidr_candidates.len().saturating_sub(visible);
+    if app.cursor < app.ranges_scroll {
+        app.ranges_scroll = app.cursor;
+    } else if app.cursor >= app.ranges_scroll.saturating_add(visible) {
+        app.ranges_scroll = app.cursor + 1 - visible;
+    }
+    app.ranges_scroll = app.ranges_scroll.min(max_scroll);
+    let start = app.ranges_scroll;
+
     let lines: Vec<Line> = app
         .cidr_candidates
         .iter()
         .enumerate()
+        .skip(start)
+        .take(visible)
         .map(|(i, e)| {
             let mark = if e.selected { "● [x]" } else { "○ [ ]" };
             let cursor = if i == app.cursor { "› " } else { "  " };
@@ -259,8 +290,8 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
 
     // Right Side Info Panel
     let selected_count = app.cidr_candidates.iter().filter(|e| e.selected).count();
-    let total_ips = selected_count * app.config.sample_per_cidr;
-    let total_requests = total_ips * app.config.probes;
+    let total_ips = selected_count.saturating_mul(app.config.sample_per_cidr);
+    let total_requests = total_ips.saturating_mul(app.config.probes);
 
     let info_text = vec![
         Line::from(vec![Span::styled(" RANGE SUMMARY ", theme::header_style())]),
@@ -490,8 +521,8 @@ fn render_review(app: &App, frame: &mut Frame, area: Rect) {
         .collect();
 
     let selected_count = selected.len();
-    let total_ips = selected_count * app.config.sample_per_cidr;
-    let total_probes = total_ips * app.config.probes;
+    let total_ips = selected_count.saturating_mul(app.config.sample_per_cidr);
+    let total_probes = total_ips.saturating_mul(app.config.probes);
 
     // Ideal scan duration estimate
     let ideal_seconds = (total_probes as f64 / app.config.concurrency as f64)
@@ -511,7 +542,7 @@ fn render_review(app: &App, frame: &mut Frame, area: Rect) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
-    let summary_left = vec![
+    let mut summary_left = vec![
         Line::from(vec![Span::styled(
             " TARGET SPECIFICATION ",
             theme::header_style(),
@@ -530,20 +561,18 @@ fn render_review(app: &App, frame: &mut Frame, area: Rect) {
             Span::raw(format!("{} selected", selected_count)),
         ]),
         Line::from(""),
-        Line::from(
-            selected
-                .iter()
-                .take(8)
-                .map(|c| format!("  • {c}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
-        Line::from(if selected_count > 8 {
-            format!("  ... and {} more", selected_count - 8)
-        } else {
-            "".to_string()
-        }),
     ];
+    summary_left.extend(
+        selected
+            .iter()
+            .take(8)
+            .map(|c| Line::from(format!("  • {c}"))),
+    );
+    summary_left.push(Line::from(if selected_count > 8 {
+        format!("  ... and {} more", selected_count - 8)
+    } else {
+        "".to_string()
+    }));
 
     let summary_right = vec![
         Line::from(vec![Span::styled(
@@ -681,14 +710,26 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
                 }
                 match crate::scanner::cidr_valid(&s) {
                     Ok(_) => {
-                        app.cidr_candidates.push(crate::tui::CidrEntry {
-                            cidr: s.clone(),
-                            selected: true,
-                        });
+                        if let Some((idx, entry)) = app
+                            .cidr_candidates
+                            .iter_mut()
+                            .enumerate()
+                            .find(|(_, entry)| entry.cidr == s)
+                        {
+                            entry.selected = true;
+                            app.cursor = idx;
+                            app.toast(format!("CIDR {s} already exists; selected it"));
+                        } else {
+                            app.cidr_candidates.push(crate::tui::CidrEntry {
+                                cidr: s.clone(),
+                                selected: true,
+                            });
+                            app.cursor = app.cidr_candidates.len() - 1;
+                            app.toast(format!("Added {s}"));
+                        }
                         app.input_buffer.clear();
                         app.edit_caret = 0;
                         app.custom_input_mode = false;
-                        app.toast(format!("Added {s}"));
                         app.save_config();
                     }
                     Err(e) => app.toast(format!("Invalid CIDR '{s}': {e}")),
@@ -813,7 +854,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
                     -field.step()
                 };
                 if let Ok(v) = app.edit_buffer.parse::<i64>() {
-                    let nv = (v + delta).max(1);
+                    let nv = v.saturating_add(delta).clamp(1, field.max_value());
                     app.edit_buffer = nv.to_string();
                     app.edit_caret = app.edit_buffer.len();
                 }

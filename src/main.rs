@@ -96,6 +96,9 @@ fn main() -> Result<()> {
 }
 
 fn normalize_config(config: &mut AppConfig) {
+    if config.sample_per_cidr == 0 {
+        config.sample_per_cidr = 1;
+    }
     if config.concurrency == 0 {
         config.concurrency = 1;
     }
@@ -169,13 +172,15 @@ mod tests {
     use crate::config::AppConfig;
 
     #[test]
-    fn zero_probe_and_concurrency_values_are_normalized() {
+    fn zero_numeric_values_are_normalized() {
         let mut config = AppConfig {
+            sample_per_cidr: 0,
             probes: 0,
             concurrency: 0,
             ..AppConfig::default()
         };
         normalize_config(&mut config);
+        assert_eq!(config.sample_per_cidr, 1);
         assert_eq!(config.probes, 1);
         assert_eq!(config.concurrency, 1);
     }

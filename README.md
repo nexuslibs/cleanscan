@@ -16,8 +16,11 @@ the best Cloudflare edge IPs to reach a given origin host.
   the `--cli` flag.
 - Custom DNS resolution per IP, HTTP/2 adaptive windows, configurable
   concurrency, probes, and timeouts.
+- Persistent TUI settings, including selected CIDR ranges and scan parameters.
 
 ## Build
+
+Install the Rust toolchain first, then run:
 
 ```sh
 cargo build --release
@@ -28,8 +31,11 @@ cargo build --release
 
 ## Install
 
-Download a prebuilt static binary (Linux x86_64 / aarch64, macOS) from the
-latest GitHub release:
+Download a prebuilt binary from a GitHub release. Linux artifacts are
+statically linked musl binaries; macOS artifacts are native binaries for Intel
+and Apple Silicon.
+
+Once a release has been published, install the latest version with:
 
 ```sh
 bash -c 'curl -sSfL https://raw.githubusercontent.com/nexuslibs/cleanscan/main/install.sh | bash'
@@ -45,7 +51,7 @@ Options (environment variables):
 
 ```sh
 # Install a specific version
-CLEANASCAN_VERSION=v1.0.0 bash -c 'curl -sSfL https://raw.githubusercontent.com/nexuslibs/cleanscan/main/install.sh | bash'
+CLEANSCAN_VERSION=v1.0.0 bash -c 'curl -sSfL https://raw.githubusercontent.com/nexuslibs/cleanscan/main/install.sh | bash'
 
 # Install to a custom directory
 INSTALL_DIR=/opt/bin bash -c 'curl -sSfL https://raw.githubusercontent.com/nexuslibs/cleanscan/main/install.sh | bash'
@@ -57,7 +63,7 @@ INSTALL_DIR=/opt/bin bash -c 'curl -sSfL https://raw.githubusercontent.com/nexus
 # TUI mode (default)
 cleanscan --cidr 188.114.96.0/20 --cidr 104.16.0.0/13
 
-# Provide a file of IPs / CIDRs (one per line, # comments allowed)
+# Provide a file of IPs / CIDRs (one per line; blank lines and lines beginning with # are ignored)
 cleanscan --ips ips.txt
 
 # Pipe-friendly tab-separated output
@@ -68,7 +74,8 @@ cleanscan --cli --cidr 188.114.96.0/20 --top 20
 
 When `cleanscan` is run with no `--cidr` / `--ips`, it opens a CIDR
 selection screen first. Built-in Cloudflare ranges are listed and pre-selected;
-toggle the ones you want and press `Enter` to start.
+toggle the ones you want and press `Enter` to start. When targets are supplied
+on the command line, the scan starts directly with those targets.
 
 **Selection screen**
 
@@ -88,8 +95,8 @@ While typing a custom CIDR (`a`), `char` appends, `Backspace` deletes,
 
 **Settings screen**
 
-Reached from the selection screen with `c`. Every scan parameter exposed by
-the CLI flags can be edited here. Navigation mirrors the selection screen:
+Reached from the selection screen with `c`. Scan parameters can be edited here.
+Navigation mirrors the selection screen:
 
 | Key            | Action                                  |
 |----------------|-----------------------------------------|
@@ -107,6 +114,8 @@ counterparts: `Host` (`--host`), `Path` (`--path`), `Sample per CIDR`
 (`--sample-per-cidr`), `Probes` (`--probes`), `Concurrency` (`--concurrency`),
 `Timeout (ms)` (`--timeout-ms`), `Connect timeout (ms)` (`--connect-timeout-ms`),
 and `Top results` (`--top`).
+Target-source flags such as `--cidr` and `--ips` are selected before launching
+the TUI and are not edited in this screen.
 
 **Scanning screen**
 
@@ -134,9 +143,36 @@ and `Top results` (`--top`).
 
 ## Output
 
-Results are ranked by: failure count (ascending), then `p95`, `max`, and `avg`
-latency (all ascending). Each row reports `ok`/`fail` counts and `avg`, `p50`,
-`p90`, `p95`, and `max` latency in seconds.
+CLI results are ranked by failure count (ascending), then `p95`, `max`, and
+`avg` latency (all ascending). Each row reports `ok`/`fail` counts and `avg`,
+`p50`, `p90`, `p95`, and `max` latency in seconds, followed by individual
+successful probe samples in the `samples` column. Only the top `N` rows are
+printed, where `N` is controlled by `--top`.
+
+The TUI displays the same latency statistics. Its save action writes the top
+successful results (`fail = 0`) to a timestamped
+`cleanscan_<timestamp>.tsv` file in the current directory.
+
+CIDR ranges are sampled randomly, so overlapping samples may produce fewer
+unique targets than `sample-per-cidr` suggests. Each probe is an HTTPS request
+to the configured host and path, using the candidate IP for the connection
+while retaining the hostname for TLS SNI and the Host header.
+
+## Configuration
+
+The TUI saves settings automatically so the next run can reuse the previous
+host, path, scan parameters, custom CIDRs, and selected ranges. The file is
+stored at the platform-specific user configuration directory under
+`cleanscan/config.json`. Command-line options override saved settings for that
+run.
+
+## Development
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
 
 ## License
 

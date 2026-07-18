@@ -222,7 +222,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
             Span::styled(format!("{exc}"), theme::hint_style()),
         ]),
         Line::from(vec![
-            Span::styled(" 80-150 : ", theme::warn_style()),
+            Span::styled("150–200ms: ", theme::warn_style()),
             Span::raw(format!("{:<8} ", make_bar(gd))),
             Span::styled(format!("{gd}"), theme::hint_style()),
         ]),
@@ -232,7 +232,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
             Span::styled(format!("{fr}"), theme::hint_style()),
         ]),
         Line::from(vec![
-            Span::styled("  >250  : ", theme::bad_style()),
+            Span::styled("  ≥250ms: ", theme::bad_style()),
             Span::raw(format!("{:<8} ", make_bar(pr))),
             Span::styled(format!("{pr}"), theme::hint_style()),
         ]),
@@ -323,7 +323,7 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
             let rank = start + i + 1;
 
             // Highlight rank 1 (fastest IP) to make it look premium
-            let is_first = rank == 1;
+            let is_first = app.sort_col == 4 && app.sort_asc && rank == 1;
             let (ip_text, rank_text) = if is_first {
                 (format!("★ {}", r.ip), format!(" {rank}"))
             } else {
