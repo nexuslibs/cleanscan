@@ -760,12 +760,12 @@ fn render_decision_panel(app: &App, frame: &mut Frame, area: Rect) {
     } else {
         0.0
     };
-    let ranked = app.sorted_results();
-    let candidates = ranked
+    let mut candidates = app
+        .results
         .iter()
-        .copied()
         .filter(|result| result.ok > 0)
         .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| App::natural_cmp(a, b));
     let mut lines = vec![Line::from(vec![
         Span::styled(format!("READY {ready}  "), theme::good_style()),
         Span::styled(format!("DEGRADED {degraded}  "), theme::warn_style()),

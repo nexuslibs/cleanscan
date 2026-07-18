@@ -73,7 +73,7 @@ pub struct Args {
     #[arg(long)]
     pub output: Option<String>,
 
-    /// Minimum aggregate probe success rate required for a healthy run
+    /// Minimum per-target probe success rate required for a healthy run
     #[arg(long)]
     pub min_success_rate: Option<f64>,
 
@@ -131,18 +131,26 @@ fn main() -> Result<()> {
         }
     }
 
-    if config.host.is_empty() && (args.cli || args.ips.is_some() || !args.cidr.is_empty()) {
+    if args.targets_file.is_some() && (args.ips.is_some() || !args.cidr.is_empty()) {
+        anyhow::bail!("--targets-file cannot be combined with --ips or --cidr");
+    }
+    if !args.cli && args.targets_file.is_some() {
+        anyhow::bail!("--targets-file requires --cli");
+    }
+    if config.host.is_empty()
+        && (args.cli || args.ips.is_some() || args.targets_file.is_some() || !args.cidr.is_empty())
+    {
         anyhow::bail!(
             "no host configured — pass --host <domain> or set a host in the TUI settings"
         );
     }
 
     if args.cli {
-        let ips = args.targets_file.or(args.ips);
         cli_mode(
             config,
             args.cidr,
-            ips,
+            args.ips,
+            args.targets_file,
             &args.format,
             args.output.as_deref(),
             args.min_success_rate,
@@ -172,6 +180,7 @@ fn cli_mode(
     config: AppConfig,
     cidr: Vec<String>,
     ips: Option<String>,
+    targets_file: Option<String>,
     format: &str,
     output: Option<&str>,
     min_success_rate: Option<f64>,
@@ -179,7 +188,11 @@ fn cli_mode(
     fail_if_no_healthy_target: bool,
     seed: Option<u64>,
 ) -> Result<()> {
-    let targets = scanner::collect_targets_with_optional_seed(&config, &cidr, &ips, seed)?;
+    let targets = if let Some(path) = targets_file {
+        scanner::load_ip_manifest(&path)?
+    } else {
+        scanner::collect_targets_with_optional_seed(&config, &cidr, &ips, seed)?
+    };
     let total = targets.len();
 
     eprintln!(

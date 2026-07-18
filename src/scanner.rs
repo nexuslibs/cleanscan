@@ -174,6 +174,25 @@ pub fn collect_targets_with_optional_seed(
     collect_targets_with_seed(config, cli_cidrs, cli_ips, seed)
 }
 
+/// Load an exact manifest containing one IP address per line.
+pub fn load_ip_manifest(path: &str) -> Result<Vec<String>> {
+    let text = fs::read_to_string(path)?;
+    let mut targets = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let ip = IpAddr::from_str(line)
+            .map_err(|_| anyhow!("invalid IP in targets manifest: {}", line))?;
+        targets.push(ip.to_string());
+    }
+    if targets.is_empty() {
+        return Err(anyhow!("targets manifest contains no IP addresses"));
+    }
+    Ok(targets)
+}
+
 pub fn collect_targets_with_seed(
     config: &AppConfig,
     cli_cidrs: &[String],
@@ -280,10 +299,6 @@ async fn probe_once(client: &Client, url: &str) -> Result<(f64, String), String>
         reqwest::Version::HTTP_3 => "h3",
         _ => "unknown",
     };
-
-    resp.bytes()
-        .await
-        .map_err(|_| "response body failure".to_string())?;
 
     Ok((start.elapsed().as_secs_f64(), protocol.to_string()))
 }

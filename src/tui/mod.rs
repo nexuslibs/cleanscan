@@ -666,10 +666,35 @@ impl App {
             self.toast_warn("No sampled targets available");
             return;
         }
-        let name = format!("cleanscan_targets_{}.txt", self.scan_seed);
-        match fs::write(&name, self.preview_targets.join("\n") + "\n") {
-            Ok(()) => self.toast_success(format!("Targets saved to {name}")),
-            Err(error) => self.toast_error(format!("Target save failed: {error}")),
+        let base = format!("cleanscan_targets_{}.txt", self.scan_seed);
+        let content = self.preview_targets.join("\n") + "\n";
+        let mut selected = base.clone();
+        let mut suffix = 1;
+        loop {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&selected)
+            {
+                Ok(mut file) => match file.write_all(content.as_bytes()) {
+                    Ok(()) => {
+                        self.toast_success(format!("Targets saved to {selected}"));
+                        break;
+                    }
+                    Err(error) => {
+                        self.toast_error(format!("Target save failed: {error}"));
+                        break;
+                    }
+                },
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    selected = format!("cleanscan_targets_{}_{}.txt", self.scan_seed, suffix);
+                    suffix += 1;
+                }
+                Err(error) => {
+                    self.toast_error(format!("Target save failed: {error}"));
+                    break;
+                }
+            }
         }
     }
 
@@ -2175,6 +2200,7 @@ impl App {
                                     if !self.custom_input_mode {
                                         self.cidr_candidates[idx].selected =
                                             !self.cidr_candidates[idx].selected;
+                                        self.invalidate_preview();
                                         self.save_config();
                                     }
                                 }
@@ -2438,6 +2464,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
         );
         app.begin_scan(3);
+        app.show_failures = true;
         let mut sampled = result("10.0.0.1", 0, 0.05);
         sampled.samples = vec![0.04, 0.06, 0.05, 0.08];
         app.add_result(sampled);

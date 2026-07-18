@@ -221,8 +221,9 @@ printed, where `N` is controlled by `--top`.
 
 Completed scans show a decision summary with READY, DEGRADED, and FAILED
 counts, a recommended target, backups, success rate, p95 latency, and
-confidence. The selected-IP details modal supports `1`–`4` / `Tab` tabs for
-overview, failure diagnostics, latency distribution, and speed context.
+confidence. The selected-IP details modal supports `1`–`5` / `Tab` tabs for
+overview, failure diagnostics, latency distribution, speed context, and
+latency map.
 
 The Review screen shows the random seed and exact deduplicated target count.
 Press `s` for a new sample or `c` to save the exact targets to

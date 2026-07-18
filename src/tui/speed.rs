@@ -475,11 +475,23 @@ fn render_results(app: &mut App, frame: &mut Frame, area: Rect) {
 fn format_measurement(value: Option<&crate::speed::SpeedMeasurement>) -> String {
     value
         .map(|measurement| {
+            let compact = |bytes_per_second: f64| {
+                let mbps = bytes_per_second * 8.0 / 1_000_000.0;
+                if mbps >= 1000.0 {
+                    format!("{:.1}k", mbps / 1000.0)
+                } else if mbps >= 100.0 {
+                    format!("{:.0}", mbps)
+                } else if mbps >= 10.0 {
+                    format!("{:.1}", mbps)
+                } else {
+                    format!("{:.2}", mbps)
+                }
+            };
             format!(
-                "{:.2} Mbps (p10 {:.2} / p90 {:.2})",
-                measurement.median_bytes_per_second * 8.0 / 1_000_000.0,
-                measurement.p10_bytes_per_second * 8.0 / 1_000_000.0,
-                measurement.p90_bytes_per_second * 8.0 / 1_000_000.0
+                "{}/{}/{}",
+                compact(measurement.median_bytes_per_second),
+                compact(measurement.p10_bytes_per_second),
+                compact(measurement.p90_bytes_per_second)
             )
         })
         .unwrap_or_else(|| "—".to_string())
