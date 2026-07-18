@@ -163,15 +163,23 @@ the TUI and are not edited in this screen.
 
 **Speed-test screen**
 
-After latency scanning completes, press `t` to select successful IPs. `Tab`
-moves focus through each control individually (the IP list, the three direction
-buttons, select-all/clear, and start/back), and `Enter` activates whichever
-control is focused. The currently chosen direction is always shown as a filled
-button so selection and focus never look alike. Shortcuts: `Space` toggles the
-highlighted IP, `a` / `x` select-all / clear, and `d` / `u` / `b` set the
-download / upload / both direction. Results report throughput in Mbps for each
-direction. Press `c` to copy the selected IP and `Esc` to return to the latency
-dashboard.
+After latency scanning completes, press `t` to select speed-test targets. The
+screen lists every scanned IP with its `READY`, `DEGRADED`, or `FAILED` status,
+average latency, p95 latency, and negotiated protocol. Failed targets remain
+visible for diagnosis but cannot be selected for a bandwidth test. The default
+order is fastest average latency first; click a column header to sort, or press
+`s` to reverse the current order.
+
+Press `/` to search by IP, status, or protocol. `Enter` accepts the search and
+`Esc` clears it before leaving search mode. `Tab` moves focus through each
+control individually (the target list, the three direction buttons,
+select-all/clear, and start/back), and `Enter` activates whichever control is
+focused. The currently chosen direction is always shown as a filled button so
+selection and focus never look alike. Shortcuts: `Space` toggles the
+highlighted eligible IP, `a` / `x` select-all / clear, and `d` / `u` / `b` set
+the download / upload / both direction. Results report throughput in Mbps for
+each direction. Press `c` to copy the selected IP and `Esc` to return to the
+latency dashboard.
 
 ### CLI options
 

@@ -255,6 +255,8 @@ pub struct App {
     /// Speed-select list inner rect + first visible index, for mouse hit-testing.
     pub speed_list_inner: Option<Rect>,
     pub speed_list_start: usize,
+    pub speed_table_header: Option<Rect>,
+    pub speed_table_col_bounds: Vec<(u16, u16)>,
     /// Set when a quit was requested while a scan is running; a second 'q'
     /// confirms the exit. Any other key clears it.
     pub confirm_quit: bool,
@@ -263,6 +265,10 @@ pub struct App {
     pub speed_targets: Vec<String>,
     pub speed_selected: std::collections::HashSet<String>,
     pub speed_cursor: usize,
+    pub speed_query: String,
+    pub speed_search_mode: bool,
+    pub speed_sort_col: usize,
+    pub speed_sort_asc: bool,
     pub speed_direction: SpeedDirection,
     pub speed_results: Vec<SpeedResult>,
     pub speed_result_cursor: usize,
@@ -450,11 +456,17 @@ impl App {
             table_col_indices: Vec::new(),
             speed_list_inner: None,
             speed_list_start: 0,
+            speed_table_header: None,
+            speed_table_col_bounds: Vec::new(),
             confirm_quit: false,
             pending_start: false,
             speed_targets: Vec::new(),
             speed_selected: std::collections::HashSet::new(),
             speed_cursor: 0,
+            speed_query: String::new(),
+            speed_search_mode: false,
+            speed_sort_col: 2,
+            speed_sort_asc: true,
             speed_direction: SpeedDirection::Both,
             speed_results: Vec::new(),
             speed_result_cursor: 0,
@@ -1174,6 +1186,11 @@ impl App {
             return;
         }
 
+        if self.screen == Screen::SpeedSelect && self.speed_search_mode {
+            self.handle_speed_select_key(code);
+            return;
+        }
+
         // The help overlay stays open until explicitly dismissed with `?`,
         // `Esc`, or `q`, so incidental navigation keys don't close it. All keys
         // are consumed while it is visible.
@@ -1191,6 +1208,10 @@ impl App {
         match code {
             KeyCode::Char('?') => {
                 self.show_help = !self.show_help;
+                return;
+            }
+            KeyCode::Char('/') if self.screen == Screen::SpeedSelect => {
+                self.speed_search_mode = true;
                 return;
             }
             KeyCode::Char('/') => {
@@ -1301,6 +1322,8 @@ impl App {
         self.table_col_bounds.clear();
         self.table_col_indices.clear();
         self.speed_list_inner = None;
+        self.speed_table_header = None;
+        self.speed_table_col_bounds.clear();
 
         match self.screen {
             Screen::Wizard => wizard::render(self, frame, frame.area()),
@@ -1540,12 +1563,14 @@ impl App {
         self.speed_targets = self
             .results
             .iter()
-            .filter(|result| result.ok > 0)
             .map(|result| result.ip.clone())
             .collect();
-        self.speed_targets.sort();
         self.speed_selected.clear();
         self.speed_cursor = 0;
+        self.speed_query.clear();
+        self.speed_search_mode = false;
+        self.speed_sort_col = 2;
+        self.speed_sort_asc = true;
         self.speed_direction = SpeedDirection::Both;
         self.speed_results.clear();
         self.speed_complete = false;
@@ -1555,17 +1580,121 @@ impl App {
         self.screen = Screen::SpeedSelect;
     }
 
+    fn speed_status(result: &ProbeResult) -> &'static str {
+        if result.ok == 0 {
+            "FAILED"
+        } else if result.fail == 0 {
+            "READY"
+        } else {
+            "DEGRADED"
+        }
+    }
+
+    fn speed_optional_latency_cmp(a: Option<f64>, b: Option<f64>) -> std::cmp::Ordering {
+        match (a, b) {
+            (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    }
+
+    fn speed_visible_indices(&self) -> Vec<usize> {
+        let query = self.speed_query.to_ascii_lowercase();
+        let mut indices: Vec<usize> = self
+            .results
+            .iter()
+            .enumerate()
+            .filter(|(_, result)| self.speed_targets.iter().any(|ip| ip == &result.ip))
+            .filter(|(_, result)| {
+                query.is_empty()
+                    || result.ip.to_ascii_lowercase().contains(&query)
+                    || result.protocol.to_ascii_lowercase().contains(&query)
+                    || Self::speed_status(result)
+                        .to_ascii_lowercase()
+                        .contains(&query)
+            })
+            .map(|(index, _)| index)
+            .collect();
+
+        indices.sort_by(|left, right| {
+            let a = &self.results[*left];
+            let b = &self.results[*right];
+            let ordering = match self.speed_sort_col {
+                0 => a.ip.cmp(&b.ip),
+                1 => Self::speed_status(a).cmp(Self::speed_status(b)),
+                2 => Self::speed_optional_latency_cmp(
+                    (a.ok > 0).then_some(a.avg),
+                    (b.ok > 0).then_some(b.avg),
+                ),
+                3 => Self::speed_optional_latency_cmp(
+                    (a.ok > 0).then_some(a.p95),
+                    (b.ok > 0).then_some(b.p95),
+                ),
+                4 => a.protocol.cmp(&b.protocol),
+                _ => std::cmp::Ordering::Equal,
+            };
+            let ordering = ordering
+                .then_with(|| a.protocol.cmp(&b.protocol))
+                .then_with(|| a.ip.cmp(&b.ip));
+            if self.speed_sort_asc {
+                ordering
+            } else {
+                ordering.reverse()
+            }
+        });
+        indices
+    }
+
     fn handle_speed_select_key(&mut self, code: KeyCode) {
+        if self.speed_search_mode {
+            match code {
+                KeyCode::Esc => {
+                    if self.speed_query.is_empty() {
+                        self.speed_search_mode = false;
+                    } else {
+                        self.speed_query.clear();
+                        self.speed_cursor = 0;
+                        self.scroll = 0;
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.speed_query.pop();
+                    self.speed_cursor = 0;
+                    self.scroll = 0;
+                }
+                KeyCode::Enter => self.speed_search_mode = false,
+                KeyCode::Char(c) => {
+                    self.speed_query.push(c);
+                    self.speed_cursor = 0;
+                    self.scroll = 0;
+                }
+                _ => {}
+            }
+            return;
+        }
         match code {
+            KeyCode::Char('/') => {
+                self.speed_search_mode = true;
+            }
             KeyCode::Char(' ') => {
-                if let Some(ip) = self.speed_targets.get(self.speed_cursor).cloned() {
-                    if !self.speed_selected.insert(ip.clone()) {
-                        self.speed_selected.remove(&ip);
+                if let Some(index) = self.speed_visible_indices().get(self.speed_cursor).copied() {
+                    let result = &self.results[index];
+                    if result.ok > 0 {
+                        let ip = result.ip.clone();
+                        if !self.speed_selected.insert(ip.clone()) {
+                            self.speed_selected.remove(&ip);
+                        }
                     }
                 }
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                self.speed_selected = self.speed_targets.iter().cloned().collect();
+                self.speed_selected = self
+                    .results
+                    .iter()
+                    .filter(|result| result.ok > 0)
+                    .map(|result| result.ip.clone())
+                    .collect();
             }
             KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.speed_selected.clear()
@@ -1578,14 +1707,15 @@ impl App {
             }
             KeyCode::Char('b') | KeyCode::Char('B') => self.speed_direction = SpeedDirection::Both,
             KeyCode::Up if self.speed_cursor > 0 => self.speed_cursor -= 1,
-            KeyCode::Down if self.speed_cursor + 1 < self.speed_targets.len() => {
+            KeyCode::Down if self.speed_cursor + 1 < self.speed_visible_indices().len() => {
                 self.speed_cursor += 1
             }
             KeyCode::PageUp => self.speed_cursor = self.speed_cursor.saturating_sub(10),
             KeyCode::PageDown => {
-                self.speed_cursor =
-                    (self.speed_cursor + 10).min(self.speed_targets.len().saturating_sub(1))
+                self.speed_cursor = (self.speed_cursor + 10)
+                    .min(self.speed_visible_indices().len().saturating_sub(1))
             }
+            KeyCode::Char('s') => self.speed_sort_asc = !self.speed_sort_asc,
             KeyCode::Enter => self.speed_select_activate_focused(),
             KeyCode::Esc => self.screen = Screen::Scanning,
             _ => {}
@@ -1600,7 +1730,14 @@ impl App {
             1 => self.speed_direction = SpeedDirection::Download,
             2 => self.speed_direction = SpeedDirection::Upload,
             3 => self.speed_direction = SpeedDirection::Both,
-            4 => self.speed_selected = self.speed_targets.iter().cloned().collect(),
+            4 => {
+                self.speed_selected = self
+                    .results
+                    .iter()
+                    .filter(|result| result.ok > 0)
+                    .map(|result| result.ip.clone())
+                    .collect()
+            }
             5 => self.speed_selected.clear(),
             7 => self.screen = Screen::Scanning,
             _ => {
@@ -1716,7 +1853,7 @@ impl App {
                     self.speed_result_cursor = (self.speed_result_cursor + 1).min(max);
                     self.scroll = self.scroll.max(self.speed_result_cursor);
                 } else if self.screen == Screen::SpeedSelect {
-                    let last = self.speed_targets.len().saturating_sub(1);
+                    let last = self.speed_visible_indices().len().saturating_sub(1);
                     self.speed_cursor = (self.speed_cursor + 1).min(last);
                 } else if self.wizard_step == WizardStep::Ranges && !self.custom_input_mode {
                     let last = self.cidr_candidates.len().saturating_sub(1);
@@ -1786,13 +1923,42 @@ impl App {
                         }
                     }
                 } else if self.screen == Screen::SpeedSelect {
+                    if let Some(header) = self.speed_table_header {
+                        if point_in(header, p) {
+                            if let Some(column) = col_at(&self.speed_table_col_bounds, m.column) {
+                                let Some(sort_col) = (match column {
+                                    1 => Some(0),
+                                    2 => Some(1),
+                                    3 => Some(2),
+                                    4 => Some(3),
+                                    5 => Some(4),
+                                    _ => None,
+                                }) else {
+                                    return;
+                                };
+                                if sort_col == self.speed_sort_col {
+                                    self.speed_sort_asc = !self.speed_sort_asc;
+                                } else {
+                                    self.speed_sort_col = sort_col;
+                                    self.speed_sort_asc = true;
+                                }
+                                self.speed_cursor = 0;
+                                self.scroll = 0;
+                            }
+                            return;
+                        }
+                    }
                     if let Some(inner) = self.speed_list_inner {
                         if point_in(inner, p) {
-                            let idx = self.speed_list_start + (m.row - inner.y) as usize;
-                            if let Some(ip) = self.speed_targets.get(idx).cloned() {
-                                self.speed_cursor = idx;
-                                if !self.speed_selected.insert(ip.clone()) {
-                                    self.speed_selected.remove(&ip);
+                            let row = self.speed_list_start + (m.row - inner.y) as usize;
+                            if let Some(index) = self.speed_visible_indices().get(row).copied() {
+                                let result = &self.results[index];
+                                self.speed_cursor = row;
+                                if result.ok > 0 {
+                                    let ip = result.ip.clone();
+                                    if !self.speed_selected.insert(ip.clone()) {
+                                        self.speed_selected.remove(&ip);
+                                    }
                                 }
                             }
                         }
@@ -1851,7 +2017,12 @@ impl App {
             ButtonAction::ConfirmQuit => self.should_quit = true,
             ButtonAction::CancelQuit => self.confirm_quit = false,
             ButtonAction::SpeedAll => {
-                self.speed_selected = self.speed_targets.iter().cloned().collect();
+                self.speed_selected = self
+                    .results
+                    .iter()
+                    .filter(|result| result.ok > 0)
+                    .map(|result| result.ip.clone())
+                    .collect();
             }
             ButtonAction::SpeedClear => self.speed_selected.clear(),
             ButtonAction::SpeedDirDownload => self.speed_direction = SpeedDirection::Download,
@@ -2095,6 +2266,97 @@ mod tests {
         app.focus_index = 7;
         app.speed_select_activate_focused();
         assert_eq!(app.screen, Screen::Scanning);
+    }
+
+    #[test]
+    fn speed_selection_shows_failed_targets_but_select_all_excludes_them() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut failed = result("192.0.2.2", 1, 0.2);
+        failed.ok = 0;
+        failed.samples.clear();
+        app.results = vec![failed, result("192.0.2.1", 0, 0.03)];
+        app.open_speed_selection();
+
+        let visible = app.speed_visible_indices();
+        assert_eq!(visible.len(), 2);
+        assert_eq!(App::speed_status(&app.results[visible[0]]), "READY");
+        app.speed_cursor = 1;
+        app.handle_speed_select_key(KeyCode::Char(' '));
+        assert!(app.speed_selected.is_empty());
+        app.focus_index = 4;
+        app.speed_select_activate_focused();
+        assert_eq!(
+            app.speed_selected,
+            ["192.0.2.1".to_string()].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn speed_selection_filters_by_ip_status_and_protocol() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut failed = result("192.0.2.2", 1, 0.2);
+        failed.ok = 0;
+        failed.protocol = "h3".to_string();
+        app.results = vec![result("192.0.2.1", 0, 0.03), failed];
+        app.open_speed_selection();
+
+        app.speed_query = "192.0.2.2".to_string();
+        assert_eq!(app.speed_visible_indices().len(), 1);
+        app.speed_query = "failed".to_string();
+        assert_eq!(app.speed_visible_indices().len(), 1);
+        app.speed_query = "h3".to_string();
+        assert_eq!(app.speed_visible_indices().len(), 1);
+    }
+
+    #[test]
+    fn speed_selection_sorts_latency_then_protocol_then_ip() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut a = result("192.0.2.3", 0, 0.05);
+        a.protocol = "h3".to_string();
+        let mut b = result("192.0.2.1", 0, 0.05);
+        b.protocol = "h2".to_string();
+        let c = result("192.0.2.2", 0, 0.01);
+        app.results = vec![a, b, c];
+        app.open_speed_selection();
+
+        let ips = |app: &App| {
+            app.speed_visible_indices()
+                .into_iter()
+                .map(|index| app.results[index].ip.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ips(&app), vec!["192.0.2.2", "192.0.2.1", "192.0.2.3"]);
+        app.speed_sort_asc = false;
+        assert_eq!(ips(&app), vec!["192.0.2.3", "192.0.2.1", "192.0.2.2"]);
+    }
+
+    #[test]
+    fn speed_selection_keeps_selection_when_filtering_and_sorting() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.results = vec![result("192.0.2.1", 0, 0.03), result("192.0.2.2", 0, 0.01)];
+        app.open_speed_selection();
+        app.speed_selected.insert("192.0.2.1".to_string());
+        app.speed_query = "192.0.2.2".to_string();
+        app.speed_sort_asc = false;
+        assert!(app.speed_selected.contains("192.0.2.1"));
+        app.speed_query.clear();
+        assert!(app.speed_selected.contains("192.0.2.1"));
     }
 
     #[test]

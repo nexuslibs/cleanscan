@@ -50,21 +50,66 @@ fn render_selection(app: &mut App, frame: &mut Frame, area: Rect) {
         .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
         .split(area);
     let block = widgets::panel_block(
-        "Successful IPs — click or Space to select",
+        "Speed-test targets — click or Space to select",
         app.focus_index == 0,
     );
     let inner = block.inner(chunks[0]);
-    app.speed_list_inner = Some(inner);
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+    let search_label = if app.speed_search_mode {
+        format!(" Search: {}▌", app.speed_query)
+    } else if app.speed_query.is_empty() {
+        " Search: press / to filter by IP, status, or protocol".to_string()
+    } else {
+        format!(" Search: {}  (press / to edit)", app.speed_query)
+    };
+    frame.render_widget(
+        Paragraph::new(search_label).style(if app.speed_search_mode {
+            theme::title_style()
+        } else {
+            theme::hint_style()
+        }),
+        parts[0],
+    );
 
-    if app.speed_targets.is_empty() {
+    let indices = app.speed_visible_indices();
+    let table_inner = parts[1];
+    app.speed_table_header = Some(Rect::new(
+        table_inner.x,
+        table_inner.y,
+        table_inner.width,
+        1,
+    ));
+    app.speed_table_col_bounds.clear();
+    let widths = [6u16, 25, 11, 13, 13, 10];
+    let mut x = table_inner.x;
+    for width in widths {
+        let end = x.saturating_add(width.min(table_inner.right().saturating_sub(x)));
+        app.speed_table_col_bounds.push((x, end));
+        x = end;
+    }
+    app.speed_list_inner = Some(Rect::new(
+        table_inner.x,
+        table_inner.y.saturating_add(1),
+        table_inner.width,
+        table_inner.height.saturating_sub(1),
+    ));
+
+    if indices.is_empty() {
         let empty = Paragraph::new(vec![
             Line::from(""),
             Line::from(Span::styled(
-                "No successful IPs to test.",
+                if app.speed_query.is_empty() {
+                    "No scanned IPs available."
+                } else {
+                    "No targets match the current search."
+                },
                 theme::warn_style(),
             )),
             Line::from(Span::styled(
-                "Run a scan first, then pick the fastest edges here.",
+                "Only READY or DEGRADED targets can be selected for testing.",
                 theme::hint_style(),
             )),
         ])
@@ -72,32 +117,87 @@ fn render_selection(app: &mut App, frame: &mut Frame, area: Rect) {
         .block(block);
         frame.render_widget(empty, chunks[0]);
     } else {
-        let visible = inner.height as usize;
-        let start = app.speed_cursor.saturating_sub(visible.saturating_sub(1));
-        app.speed_list_start = start;
-        let rows = app
-            .speed_targets
+        let visible = table_inner.height.saturating_sub(1) as usize;
+        app.speed_cursor = app.speed_cursor.min(indices.len().saturating_sub(1));
+        let max_scroll = indices.len().saturating_sub(visible);
+        app.scroll = app
+            .scroll
+            .max(app.speed_cursor.saturating_sub(visible.saturating_sub(1)))
+            .min(app.speed_cursor)
+            .min(max_scroll);
+        app.speed_list_start = app.scroll;
+        let rows = indices
             .iter()
-            .enumerate()
-            .skip(start)
+            .skip(app.scroll)
             .take(visible)
-            .map(|(index, ip)| {
-                let selected = app.speed_selected.contains(ip);
-                let style = if index == app.speed_cursor {
+            .enumerate()
+            .map(|(row_index, result_index)| {
+                let result = &app.results[*result_index];
+                let selected = app.speed_selected.contains(&result.ip);
+                let focused = app.scroll + row_index == app.speed_cursor;
+                let style = if focused {
                     theme::row_selected_style()
+                } else if result.ok == 0 {
+                    theme::bad_style()
                 } else if selected {
                     Style::default().fg(theme::palette().info)
+                } else if (app.scroll + row_index) % 2 == 1 {
+                    theme::row_alt_style()
                 } else {
                     theme::hint_style()
                 };
                 Row::new(vec![
-                    Cell::from(if selected { "[x]" } else { "[ ]" }),
-                    Cell::from(ip.clone()),
+                    Cell::from(if result.ok > 0 {
+                        if selected {
+                            "[x]"
+                        } else {
+                            "[ ]"
+                        }
+                    } else {
+                        " - "
+                    }),
+                    Cell::from(result.ip.clone()),
+                    Cell::from(App::speed_status(result)),
+                    Cell::from(format_latency(result.ok > 0, result.avg)),
+                    Cell::from(format_latency(result.ok > 0, result.p95)),
+                    Cell::from(result.protocol.clone()),
                 ])
                 .style(style)
             });
+        let sort_marker = |column| {
+            if app.speed_sort_col == column {
+                if app.speed_sort_asc {
+                    " ↑"
+                } else {
+                    " ↓"
+                }
+            } else {
+                ""
+            }
+        };
+        let header = Row::new(vec![
+            "Sel".to_string(),
+            format!("IP{}", sort_marker(0)),
+            format!("Status{}", sort_marker(1)),
+            format!("Avg{}", sort_marker(2)),
+            format!("P95{}", sort_marker(3)),
+            format!("Proto{}", sort_marker(4)),
+        ])
+        .style(theme::title_style());
         frame.render_widget(
-            Table::new(rows, [Constraint::Length(5), Constraint::Min(1)]).block(block),
+            Table::new(
+                rows,
+                [
+                    Constraint::Length(5),
+                    Constraint::Length(25),
+                    Constraint::Length(11),
+                    Constraint::Length(13),
+                    Constraint::Length(13),
+                    Constraint::Min(8),
+                ],
+            )
+            .header(header)
+            .block(block),
             chunks[0],
         );
     }
@@ -382,6 +482,8 @@ fn format_measurement(value: Option<&crate::speed::SpeedMeasurement>) -> String 
 fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
     let hints: &[widgets::KeyHint] = match app.screen {
         Screen::SpeedSelect => &[
+            ("/", "search"),
+            ("s", "reverse sort"),
             ("Tab", "focus"),
             ("Space", "select"),
             ("↵", "start"),
@@ -401,4 +503,12 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
         _ => &[],
     };
     widgets::status_bar(frame, area, hints, app.visible_message());
+}
+
+fn format_latency(successful: bool, seconds: f64) -> String {
+    if successful {
+        format!("{:.1} ms", seconds * 1000.0)
+    } else {
+        "—".to_string()
+    }
 }
