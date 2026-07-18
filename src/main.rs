@@ -94,10 +94,6 @@ pub struct Args {
     #[arg(long)]
     pub country: Option<String>,
 
-    /// Only report IPs in the given country (substring match, e.g. "Germany")
-    #[arg(long)]
-    pub country: Option<String>,
-
     /// Skip the connection-establishment warmup probe (first counted probe includes connection time)
     #[arg(long)]
     pub no_warmup: bool,
