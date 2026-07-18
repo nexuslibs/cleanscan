@@ -164,14 +164,17 @@ the TUI and are not edited in this screen.
 
 ## Output
 
-CLI results are ranked by failure count (ascending), then `p95`, `max`, and
-`avg` latency (all ascending). Each row reports `ok`/`fail` counts and `avg`,
+Only IPs with at least one successful probe are shown. Probes are scheduled one
+at a time per IP: successful IPs receive priority for their remaining probes,
+unexplored IPs are preferred over IPs that have failed, and original order is
+used as a deterministic tie-breaker. CLI results are ranked by failure count
+(ascending), then `p95`, `max`, and `avg` latency (all ascending). Each row reports `ok`/`fail` counts and `avg`,
 `p50`, `p90`, `p95`, and `max` latency in seconds, followed by individual
 successful probe samples in the `samples` column. Only the top `N` rows are
 printed, where `N` is controlled by `--top`.
 
 The TUI displays the same latency statistics. Its save action writes the top
-successful results (`fail = 0`) to a timestamped
+successful results to a timestamped
 `cleanscan_<timestamp>.tsv` file in the current directory.
 
 CIDR ranges are sampled randomly, so overlapping samples may produce fewer
