@@ -13,7 +13,8 @@ use ratatui::{
 
 use crate::scanner::{result_confidence, result_status, ProbeResult};
 use crate::tui::theme;
-use crate::tui::{widgets, App, ButtonAction, ButtonKind};
+use crate::tui::{modal_overlay, widgets, App, ButtonAction, ButtonKind};
+use std::time::Duration;
 
 pub const RESULT_COLUMNS: [&str; 14] = [
     "#", "IP", "Proto", "OK", "Fail", "Avg", "P50", "P90", "P95", "Max", "Colo", "Country",
@@ -37,9 +38,12 @@ const WIDTHS: [Constraint; 14] = [
 ];
 
 /// Render the live scanning dashboard.
-pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
+pub fn render(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) {
     if area.width < 80 || area.height < 24 {
         render_terminal_too_small(frame, area);
+        // Keep the result-details overlay's lifecycle running (so it can still
+        // be dismissed with its close animation) even on a too-small terminal.
+        render_result_details(app, frame, area, elapsed);
         return;
     }
 
@@ -51,9 +55,7 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
         render_wide(app, frame, area);
     }
 
-    if app.show_result_details {
-        render_result_details(app, frame, area);
-    }
+    render_result_details(app, frame, area, elapsed);
 }
 
 fn render_wide(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -254,7 +256,7 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     widgets::status_bar(frame, area, hints, app.visible_message());
 }
 
-fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
+fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) {
     let tabs = [
         "Overview",
         "Diagnostics",
@@ -263,6 +265,21 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
         "Latency Map",
     ];
     app.detail_tab = app.detail_tab.min(tabs.len().saturating_sub(1));
+
+    // Drive the overlay state machine before borrowing `app` immutably below
+    // (the result lookup keeps `app` borrowed for the rest of the function).
+    let overlay = modal_overlay(" Selected edge details ", 64, 62);
+    if app.show_result_details {
+        app.result_details_overlay.open();
+    } else {
+        app.result_details_overlay.close();
+    }
+    app.result_details_overlay.tick(elapsed);
+    frame.render_stateful_widget(overlay, area, &mut app.result_details_overlay);
+    let Some(inner) = app.result_details_overlay.inner_area() else {
+        return;
+    };
+
     let Some(result) = app
         .sorted_results()
         .into_iter()
@@ -271,8 +288,7 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
     else {
         return;
     };
-    let popup = crate::tui::centered(area, 64, 62);
-    let inner = widgets::modal(frame, area, popup, " Selected edge details ");
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

@@ -5,11 +5,24 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
+use std::time::Duration;
 
-use crate::tui::{centered, theme, widgets, App, Screen, WizardStep};
+use crate::tui::{modal_overlay, theme, App, Screen, WizardStep};
 
 /// Render a context-aware help overlay. Closed by any key (`?` toggles).
-pub fn overlay(app: &App, frame: &mut Frame, area: Rect) {
+pub fn overlay(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) {
+    let overlay = modal_overlay(" Help — ? / Esc / q to close ", 64, 70);
+    if app.show_help {
+        app.help_overlay.open();
+    } else {
+        app.help_overlay.close();
+    }
+    app.help_overlay.tick(elapsed);
+    frame.render_stateful_widget(overlay, area, &mut app.help_overlay);
+    let Some(inner) = app.help_overlay.inner_area() else {
+        return;
+    };
+
     let lines: Vec<Line> = match app.screen {
         Screen::Wizard => wizard_lines(app.wizard_step),
         Screen::Scanning => scanning_lines(app),
@@ -18,8 +31,6 @@ pub fn overlay(app: &App, frame: &mut Frame, area: Rect) {
         Screen::SpeedResults => speed_results_lines(),
     };
 
-    let popup = centered(area, 64, 70);
-    let inner = widgets::modal(frame, area, popup, " Help — ? / Esc / q to close ");
     let para = Paragraph::new(lines).style(Style::default());
     frame.render_widget(para, inner);
 }
