@@ -1268,14 +1268,17 @@ pub async fn run_profile_scan(
     paused: Arc<AtomicBool>,
 ) {
     let checks = effective_health_checks(&args);
-    if checks.len() <= 1 {
+    if args.health_checks.is_empty() {
         run_scan(targets, args, tx, cancel, paused).await;
         return;
     }
 
+    let expected_checks = checks.clone();
     let mut by_ip: BTreeMap<String, Vec<(HealthCheck, ProbeResult)>> = BTreeMap::new();
+    let mut cancelled = false;
     for check in checks {
         if cancel.load(Ordering::Relaxed) {
+            cancelled = true;
             break;
         }
         let mut check_args = (*args).clone();
@@ -1298,6 +1301,10 @@ pub async fn run_profile_scan(
         }
     }
 
+    if cancelled || cancel.load(Ordering::Relaxed) {
+        return;
+    }
+
     for (_, entries) in by_ip {
         let Some((_, mut merged)) = entries.first().cloned() else {
             continue;
@@ -1307,10 +1314,14 @@ pub async fn run_profile_scan(
             .iter()
             .map(|(check, result)| check.weight.max(0.0) * result.score)
             .sum::<f64>();
-        let required_ok = entries
+        let required_ok = expected_checks
             .iter()
-            .filter(|(check, _)| check.required)
-            .all(|(_, result)| result.ok > 0);
+            .filter(|check| check.required)
+            .all(|check| {
+                entries
+                    .iter()
+                    .any(|(entry, result)| entry.name == check.name && result.ok > 0)
+            });
         merged.score = if total_weight > 0.0 {
             weighted_score / total_weight
         } else {

@@ -2760,8 +2760,12 @@ impl Drop for RestoreGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{ranked_export_results, Action, App, FocusTarget, ProbeResult, Screen, WizardStep};
+    use super::{
+        build_current_manifest, ranked_export_results, Action, App, FocusTarget, ProbeResult,
+        Screen, WizardStep,
+    };
     use crate::config::AppConfig;
+    use crate::watch::{WatchPolicy, WatchState};
     use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::{backend::TestBackend, Terminal};
     use std::sync::atomic::AtomicBool;
@@ -2829,12 +2833,63 @@ mod tests {
     fn export_excludes_ips_with_no_successful_probes() {
         let mut failed = result("failed", 1, 0.001);
         failed.ok = 0;
+        failed.health_ok = false;
         failed.samples.clear();
 
         let results = [failed, result("ok", 1, 0.1)];
         let ranked = ranked_export_results(&results, 50);
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].ip, "ok");
+    }
+
+    #[test]
+    fn watch_state_persists_and_covers_promotion_loss_recovery_and_identity() {
+        let path =
+            std::env::temp_dir().join(format!("cleanscan-tui-watch-{}.json", std::process::id()));
+        let mut state = WatchState::new(11, 22, vec!["192.0.2.1".to_string()]);
+        let policy = WatchPolicy::default();
+        assert!(
+            !state
+                .advance(&[result("192.0.2.1", 0, 0.02)], policy, |r| r.health_ok)
+                .changed
+        );
+        crate::watch::save(&path, &state).unwrap();
+        let mut state = crate::watch::load(&path).unwrap();
+        assert!(state.compatible(11, 22));
+        assert!(!state.compatible(12, 22));
+        assert!(
+            state
+                .advance(&[result("192.0.2.1", 0, 0.02)], policy, |r| r.health_ok)
+                .changed
+        );
+        assert!(!state.advance(&[], policy, |r| r.health_ok).changed);
+        assert!(state.advance(&[], policy, |r| r.health_ok).changed);
+        assert!(state
+            .advance(&[result("192.0.2.1", 0, 0.02)], policy, |r| r.health_ok)
+            .stable_primary
+            .is_none());
+        assert!(state
+            .advance(&[result("192.0.2.1", 0, 0.02)], policy, |r| r.health_ok)
+            .stable_primary
+            .is_some());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn current_manifest_keeps_only_healthy_primary_and_backups() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.last_targets = vec!["192.0.2.1".to_string(), "192.0.2.2".to_string()];
+        app.results = vec![result("192.0.2.1", 0, 0.02), result("192.0.2.2", 1, 0.03)];
+        let manifest = build_current_manifest(&app);
+        assert_eq!(
+            manifest.primary.as_ref().map(|r| r.ip.as_str()),
+            Some("192.0.2.1")
+        );
+        assert_eq!(manifest.backups.len(), 1);
     }
 
     #[test]
@@ -2879,6 +2934,7 @@ mod tests {
         app.add_result(sampled);
         let mut empty = result("10.0.0.2", 2, 0.2);
         empty.ok = 0;
+        empty.health_ok = false;
         empty.samples.clear();
         app.add_result(empty);
         app.scan_complete = true;
@@ -3060,6 +3116,7 @@ mod tests {
         );
         let mut failed = result("192.0.2.2", 1, 0.2);
         failed.ok = 0;
+        failed.health_ok = false;
         failed.samples.clear();
         app.results = vec![failed, result("192.0.2.1", 0, 0.03)];
         app.open_speed_selection();
@@ -3087,6 +3144,7 @@ mod tests {
         );
         let mut failed = result("192.0.2.2", 1, 0.2);
         failed.ok = 0;
+        failed.health_ok = false;
         failed.protocol = "h3".to_string();
         app.results = vec![result("192.0.2.1", 0, 0.03), failed];
         app.open_speed_selection();
