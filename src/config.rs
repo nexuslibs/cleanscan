@@ -38,6 +38,40 @@ pub struct AppConfig {
     /// make a lossy IP rank lower even when its success rate still looks usable.
     #[serde(default = "default_loss_weight")]
     pub loss_weight: f64,
+    /// Stop probing a target early once it is clearly dead or clearly worse
+    /// than the current top candidates, instead of always running the full
+    /// `--probes` budget against every target.
+    #[serde(default = "default_early_stop")]
+    pub early_stop: bool,
+    /// Number of consecutive dropped probes (timeouts / connect failures) after
+    /// which a target is declared dead and stopped early. Only applies once at
+    /// least `early_stop_min_samples` measured probes have completed.
+    #[serde(default = "default_early_stop_loss_streak")]
+    pub early_stop_loss_streak: usize,
+    /// Minimum number of measured probes before any early-stop rule may fire,
+    /// so a single first-timeout does not abort an otherwise-good target.
+    #[serde(default = "default_early_stop_min_samples")]
+    pub early_stop_min_samples: usize,
+    /// Success rate below which a target is abandoned early once enough probes
+    /// have completed. A target unlikely to ever reach READY is skipped.
+    #[serde(default = "default_early_stop_success_floor")]
+    pub early_stop_success_floor: f64,
+    /// Once at least `top` READY candidates exist, stop probing targets whose
+    /// current best score cannot beat the worst of that set by the margin.
+    #[serde(default = "default_early_stop_prune")]
+    pub early_stop_prune: bool,
+    /// How much better (as a fraction) a target's score must be versus the
+    /// current worst top-N candidate to keep probing it under the prune rule.
+    #[serde(default = "default_early_stop_prune_margin")]
+    pub early_stop_prune_margin: f64,
+    /// Run a sparse discovery pass first, then focus the remaining probe budget
+    /// on CIDRs that produced the best Cloudflare colos (two-phase sampling).
+    #[serde(default = "default_two_phase")]
+    pub two_phase: bool,
+    /// Fraction of `sample_per_cidr` used for the discovery pass when
+    /// `two_phase` is enabled (the remainder is spent focusing on good colos).
+    #[serde(default = "default_discover_fraction")]
+    pub discover_fraction: f64,
     pub custom_cidrs: Vec<String>,
     #[serde(default)]
     pub selected_cidrs: Vec<String>,
@@ -77,6 +111,38 @@ fn default_loss_weight() -> f64 {
     1.0
 }
 
+fn default_early_stop() -> bool {
+    true
+}
+
+fn default_early_stop_loss_streak() -> usize {
+    5
+}
+
+fn default_early_stop_min_samples() -> usize {
+    3
+}
+
+fn default_early_stop_success_floor() -> f64 {
+    0.5
+}
+
+fn default_early_stop_prune() -> bool {
+    true
+}
+
+fn default_early_stop_prune_margin() -> f64 {
+    0.2
+}
+
+fn default_two_phase() -> bool {
+    false
+}
+
+fn default_discover_fraction() -> f64 {
+    0.25
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -97,6 +163,14 @@ impl Default for AppConfig {
             warmup: default_warmup(),
             stability_weight: default_stability_weight(),
             loss_weight: default_loss_weight(),
+            early_stop: default_early_stop(),
+            early_stop_loss_streak: default_early_stop_loss_streak(),
+            early_stop_min_samples: default_early_stop_min_samples(),
+            early_stop_success_floor: default_early_stop_success_floor(),
+            early_stop_prune: default_early_stop_prune(),
+            early_stop_prune_margin: default_early_stop_prune_margin(),
+            two_phase: default_two_phase(),
+            discover_fraction: default_discover_fraction(),
             custom_cidrs: Vec::new(),
             selected_cidrs: crate::scanner::DEFAULT_CLOUDFLARE_CIDRS
                 .iter()

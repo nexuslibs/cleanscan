@@ -105,6 +105,40 @@ pub struct Args {
     /// Weight applied to packet loss when ranking results (higher penalizes lossy IPs)
     #[arg(long)]
     pub loss_weight: Option<f64>,
+
+    /// Disable fail-fast early stopping: probe every target for the full
+    /// `--probes` count even when it is clearly dead or clearly worse.
+    #[arg(long)]
+    pub no_early_stop: bool,
+
+    /// Consecutive dropped probes after which a target is declared dead.
+    #[arg(long)]
+    pub early_stop_loss_streak: Option<usize>,
+
+    /// Minimum measured probes before any early-stop rule may fire.
+    #[arg(long)]
+    pub early_stop_min_samples: Option<usize>,
+
+    /// Success rate below which a target is abandoned once enough probes ran.
+    #[arg(long)]
+    pub early_stop_success_floor: Option<f64>,
+
+    /// Disable pruning of targets that cannot beat the current top-N.
+    #[arg(long)]
+    pub no_early_stop_prune: bool,
+
+    /// Score margin a target must beat the worst top-N candidate by to keep probing.
+    #[arg(long)]
+    pub early_stop_prune_margin: Option<f64>,
+
+    /// Run a sparse discovery pass first, then focus probing on the CIDRs that
+    /// produced the best Cloudflare colos (two-phase, colo-aware sampling).
+    #[arg(long)]
+    pub two_phase: bool,
+
+    /// Fraction of `sample_per_cidr` used for the discovery pass with `--two-phase`.
+    #[arg(long)]
+    pub discover_fraction: Option<f64>,
 }
 
 fn main() -> Result<()> {
@@ -146,6 +180,33 @@ fn main() -> Result<()> {
     }
     if let Some(weight) = args.loss_weight {
         config.loss_weight = weight;
+    }
+    if args.no_early_stop {
+        config.early_stop = false;
+    }
+    if let Some(streak) = args.early_stop_loss_streak {
+        config.early_stop_loss_streak = streak;
+    }
+    if let Some(min) = args.early_stop_min_samples {
+        config.early_stop_min_samples = min;
+    }
+    if let Some(floor) = args.early_stop_success_floor {
+        config.early_stop_success_floor = floor;
+    }
+    if args.no_early_stop_prune {
+        config.early_stop_prune = false;
+    }
+    if let Some(margin) = args.early_stop_prune_margin {
+        config.early_stop_prune_margin = margin;
+    }
+    if args.two_phase {
+        config.two_phase = true;
+    }
+    if let Some(fraction) = args.discover_fraction {
+        if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
+            anyhow::bail!("--discover-fraction must be a finite value between 0.0 and 1.0");
+        }
+        config.discover_fraction = fraction;
     }
 
     if !config.stability_weight.is_finite() || config.stability_weight < 0.0 {
@@ -229,29 +290,50 @@ fn cli_mode(
     colo: Option<String>,
     country: Option<String>,
 ) -> Result<()> {
+    let has_explicit_targets = ips.is_some() || targets_file.is_some();
     let targets = if let Some(path) = targets_file {
         scanner::load_ip_manifest(&path)?
     } else {
         scanner::collect_targets_with_optional_seed(&config, &cidr, &ips, seed)?
     };
     let total = targets.len();
+    let use_two_phase = config.two_phase && !has_explicit_targets;
 
-    eprintln!(
-        "Testing {} targets × {} probes, concurrency={}",
-        total, config.probes, config.concurrency
-    );
+    if !use_two_phase {
+        eprintln!(
+            "Testing {} targets × {} probes, concurrency={}",
+            total, config.probes, config.concurrency
+        );
+    }
 
     let (tx, rx) = std::sync::mpsc::channel();
     let config_arc = Arc::new(config.clone());
 
+    let selected_cidrs: Vec<String> = if !cidr.is_empty() {
+        cidr.clone()
+    } else {
+        config.selected_cidrs.clone()
+    };
+
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(scanner::run_scan(
-        targets,
-        config_arc,
-        tx,
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(false)),
-    ));
+    if use_two_phase {
+        rt.block_on(scanner::run_scan_two_phase(
+            selected_cidrs,
+            config_arc,
+            colo.clone(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ))?;
+    } else {
+        rt.block_on(scanner::run_scan(
+            targets,
+            config_arc,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ));
+    }
 
     // Keep fully failed targets in machine-readable output so callers can
     // inspect their categorized diagnostics and distinguish them from targets
@@ -386,6 +468,7 @@ mod tests {
             colo: Some("ABJ".to_string()),
             country: Some("Côte d'Ivoire".to_string()),
             cold_ms: None,
+            stopped_early: false,
         }];
         let mut filtered = results.clone();
         filtered.retain(|r| {
