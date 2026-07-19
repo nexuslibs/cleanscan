@@ -18,6 +18,10 @@ use tui_slider::{Slider, SliderState};
 pub enum SettingField {
     Host,
     Path,
+    ExpectedStatuses,
+    RequiredBodyMarkers,
+    RequiredHeaders,
+    FollowRedirects,
     DownloadPath,
     UploadPath,
     SpeedPayloadMb,
@@ -55,10 +59,14 @@ const MAX_SPEED_TIMEOUT_MS: u64 = 3_600_000;
 impl SettingField {
     /// All settings fields in display order, grouped by concern. Group
     /// boundaries are described by [`SettingField::GROUPS`].
-    pub const ALL: [SettingField; 22] = [
+    pub const ALL: [SettingField; 26] = [
         // Target
         SettingField::Host,
         SettingField::Path,
+        SettingField::ExpectedStatuses,
+        SettingField::RequiredBodyMarkers,
+        SettingField::RequiredHeaders,
+        SettingField::FollowRedirects,
         // Latency scan
         SettingField::SamplePerCidr,
         SettingField::Probes,
@@ -87,8 +95,9 @@ impl SettingField {
 
     /// Section headers and the number of consecutive fields in each, in the
     /// same order as [`SettingField::ALL`].
-    pub const GROUPS: [(&'static str, usize); 5] = [
+    pub const GROUPS: [(&'static str, usize); 6] = [
         ("Target", 2),
+        ("Validation", 4),
         ("Latency scan", 6),
         ("Ranking quality", 2),
         ("Adaptive scan", 7),
@@ -99,6 +108,10 @@ impl SettingField {
         match self {
             SettingField::Host => "Host",
             SettingField::Path => "Path",
+            SettingField::ExpectedStatuses => "Expected statuses",
+            SettingField::RequiredBodyMarkers => "Required body markers",
+            SettingField::RequiredHeaders => "Required headers",
+            SettingField::FollowRedirects => "Follow redirects",
             SettingField::DownloadPath => "Download path",
             SettingField::UploadPath => "Upload path",
             SettingField::SpeedPayloadMb => "Speed payload (MB)",
@@ -126,6 +139,10 @@ impl SettingField {
         match self {
             SettingField::Host => "The hostname used in SNI and the Host header for HTTP probes (e.g. app.iplat.ir). Cleanscan resolves this host to the tested edge IPs directly.",
             SettingField::Path => "The HTTP request path to probe (e.g. /cdn-cgi/trace). Typically points to a lightweight text file or endpoint to minimize bandwidth usage.",
+            SettingField::ExpectedStatuses => "Comma-separated HTTP statuses accepted by the endpoint. Empty means any 2xx response.",
+            SettingField::RequiredBodyMarkers => "Comma-separated literal substrings that must occur in the response body.",
+            SettingField::RequiredHeaders => "Comma-separated exact header checks in name=value form.",
+            SettingField::FollowRedirects => "Follow redirects during validation. Off preserves the default strict behavior.",
             SettingField::DownloadPath => "Static file endpoint used for download speed tests.",
             SettingField::UploadPath => "POST endpoint used for upload speed tests; it should consume and discard the request body.",
             SettingField::SpeedPayloadMb => "Payload size used for each upload/download repetition. Larger payloads reduce short-test noise but use more bandwidth.",
@@ -154,6 +171,21 @@ impl SettingField {
         match self {
             SettingField::Host => args.host.clone(),
             SettingField::Path => args.path.clone(),
+            SettingField::ExpectedStatuses => args
+                .expected_statuses
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            SettingField::RequiredBodyMarkers => args.required_body_markers.join(","),
+            SettingField::RequiredHeaders => args.required_headers.join(","),
+            SettingField::FollowRedirects => {
+                if args.follow_redirects {
+                    "On".to_string()
+                } else {
+                    "Off".to_string()
+                }
+            }
             SettingField::DownloadPath => args.download_path.clone(),
             SettingField::UploadPath => args.upload_path.clone(),
             SettingField::SpeedPayloadMb => (args.speed_payload_bytes / (1024 * 1024)).to_string(),
@@ -200,6 +232,10 @@ impl SettingField {
             self,
             SettingField::Host
                 | SettingField::Path
+                | SettingField::ExpectedStatuses
+                | SettingField::RequiredBodyMarkers
+                | SettingField::RequiredHeaders
+                | SettingField::FollowRedirects
                 | SettingField::DownloadPath
                 | SettingField::UploadPath
                 | SettingField::EarlyStop
@@ -238,6 +274,10 @@ impl SettingField {
             SettingField::DiscoverFraction => i64::MAX,
             SettingField::Host
             | SettingField::Path
+            | SettingField::ExpectedStatuses
+            | SettingField::RequiredBodyMarkers
+            | SettingField::RequiredHeaders
+            | SettingField::FollowRedirects
             | SettingField::DownloadPath
             | SettingField::UploadPath
             | SettingField::EarlyStop
@@ -295,6 +335,10 @@ impl SettingField {
             SettingField::SpeedTimeoutMs => args.speed_timeout_ms = value as u64,
             SettingField::Host
             | SettingField::Path
+            | SettingField::ExpectedStatuses
+            | SettingField::RequiredBodyMarkers
+            | SettingField::RequiredHeaders
+            | SettingField::FollowRedirects
             | SettingField::DownloadPath
             | SettingField::UploadPath
             | SettingField::EarlyStop
@@ -325,6 +369,54 @@ impl SettingField {
                     return Err("path must be non-empty and begin with /".to_string());
                 }
                 args.path = raw.to_string();
+            }
+            SettingField::ExpectedStatuses => {
+                if raw.is_empty() {
+                    args.expected_statuses.clear();
+                } else {
+                    let statuses = raw
+                        .split(',')
+                        .map(|value| {
+                            value
+                                .trim()
+                                .parse::<u16>()
+                                .map_err(|_| "invalid status".to_string())
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if statuses.iter().any(|status| *status > 599) {
+                        return Err("statuses must be between 100 and 599".to_string());
+                    }
+                    args.expected_statuses = statuses;
+                }
+            }
+            SettingField::RequiredBodyMarkers => {
+                args.required_body_markers = if raw.is_empty() {
+                    Vec::new()
+                } else {
+                    raw.split(',')
+                        .map(|value| value.trim().to_string())
+                        .collect()
+                };
+            }
+            SettingField::RequiredHeaders => {
+                let headers = if raw.is_empty() {
+                    Vec::new()
+                } else {
+                    raw.split(',')
+                        .map(|value| value.trim().to_string())
+                        .collect()
+                };
+                if headers.iter().any(|value| !value.contains('=')) {
+                    return Err("headers must use name=value form".to_string());
+                }
+                args.required_headers = headers;
+            }
+            SettingField::FollowRedirects => {
+                args.follow_redirects = match raw.to_lowercase().as_str() {
+                    "on" | "true" | "1" | "yes" => true,
+                    "off" | "false" | "0" | "no" => false,
+                    _ => return Err("enter on or off".to_string()),
+                };
             }
             SettingField::DownloadPath => {
                 if raw.is_empty() || !raw.starts_with('/') {
@@ -1636,13 +1728,17 @@ mod tests {
     fn arrows_step_numeric_draft_while_editing() {
         let mut app = settings_app();
         app.wizard_step = crate::tui::WizardStep::Settings;
-        app.start_edit(2);
+        let sample_index = SettingField::ALL
+            .iter()
+            .position(|field| *field == SettingField::SamplePerCidr)
+            .unwrap();
+        app.start_edit(sample_index);
         app.edit_buffer = "100".to_string();
         app.edit_caret = app.edit_buffer.len();
 
         handle_settings_key(&mut app, crossterm::event::KeyCode::Up);
 
-        assert_eq!(app.edit_field, Some(2));
+        assert_eq!(app.edit_field, Some(sample_index));
         assert_eq!(app.edit_buffer, "110");
         assert_eq!(app.config.sample_per_cidr, 100);
     }

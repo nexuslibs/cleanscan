@@ -143,7 +143,9 @@ counterparts: `Host` (`--host`), `Path` (`--path`), `Sample per CIDR`
 (`--sample-per-cidr`), `Probes` (`--probes`), `Concurrency` (`--concurrency`),
 `Timeout (ms)` (`--timeout-ms`), `Connect timeout (ms)` (`--connect-timeout-ms`),
 `Top results` (`--top`), `Stability weight` (`--stability-weight`, default `1.0`),
-and `Loss weight` (`--loss-weight`, default `1.0`). Speed-test settings are also editable: download
+and `Loss weight` (`--loss-weight`, default `1.0`). Validation settings are also editable:
+expected statuses, required body markers, required headers, and redirect behavior.
+Comma-separated values are used for repeatable marker/header fields. Speed-test settings are also editable: download
 path, upload path, payload size in MB, repetition count, and speed timeout (ms).
 Target-source flags such as `--cidr` and `--ips` are selected before launching
 the TUI and are not edited in this screen.
@@ -199,6 +201,10 @@ latency dashboard.
 | `--cli`                | off              | Use tab-separated CLI output instead of the TUI  |
 | `--host`               | required         | Hostname for HTTPS / SNI / Host header (no built-in default) |
 | `--path`               | `/cdn-cgi/trace` | Path to probe                                    |
+| `--expect-status`      | any 2xx          | Expected HTTP status code (repeatable)           |
+| `--require-body`       | —                | Required literal response-body marker (repeatable) |
+| `--require-header`     | —                | Required exact response header as `name=value` (repeatable) |
+| `--follow-redirects`   | off              | Follow redirects during validation               |
 | `--ips`                | —                | File with one IP or CIDR per line                |
 | `--cidr`               | —                | CIDR block to sample (repeatable)                |
 | `--sample-per-cidr`    | `100`            | Random IPs sampled from each CIDR                |
@@ -219,6 +225,13 @@ latency dashboard.
 | `--no-warmup`           | off              | Skip the warmup probe; the first measured probe includes connection setup, while later probes may reuse the connection |
 | `--stability-weight`    | `1.0`            | Weight of latency jitter in the recommendation score (higher penalizes variable-latency IPs) |
 | `--loss-weight`         | `1.0`            | Weight of packet loss in the recommendation score (higher penalizes lossy IPs) |
+| `--watch`               | —                | Repeat scans every N seconds using the same exact target list |
+| `--manifest`            | —                | Atomically write a primary/backup JSON manifest   |
+| `--manifest-backups`    | `3`              | Number of backup targets in the manifest         |
+| `--manifest-min-confidence` | `UNKNOWN`    | Minimum confidence required for manifest targets |
+| `--alert-p95-increase-ms` | —              | Watch alert threshold for recommended p95 regression |
+| `--alert-packet-loss-increase` | —        | Watch alert threshold for recommended packet-loss regression |
+| `--fail-on-alert`       | off              | Exit watch mode when an alert is emitted         |
 
 ## Output
 
@@ -242,6 +255,15 @@ counts, a recommended target, backups, success rate, p95 latency, and
 confidence. The selected-IP details modal supports `1`–`5` / `Tab` tabs for
 overview, failure diagnostics, latency distribution, speed context, and
 latency map.
+
+When validation options are configured, a probe is counted as successful only
+when its status, required headers, and required body markers all match. A
+validation failure remains in the result diagnostics and does not contribute
+to latency or success-rate statistics. In watch mode, structured `alert`
+events are emitted for health loss, recommendation changes, configured p95 or
+packet-loss regressions, and colo changes. `--manifest` writes the current
+healthy primary and backup pool only after a completed scan; the JSON file is
+updated atomically and contains the validation policy and target metrics.
 
 The Review screen shows the random seed and exact deduplicated target count.
 Press `s` for a new sample or `c` to save the exact targets to

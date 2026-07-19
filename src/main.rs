@@ -26,6 +26,22 @@ pub struct Args {
     #[arg(long)]
     pub path: Option<String>,
 
+    /// Expected HTTP status code. Repeat to allow multiple statuses; empty means any 2xx.
+    #[arg(long = "expect-status")]
+    pub expected_statuses: Vec<u16>,
+
+    /// Literal substring required in the response body. Repeatable.
+    #[arg(long = "require-body")]
+    pub required_body_markers: Vec<String>,
+
+    /// Exact required response header in name=value form. Repeatable.
+    #[arg(long = "require-header")]
+    pub required_headers: Vec<String>,
+
+    /// Follow redirects instead of treating them as validation failures.
+    #[arg(long)]
+    pub follow_redirects: bool,
+
     /// Optional file containing candidate IPs and/or CIDRs, one per line
     #[arg(long)]
     pub ips: Option<String>,
@@ -159,6 +175,30 @@ pub struct Args {
     /// Repeat scans every N seconds using the same exact target list.
     #[arg(long)]
     pub watch: Option<u64>,
+
+    /// Write the ranked healthy primary/backup manifest atomically after each scan.
+    #[arg(long)]
+    pub manifest: Option<String>,
+
+    /// Number of backup targets to include in the manifest.
+    #[arg(long, default_value_t = 3)]
+    pub manifest_backups: usize,
+
+    /// Minimum confidence label required for manifest targets (UNKNOWN, LOW, MEDIUM, HIGH).
+    #[arg(long, default_value = "UNKNOWN", value_parser = ["UNKNOWN", "LOW", "MEDIUM", "HIGH"])]
+    pub manifest_min_confidence: String,
+
+    /// Alert when recommended p95 rises by at least this many milliseconds between watch cycles.
+    #[arg(long)]
+    pub alert_p95_increase_ms: Option<f64>,
+
+    /// Alert when recommended packet loss rises by at least this fraction between watch cycles.
+    #[arg(long)]
+    pub alert_packet_loss_increase: Option<f64>,
+
+    /// Exit watch mode when an alert is emitted.
+    #[arg(long)]
+    pub fail_on_alert: bool,
 }
 
 fn main() -> Result<()> {
@@ -170,6 +210,18 @@ fn main() -> Result<()> {
     }
     if let Some(path) = args.path {
         config.path = path;
+    }
+    if !args.expected_statuses.is_empty() {
+        config.expected_statuses = args.expected_statuses.clone();
+    }
+    if !args.required_body_markers.is_empty() {
+        config.required_body_markers = args.required_body_markers.clone();
+    }
+    if !args.required_headers.is_empty() {
+        config.required_headers = args.required_headers.clone();
+    }
+    if args.follow_redirects {
+        config.follow_redirects = true;
     }
     if let Some(sample_per_cidr) = args.sample_per_cidr {
         config.sample_per_cidr = sample_per_cidr;
@@ -264,6 +316,30 @@ fn main() -> Result<()> {
     if args.cli && args.watch.is_some() && args.format != "ndjson" {
         anyhow::bail!("--watch requires --cli --format ndjson");
     }
+    if let Some(value) = args.alert_p95_increase_ms {
+        if !value.is_finite() || value < 0.0 {
+            anyhow::bail!("--alert-p95-increase-ms must be finite and non-negative");
+        }
+    }
+    if let Some(value) = args.alert_packet_loss_increase {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            anyhow::bail!("--alert-packet-loss-increase must be between 0 and 1");
+        }
+    }
+    if config
+        .expected_statuses
+        .iter()
+        .any(|status| !(100..=599).contains(status))
+    {
+        anyhow::bail!("--expect-status values must be between 100 and 599");
+    }
+    if config
+        .required_headers
+        .iter()
+        .any(|value| !value.contains('='))
+    {
+        anyhow::bail!("required headers must use name=value form");
+    }
 
     normalize_config(&mut config);
 
@@ -307,9 +383,22 @@ fn main() -> Result<()> {
             args.colo,
             args.country,
             args.watch,
+            args.manifest,
+            args.manifest_backups,
+            args.manifest_min_confidence,
+            args.alert_p95_increase_ms,
+            args.alert_packet_loss_increase,
+            args.fail_on_alert,
         )
     } else {
-        tui::run_tui(config, args.cidr, args.ips, args.seed, args.watch)
+        tui::run_tui(
+            config,
+            args.cidr,
+            args.ips,
+            args.seed,
+            args.watch,
+            args.manifest,
+        )
     }
 }
 
@@ -323,6 +412,139 @@ fn normalize_config(config: &mut AppConfig) {
     if config.probes == 0 {
         config.probes = 1;
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HealthThresholds {
+    min_success_rate: Option<f64>,
+    max_p95_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct Manifest {
+    schema_version: u32,
+    generated_at_unix: u64,
+    host: String,
+    path: String,
+    seed: u64,
+    targets: Vec<String>,
+    validation: ManifestValidation,
+    thresholds: HealthThresholdsOutput,
+    primary: Option<scanner::ProbeResult>,
+    backups: Vec<scanner::ProbeResult>,
+    failure: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ManifestValidation {
+    expected_statuses: Vec<u16>,
+    required_body_markers: Vec<String>,
+    required_headers: Vec<String>,
+    follow_redirects: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct HealthThresholdsOutput {
+    min_success_rate: Option<f64>,
+    max_p95_ms: Option<f64>,
+    min_confidence: String,
+}
+
+fn confidence_rank(value: &str) -> u8 {
+    match value {
+        "HIGH" => 3,
+        "MEDIUM" => 2,
+        "LOW" => 1,
+        _ => 0,
+    }
+}
+
+fn healthy_result(
+    result: &scanner::ProbeResult,
+    thresholds: HealthThresholds,
+    min_confidence: &str,
+) -> bool {
+    result.ok > 0
+        && thresholds
+            .min_success_rate
+            .is_none_or(|min| result.success_rate >= min)
+        && thresholds
+            .max_p95_ms
+            .is_none_or(|max| result.p95 * 1000.0 <= max)
+        && confidence_rank(scanner::result_confidence(result)) >= confidence_rank(min_confidence)
+}
+
+pub(crate) fn build_manifest(
+    config: &AppConfig,
+    targets: Vec<String>,
+    results: &[scanner::ProbeResult],
+    thresholds: HealthThresholds,
+    min_confidence: &str,
+    backup_count: usize,
+) -> Manifest {
+    let mut healthy: Vec<scanner::ProbeResult> = results
+        .iter()
+        .filter(|result| healthy_result(result, thresholds, min_confidence))
+        .cloned()
+        .collect();
+    healthy.sort_by(crate::tui::App::natural_cmp);
+    let primary = healthy.first().cloned();
+    let backups = healthy.into_iter().skip(1).take(backup_count).collect();
+    Manifest {
+        schema_version: 1,
+        generated_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        host: config.host.clone(),
+        path: config.path.clone(),
+        seed: config.seed,
+        targets,
+        validation: ManifestValidation {
+            expected_statuses: config.expected_statuses.clone(),
+            required_body_markers: config.required_body_markers.clone(),
+            required_headers: config.required_headers.clone(),
+            follow_redirects: config.follow_redirects,
+        },
+        thresholds: HealthThresholdsOutput {
+            min_success_rate: thresholds.min_success_rate,
+            max_p95_ms: thresholds.max_p95_ms,
+            min_confidence: min_confidence.to_string(),
+        },
+        failure: primary
+            .is_none()
+            .then(|| "no target met manifest health thresholds".to_string()),
+        primary,
+        backups,
+    }
+}
+
+pub(crate) fn write_manifest(path: &str, manifest: &Manifest) -> Result<()> {
+    let content = serde_json::to_vec_pretty(manifest)?;
+    let target = std::path::Path::new(path);
+    let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let file_name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("manifest.json");
+    let temp = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp)?;
+    let result = (|| -> Result<()> {
+        use std::io::Write;
+        file.write_all(&content)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, target)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -340,6 +562,12 @@ fn cli_mode(
     colo: Option<String>,
     country: Option<String>,
     watch: Option<u64>,
+    manifest_path: Option<String>,
+    manifest_backups: usize,
+    manifest_min_confidence: String,
+    alert_p95_increase_ms: Option<f64>,
+    alert_packet_loss_increase: Option<f64>,
+    fail_on_alert: bool,
 ) -> Result<()> {
     let has_explicit_targets = ips.is_some() || targets_file.is_some();
     let targets = if let Some(path) = targets_file {
@@ -347,6 +575,7 @@ fn cli_mode(
     } else {
         scanner::collect_targets_with_optional_seed(&config, &cidr, &ips, seed)?
     };
+    let manifest_targets = targets.clone();
     if let Some(interval) = watch {
         return cli_watch(
             config,
@@ -357,6 +586,12 @@ fn cli_mode(
             fail_if_no_healthy_target,
             colo,
             country,
+            manifest_path,
+            manifest_backups,
+            manifest_min_confidence,
+            alert_p95_increase_ms,
+            alert_packet_loss_increase,
+            fail_on_alert,
         );
     }
     let total = targets.len();
@@ -423,9 +658,14 @@ fn cli_mode(
 
     results.sort_by(crate::tui::App::natural_cmp);
     let healthy = results.iter().any(|result| {
-        result.ok > 0
-            && min_success_rate.is_none_or(|min| result.success_rate >= min)
-            && max_p95_ms.is_none_or(|max| result.p95 * 1000.0 <= max)
+        healthy_result(
+            result,
+            HealthThresholds {
+                min_success_rate,
+                max_p95_ms,
+            },
+            "UNKNOWN",
+        )
     });
     let health_error = fail_if_no_healthy_target && !healthy;
 
@@ -438,7 +678,7 @@ fn cli_mode(
             .collect::<std::result::Result<Vec<_>, _>>()?
             .join("\n"),
         _ => {
-            let mut text = String::from("rank\tip\tcolo\tcountry\tprotocol\tok\tfail\tsuccess_rate\tconfidence\tavg\tp50\tp90\tp95\tmax\tjitter\tloss\tpkt_loss\tcold_ms\tmin_score\tmax_score\tsamples\tfailures\n");
+            let mut text = String::from("rank\tip\tcolo\tcountry\tprotocol\tok\tfail\tsuccess_rate\tconfidence\tavg\tp50\tp90\tp95\tmax\tjitter\tloss\tpkt_loss\tcold_ms\tmin_score\tmax_score\tsamples\tfailures\tdiagnostics\n");
             for (i, r) in rows.iter().enumerate() {
                 let samples = r
                     .samples
@@ -446,9 +686,15 @@ fn cli_mode(
                     .map(|x| format!("{:.3}", x))
                     .collect::<Vec<_>>()
                     .join(",");
+                let diagnostics = r
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| format!("{:?}:{}", diagnostic.category, diagnostic.message))
+                    .collect::<Vec<_>>()
+                    .join(",");
 
                 text.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{:.1}\t{}\t{:.5}\t{:.5}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{:.1}\t{}\t{:.5}\t{:.5}\t{}\t{}\t{}\n",
                     i + 1,
                     r.ip,
                     r.colo.clone().unwrap_or_default(),
@@ -470,7 +716,8 @@ fn cli_mode(
                     r.min_score,
                     r.max_score,
                     samples,
-                    r.failures.join(",")
+                    r.failures.join(","),
+                    diagnostics
                 ));
             }
             text
@@ -480,6 +727,21 @@ fn cli_mode(
         std::fs::write(path, rendered)?;
     } else {
         println!("{rendered}");
+    }
+
+    if let Some(path) = manifest_path {
+        let manifest = build_manifest(
+            &config,
+            manifest_targets,
+            &results,
+            HealthThresholds {
+                min_success_rate,
+                max_p95_ms,
+            },
+            &manifest_min_confidence,
+            manifest_backups,
+        );
+        write_manifest(&path, &manifest)?;
     }
 
     if health_error {
@@ -499,11 +761,22 @@ fn cli_watch(
     fail_if_no_healthy_target: bool,
     colo: Option<String>,
     country: Option<String>,
+    manifest_path: Option<String>,
+    manifest_backups: usize,
+    manifest_min_confidence: String,
+    alert_p95_increase_ms: Option<f64>,
+    alert_packet_loss_increase: Option<f64>,
+    fail_on_alert: bool,
 ) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     let mut cycle = 0u64;
-    let mut previous_recommendation: Option<String> = None;
+    let thresholds = HealthThresholds {
+        min_success_rate,
+        max_p95_ms,
+    };
+    let mut previous: Option<scanner::ProbeResult> = None;
     let mut previous_healthy: Option<bool> = None;
+    let mut previous_manifest: Option<Manifest> = None;
     loop {
         cycle += 1;
         println!(
@@ -535,20 +808,74 @@ fn cli_watch(
             });
         }
         results.sort_by(crate::tui::App::natural_cmp);
-        let healthy = results.iter().any(|r| {
-            r.ok > 0
-                && min_success_rate.is_none_or(|v| r.success_rate >= v)
-                && max_p95_ms.is_none_or(|v| r.p95 * 1000.0 <= v)
-        });
-        let recommendation = results.first().map(|r| r.ip.clone());
+        let manifest = build_manifest(
+            &config,
+            targets.clone(),
+            &results,
+            thresholds,
+            &manifest_min_confidence,
+            manifest_backups,
+        );
+        if let Some(path) = &manifest_path {
+            write_manifest(path, &manifest)?;
+            println!(
+                "{}",
+                serde_json::json!({"event":"manifest_written", "cycle":cycle, "path":path, "primary":manifest.primary.as_ref().map(|r| &r.ip)})
+            );
+        }
+        let healthy = manifest.primary.is_some();
+        let recommendation = manifest.primary.as_ref().map(|r| r.ip.clone());
+        if let Some(before) = &previous_manifest {
+            let before_ips = std::iter::once(before.primary.as_ref().map(|r| r.ip.clone()))
+                .chain(before.backups.iter().map(|r| Some(r.ip.clone())))
+                .collect::<Vec<_>>();
+            let current_ips = std::iter::once(manifest.primary.as_ref().map(|r| r.ip.clone()))
+                .chain(manifest.backups.iter().map(|r| Some(r.ip.clone())))
+                .collect::<Vec<_>>();
+            if before_ips != current_ips {
+                println!(
+                    "{}",
+                    serde_json::json!({"event":"manifest_changed", "cycle":cycle, "primary":recommendation})
+                );
+            }
+        }
         println!(
             "{}",
             serde_json::json!({"event":"cycle_completed", "cycle":cycle, "healthy":healthy, "recommendation":recommendation, "results":results})
         );
-        if cycle > 1 && recommendation != previous_recommendation {
+        let mut alerts = Vec::new();
+        if cycle > 1 {
+            let before_ip = previous.as_ref().map(|result| result.ip.clone());
+            if before_ip != recommendation {
+                alerts.push(serde_json::json!({"kind":"recommendation_changed", "from":before_ip, "to":recommendation}));
+            }
+        }
+        if let (Some(before), Some(current)) = (previous.as_ref(), manifest.primary.as_ref()) {
+            if before.ip == current.ip {
+                if let Some(threshold) = alert_p95_increase_ms {
+                    let delta = (current.p95 - before.p95) * 1000.0;
+                    if delta >= threshold {
+                        alerts.push(serde_json::json!({"kind":"p95_regression", "increase_ms":delta, "threshold_ms":threshold}));
+                    }
+                }
+                if let Some(threshold) = alert_packet_loss_increase {
+                    let delta = current.packet_loss - before.packet_loss;
+                    if delta >= threshold {
+                        alerts.push(serde_json::json!({"kind":"packet_loss_regression", "increase":delta, "threshold":threshold}));
+                    }
+                }
+                if before.colo != current.colo {
+                    alerts.push(serde_json::json!({"kind":"colo_changed", "from":before.colo, "to":current.colo}));
+                }
+            }
+        }
+        if cycle > 1 && !healthy && previous_healthy != Some(false) {
+            alerts.push(serde_json::json!({"kind":"no_healthy_target"}));
+        }
+        for alert in &alerts {
             println!(
                 "{}",
-                serde_json::json!({"event":"recommendation_changed", "cycle":cycle, "ip":recommendation})
+                serde_json::json!({"event":"alert", "cycle":cycle, "alert":alert})
             );
         }
         if cycle > 1 && previous_healthy != Some(healthy) {
@@ -557,21 +884,19 @@ fn cli_watch(
                 serde_json::json!({"event":"target_health_changed", "cycle":cycle, "healthy":healthy})
             );
         }
-        let record = serde_json::json!({"schema_version":1, "cycle":cycle, "host":config.host, "path":config.path, "targets":targets, "healthy":healthy, "recommendation":recommendation, "results":results});
+        let record = serde_json::json!({"schema_version":1, "cycle":cycle, "host":config.host, "path":config.path, "targets":targets, "healthy":healthy, "recommendation":recommendation, "alerts":alerts.clone(), "manifest":manifest, "results":results});
         if let Err(error) = config::append_history(&record) {
             eprintln!("history write failed: {error}");
         }
-        let _ = results;
-        previous_recommendation = recommendation;
+        previous = manifest.primary.clone();
         previous_healthy = Some(healthy);
-        if fail_if_no_healthy_target && !healthy {
+        previous_manifest = Some(manifest);
+        if (fail_if_no_healthy_target && !healthy) || (fail_on_alert && !alerts.is_empty()) {
             println!(
                 "{}",
-                serde_json::json!({"event":"health_failure", "cycle":cycle})
+                serde_json::json!({"event":"health_failure", "cycle":cycle, "alerts":alerts})
             );
-            return Err(anyhow::anyhow!(
-                "no target met the configured health thresholds"
-            ));
+            return Err(anyhow::anyhow!("watch alert policy triggered"));
         }
         std::thread::sleep(std::time::Duration::from_secs(interval.max(1)));
     }
@@ -579,7 +904,7 @@ fn cli_watch(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_config;
+    use super::{build_manifest, normalize_config, write_manifest, HealthThresholds};
     use crate::config::AppConfig;
     use crate::scanner;
 
@@ -595,6 +920,51 @@ mod tests {
         assert_eq!(config.sample_per_cidr, 1);
         assert_eq!(config.probes, 1);
         assert_eq!(config.concurrency, 1);
+    }
+
+    #[test]
+    fn empty_scan_produces_explainable_manifest() {
+        let config = AppConfig::default();
+        let manifest = build_manifest(
+            &config,
+            vec!["192.0.2.1".to_string()],
+            &[],
+            HealthThresholds {
+                min_success_rate: Some(1.0),
+                max_p95_ms: Some(100.0),
+            },
+            "HIGH",
+            3,
+        );
+        assert!(manifest.primary.is_none());
+        assert_eq!(manifest.backups.len(), 0);
+        assert!(manifest.failure.is_some());
+        assert_eq!(manifest.thresholds.min_confidence, "HIGH");
+    }
+
+    #[test]
+    fn manifest_write_replaces_target_with_valid_json() {
+        let path = std::env::temp_dir().join(format!(
+            "cleanscan-manifest-test-{}.json",
+            std::process::id()
+        ));
+        let manifest = build_manifest(
+            &AppConfig::default(),
+            Vec::new(),
+            &[],
+            HealthThresholds {
+                min_success_rate: None,
+                max_p95_ms: None,
+            },
+            "UNKNOWN",
+            3,
+        );
+        write_manifest(path.to_str().unwrap(), &manifest).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["schema_version"], 1);
+        assert!(parsed["primary"].is_null());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

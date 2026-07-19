@@ -305,6 +305,10 @@ pub struct App {
     pub watch_interval: Option<Duration>,
     pub watch_cycle: u64,
     pub watch_due: Option<Instant>,
+    pub manifest_path: Option<String>,
+    pub last_watch_primary: Option<String>,
+    pub last_watch_healthy: Option<bool>,
+    pub alert_message: Option<String>,
     /// Animation lifecycle state for each modal layer, driven by `render`.
     pub help_overlay: OverlayState,
     pub quit_overlay: OverlayState,
@@ -559,6 +563,10 @@ impl App {
             watch_interval: None,
             watch_cycle: 0,
             watch_due: None,
+            manifest_path: None,
+            last_watch_primary: None,
+            last_watch_healthy: None,
+            alert_message: None,
             help_overlay: modal_state(),
             quit_overlay: modal_state(),
             speed_confirm_overlay: modal_state(),
@@ -1107,6 +1115,7 @@ pub fn run_tui(
     cli_ips: Option<String>,
     explicit_seed: Option<u64>,
     watch_interval: Option<u64>,
+    manifest_path: Option<String>,
 ) -> anyhow::Result<()> {
     let has_cli_targets = cli_ips.is_some() || !cli_cidr.is_empty();
 
@@ -1130,6 +1139,7 @@ pub fn run_tui(
     let _guard = RestoreGuard;
     let mut app = App::new((*config_arc).clone(), has_cli_targets, paused.clone());
     app.watch_interval = watch_interval.map(|seconds| Duration::from_secs(seconds.max(1)));
+    app.manifest_path = manifest_path;
     if has_cli_targets {
         app.set_explicit_target_source(cli_cidr.clone(), cli_ips.clone());
     }
@@ -1296,9 +1306,39 @@ pub fn run_tui(
                         if !app.last_targets.is_empty() {
                             app.watch_cycle = app.watch_cycle.saturating_add(1);
                         }
-                        let healthy = app.results.iter().any(|r| r.ok > 0);
+                        let manifest = crate::build_manifest(
+                            &app.config,
+                            app.last_targets.clone(),
+                            &app.results,
+                            crate::HealthThresholds {
+                                min_success_rate: None,
+                                max_p95_ms: None,
+                            },
+                            "UNKNOWN",
+                            3,
+                        );
+                        if let Some(path) = &app.manifest_path {
+                            if let Err(error) = crate::write_manifest(path, &manifest) {
+                                app.toast_warn(format!("Manifest write failed: {error}"));
+                            }
+                        }
+                        let healthy = manifest.primary.is_some();
                         let recommendation =
-                            app.sorted_results().first().map(|result| result.ip.clone());
+                            manifest.primary.as_ref().map(|result| result.ip.clone());
+                        let mut alerts = Vec::new();
+                        if app.watch_cycle > 1
+                            && app.last_watch_primary.as_ref() != recommendation.as_ref()
+                        {
+                            alerts.push("recommended target changed".to_string());
+                        }
+                        if app.watch_cycle > 1 && !healthy && app.last_watch_healthy != Some(false)
+                        {
+                            alerts.push("no healthy target".to_string());
+                        }
+                        app.alert_message = (!alerts.is_empty()).then(|| alerts.join("; "));
+                        if let Some(message) = &app.alert_message {
+                            app.toast_warn(format!("Watch alert: {message}"));
+                        }
                         let record = serde_json::json!({
                             "schema_version": 1,
                             "cycle": app.watch_cycle,
@@ -1307,10 +1347,32 @@ pub fn run_tui(
                             "targets": app.last_targets,
                             "healthy": healthy,
                             "recommendation": recommendation,
+                            "alerts": alerts,
+                            "manifest": manifest,
                             "results": app.results,
                         });
                         if let Err(error) = crate::config::append_history(&record) {
                             app.toast_warn(format!("History write failed: {error}"));
+                        }
+                        app.last_watch_primary = recommendation;
+                        app.last_watch_healthy = Some(healthy);
+                    }
+                    if app.watch_interval.is_none() {
+                        if let Some(path) = &app.manifest_path {
+                            let manifest = crate::build_manifest(
+                                &app.config,
+                                app.last_targets.clone(),
+                                &app.results,
+                                crate::HealthThresholds {
+                                    min_success_rate: None,
+                                    max_p95_ms: None,
+                                },
+                                "UNKNOWN",
+                                3,
+                            );
+                            if let Err(error) = crate::write_manifest(path, &manifest) {
+                                app.toast_warn(format!("Manifest write failed: {error}"));
+                            }
                         }
                     }
                     if let Some(interval) = app.watch_interval {
