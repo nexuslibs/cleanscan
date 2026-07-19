@@ -1166,10 +1166,17 @@ fn prepare_watch_targets(
     mut targets: Vec<String>,
     source_fingerprint: u64,
 ) -> Vec<String> {
-    if app.watch_interval.is_none() || app.watch_state.is_some() {
+    if app.watch_interval.is_none() {
         return targets;
     }
     let profile_fingerprint = watch_profile_fingerprint(&app.config);
+    if let Some(state) = &app.watch_state {
+        if state.compatible(source_fingerprint, profile_fingerprint) {
+            return targets;
+        }
+        app.watch_state = None;
+        app.watch_state_path = None;
+    }
     let path = app
         .watch_state_path
         .clone()

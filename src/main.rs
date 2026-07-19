@@ -431,6 +431,13 @@ fn main() -> Result<()> {
         );
     }
 
+    let watch_policy = watch::WatchPolicy {
+        promote_after: args.watch_promote_after,
+        demote_after: args.watch_demote_after,
+        switch_margin: args.watch_switch_margin,
+        cooldown_cycles: args.watch_cooldown_cycles,
+    };
+
     if args.cli {
         cli_mode(
             config,
@@ -452,12 +459,7 @@ fn main() -> Result<()> {
             args.alert_p95_increase_ms,
             args.alert_packet_loss_increase,
             args.fail_on_alert,
-            watch::WatchPolicy {
-                promote_after: args.watch_promote_after,
-                demote_after: args.watch_demote_after,
-                switch_margin: args.watch_switch_margin,
-                cooldown_cycles: args.watch_cooldown_cycles,
-            },
+            watch_policy,
             args.watch_state.as_deref(),
             args.watch_new_sample,
         )
@@ -473,12 +475,7 @@ fn main() -> Result<()> {
             args.max_p95_ms,
             args.manifest_min_confidence,
             args.manifest_backups,
-            watch::WatchPolicy {
-                promote_after: args.watch_promote_after,
-                demote_after: args.watch_demote_after,
-                switch_margin: args.watch_switch_margin,
-                cooldown_cycles: args.watch_cooldown_cycles,
-            },
+            watch_policy,
             args.watch_state.as_deref(),
             args.watch_new_sample,
         )
