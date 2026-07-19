@@ -675,19 +675,21 @@ fn cli_mode(
     let targets_file_identity = targets_file
         .as_deref()
         .and_then(|path| std::fs::read(path).ok());
+    let effective_seed = seed
+        .or_else(|| (config.seed != 0).then_some(config.seed))
+        .unwrap_or_else(rand::random);
     let source_identity = (
         cidr.clone(),
         ips_identity,
         targets_file_identity,
         config.sample_per_cidr,
-        config.seed,
-        seed,
+        effective_seed,
     );
     let source_fingerprint = watch::fingerprint(&source_identity);
     let targets = if let Some(path) = targets_file {
         scanner::load_ip_manifest(&path)?
     } else {
-        scanner::collect_targets_with_optional_seed(&config, &cidr, &ips, seed)?
+        scanner::collect_targets_with_optional_seed(&config, &cidr, &ips, Some(effective_seed))?
     };
     if let Some(interval) = watch {
         return cli_watch(
@@ -714,6 +716,9 @@ fn cli_mode(
     let manifest_targets = targets.clone();
     let total = targets.len();
     let use_two_phase = config.two_phase && !has_explicit_targets;
+    if use_two_phase && !config.health_checks.is_empty() {
+        anyhow::bail!("--two-phase cannot be combined with configured health checks");
+    }
 
     if !use_two_phase {
         eprintln!(
@@ -904,36 +909,28 @@ fn cli_watch(
         .map(std::path::PathBuf::from)
         .or_else(|| watch::default_state_path(&config.host, source_fingerprint))
         .ok_or_else(|| anyhow::anyhow!("cannot determine watch state path"))?;
-    let mut state = if !watch_new_sample {
+    let state = if !watch_new_sample {
         watch::load(&state_path)
             .filter(|saved| saved.compatible(source_fingerprint, profile_fingerprint))
     } else {
         None
     };
-    let targets = if let Some(saved) = &state {
-        saved.targets.clone()
+    let (targets, mut watch_state) = if let Some(saved) = state {
+        (saved.targets.clone(), saved)
     } else {
         let fresh =
             watch::WatchState::new(source_fingerprint, profile_fingerprint, targets.clone());
         watch::save(&state_path, &fresh)
             .map_err(|error| anyhow::anyhow!("failed to persist watch targets: {error}"))?;
-        fresh.targets.clone()
+        (fresh.targets.clone(), fresh)
     };
-    let mut cycle = state.as_ref().map_or(0, |saved| saved.cycle);
+    let mut cycle = watch_state.cycle;
     let thresholds = HealthThresholds {
         min_success_rate,
         max_p95_ms,
     };
     let mut previous_healthy: Option<bool> = None;
     let mut previous_manifest: Option<Manifest> = None;
-    if state.is_none() {
-        state = Some(watch::WatchState::new(
-            source_fingerprint,
-            profile_fingerprint,
-            targets.clone(),
-        ));
-    }
-    let mut watch_state = state.expect("watch state initialized");
     loop {
         cycle += 1;
         println!(
@@ -986,7 +983,10 @@ fn cli_watch(
         );
         let mut manifest = manifest;
         if let Some(stable) = transition.stable_primary.as_deref() {
-            manifest.primary = manifest_results.iter().find(|r| r.ip == stable).cloned();
+            manifest.primary = manifest_results
+                .iter()
+                .find(|r| r.ip == stable && healthy_result(r, thresholds, &manifest_min_confidence))
+                .cloned();
             manifest.backups = manifest_results
                 .iter()
                 .filter(|r| {

@@ -1,5 +1,7 @@
 use crate::scanner::ProbeResult;
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -132,8 +134,13 @@ impl WatchState {
                 self.unhealthy_streak = 0;
             }
         } else if self.candidate_streak >= policy.promote_after.max(1) {
-            self.stable_primary = observed.clone();
-            self.last_switch_cycle = Some(self.cycle);
+            let cooldown_ok = self
+                .last_switch_cycle
+                .is_none_or(|last| self.cycle.saturating_sub(last) >= policy.cooldown_cycles);
+            if cooldown_ok {
+                self.stable_primary = observed.clone();
+                self.last_switch_cycle = Some(self.cycle);
+            }
         }
 
         let changed = previous != self.stable_primary;
@@ -168,13 +175,12 @@ impl WatchState {
 }
 
 pub fn fingerprint<T: Serialize>(value: &T) -> u64 {
-    let bytes = serde_json::to_vec(value).expect("fingerprint input must serialize");
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
+    let Ok(bytes) = serde_json::to_vec(value) else {
+        return 0;
+    };
+    let mut hasher = DefaultHasher::new();
+    hasher.write(&bytes);
+    hasher.finish()
 }
 
 pub fn default_state_path(host: &str, source_fingerprint: u64) -> Option<PathBuf> {
@@ -189,9 +195,21 @@ pub fn default_state_path(host: &str, source_fingerprint: u64) -> Option<PathBuf
 }
 
 pub fn load(path: &std::path::Path) -> Option<WatchState> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|content| serde_json::from_str(&content).ok())
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            eprintln!("failed to read watch state {}: {error}", path.display());
+            return None;
+        }
+    };
+    match serde_json::from_str(&content) {
+        Ok(state) => Some(state),
+        Err(error) => {
+            eprintln!("failed to parse watch state {}: {error}", path.display());
+            None
+        }
+    }
 }
 
 pub fn save(path: &std::path::Path, state: &WatchState) -> std::io::Result<()> {

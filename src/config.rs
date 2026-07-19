@@ -1,6 +1,5 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::{fs, io::Write};
 
@@ -12,15 +11,6 @@ pub struct HealthCheck {
     pub required: bool,
     #[serde(default = "default_health_check_weight")]
     pub weight: f64,
-}
-
-impl Hash for HealthCheck {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.name.hash(state);
-        self.path.hash(state);
-        self.required.hash(state);
-        self.weight.to_bits().hash(state);
-    }
 }
 
 fn default_health_check_required() -> bool {

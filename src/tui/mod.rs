@@ -1275,7 +1275,10 @@ pub fn run_tui(
                     return Err(format!("failed to create tokio runtime: {e}"));
                 }
             };
-            if scanner_config.two_phase && !selected_cidrs.is_empty() {
+            if scanner_config.two_phase
+                && !selected_cidrs.is_empty()
+                && scanner_config.health_checks.is_empty()
+            {
                 rt.block_on(crate::scanner::run_scan_two_phase(
                     selected_cidrs,
                     scanner_config,
@@ -1439,24 +1442,9 @@ pub fn run_tui(
                         if !app.last_targets.is_empty() {
                             app.watch_cycle = app.watch_cycle.saturating_add(1);
                         }
-                        let manifest = build_current_manifest(&app);
-                        if let Some(path) = &app.manifest_path {
-                            queue_manifest_write(path, manifest.clone(), &manifest_tx);
-                        }
-                        let healthy = manifest.primary.is_some();
-                        let recommendation =
-                            manifest.primary.as_ref().map(|result| result.ip.clone());
                         if app.watch_state.is_none() {
                             let source_fingerprint = crate::watch::fingerprint(&app.last_targets);
-                            let profile_fingerprint = crate::watch::fingerprint(&(
-                                app.config.host.clone(),
-                                app.config.path.clone(),
-                                app.config.expected_statuses.clone(),
-                                app.config.required_body_markers.clone(),
-                                app.config.required_headers.clone(),
-                                app.config.follow_redirects,
-                                app.config.health_checks.clone(),
-                            ));
+                            let profile_fingerprint = watch_profile_fingerprint(&app.config);
                             app.watch_state = Some(crate::watch::WatchState::new(
                                 source_fingerprint,
                                 profile_fingerprint,
@@ -1476,6 +1464,68 @@ pub fn run_tui(
                                     &watch_min_confidence,
                                 )
                             });
+                        let mut manifest_results = app.results.clone();
+                        if let Some(stable) = transition.stable_primary.as_deref() {
+                            manifest_results.sort_by(|a, b| {
+                                (a.ip != stable)
+                                    .cmp(&(b.ip != stable))
+                                    .then_with(|| App::natural_cmp(a, b))
+                            });
+                        } else {
+                            manifest_results.sort_by(App::natural_cmp);
+                        }
+                        let mut manifest = build_current_manifest(&app);
+                        if let Some(stable) = transition.stable_primary.as_deref() {
+                            manifest.primary = manifest_results
+                                .iter()
+                                .find(|result| {
+                                    result.ip == stable
+                                        && crate::healthy_result(
+                                            result,
+                                            app.manifest_thresholds,
+                                            &app.manifest_min_confidence,
+                                        )
+                                })
+                                .cloned();
+                            manifest.backups = manifest_results
+                                .iter()
+                                .filter(|result| {
+                                    result.ip != stable
+                                        && crate::healthy_result(
+                                            result,
+                                            app.manifest_thresholds,
+                                            &app.manifest_min_confidence,
+                                        )
+                                })
+                                .take(app.manifest_backups)
+                                .cloned()
+                                .collect();
+                            manifest.failure = manifest
+                                .primary
+                                .is_none()
+                                .then(|| "stable primary is no longer available".to_string());
+                        } else {
+                            manifest.primary = None;
+                            manifest.backups = manifest_results
+                                .iter()
+                                .filter(|result| {
+                                    crate::healthy_result(
+                                        result,
+                                        app.manifest_thresholds,
+                                        &app.manifest_min_confidence,
+                                    )
+                                })
+                                .take(app.manifest_backups)
+                                .cloned()
+                                .collect();
+                            manifest.failure =
+                                Some("no stable target met the watch policy".to_string());
+                        }
+                        if let Some(path) = &app.manifest_path {
+                            queue_manifest_write(path, manifest.clone(), &manifest_tx);
+                        }
+                        let healthy = manifest.primary.is_some();
+                        let recommendation = transition.stable_primary.clone();
                         let mut alerts = Vec::new();
                         if transition.changed {
                             alerts.push("recommended target changed".to_string());
