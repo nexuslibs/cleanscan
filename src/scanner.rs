@@ -802,20 +802,24 @@ fn select_next_target_adaptive(
     probe_count: usize,
     min_probes: usize,
 ) -> Option<usize> {
+    let bootstrap_intervals: Vec<(f64, f64)> = states
+        .iter()
+        .map(|state| bootstrap_score_interval(state, state.confidence))
+        .collect();
     states
         .iter()
         .enumerate()
         .filter(|(_, state)| state.has_remaining_probe(probe_count))
-        .min_by(|(_, left), (_, right)| {
+        .min_by(|(left_index, left), (right_index, right)| {
             let left_min = left.completed < min_probes;
             let right_min = right.completed < min_probes;
             right_min
                 .cmp(&left_min)
                 .then_with(|| {
-                    let left_width = bootstrap_score_interval(left, left.confidence);
-                    let right_width = bootstrap_score_interval(right, right.confidence);
-                    let lw = left_width.1 - left_width.0;
-                    let rw = right_width.1 - right_width.0;
+                    let (left_min, left_max) = bootstrap_intervals[*left_index];
+                    let (right_min, right_max) = bootstrap_intervals[*right_index];
+                    let lw = left_max - left_min;
+                    let rw = right_max - right_min;
                     rw.partial_cmp(&lw).unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .then_with(|| {
@@ -833,10 +837,14 @@ fn adaptive_should_stop(index: usize, states: &[TargetState], cfg: &AppConfig) -
     if state.completed < cfg.min_probes || state.samples.is_empty() {
         return false;
     }
-    let own = bootstrap_score_interval(state, cfg.confidence);
+    let bootstrap_intervals: Vec<(f64, f64)> = states
+        .iter()
+        .map(|state| bootstrap_score_interval(state, cfg.confidence))
+        .collect();
+    let own = bootstrap_intervals[index];
     states.iter().enumerate().any(|(other_index, other)| {
         other_index != index && other.completed >= cfg.min_probes && !other.samples.is_empty() && {
-            let other_bounds = bootstrap_score_interval(other, cfg.confidence);
+            let other_bounds = bootstrap_intervals[other_index];
             other_bounds.0 > own.1
         }
     })

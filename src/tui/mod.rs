@@ -1129,7 +1129,7 @@ pub fn run_tui(
     let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
     let _guard = RestoreGuard;
     let mut app = App::new((*config_arc).clone(), has_cli_targets, paused.clone());
-    app.watch_interval = watch_interval.map(Duration::from_secs);
+    app.watch_interval = watch_interval.map(|seconds| Duration::from_secs(seconds.max(1)));
     if has_cli_targets {
         app.set_explicit_target_source(cli_cidr.clone(), cli_ips.clone());
     }
@@ -1293,6 +1293,9 @@ pub fn run_tui(
                         }
                     }
                     if app.watch_interval.is_some() && app.scan_complete {
+                        if !app.last_targets.is_empty() {
+                            app.watch_cycle = app.watch_cycle.saturating_add(1);
+                        }
                         let healthy = app.results.iter().any(|r| r.ok > 0);
                         let recommendation =
                             app.sorted_results().first().map(|result| result.ip.clone());
@@ -1312,7 +1315,6 @@ pub fn run_tui(
                     }
                     if let Some(interval) = app.watch_interval {
                         if !app.last_targets.is_empty() {
-                            app.watch_cycle = app.watch_cycle.saturating_add(1);
                             app.watch_due = Some(Instant::now() + interval);
                             app.toast_info(format!(
                                 "Watch cycle {} complete; next scan in {}s",
@@ -1322,17 +1324,14 @@ pub fn run_tui(
                         }
                     }
                 }
+            }
 
-                if app.scan_complete
-                    && scanner.is_none()
-                    && app.watch_due.is_some_and(|due| Instant::now() >= due)
-                {
-                    app.results.clear();
-                    app.scan_complete = false;
-                    app.watch_due = None;
-                    app.rescan_targets = Some(app.last_targets.clone());
-                    app.pending_start = true;
-                }
+            if app.watch_due.is_some_and(|due| Instant::now() >= due) {
+                app.results.clear();
+                app.scan_complete = false;
+                app.watch_due = None;
+                app.rescan_targets = Some(app.last_targets.clone());
+                app.pending_start = true;
             }
 
             if app.screen == Screen::SpeedTesting
