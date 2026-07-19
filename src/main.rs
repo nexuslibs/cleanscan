@@ -850,22 +850,29 @@ fn cli_watch(
                 alerts.push(serde_json::json!({"kind":"recommendation_changed", "from":before_ip, "to":recommendation}));
             }
         }
-        if let (Some(before), Some(current)) = (previous.as_ref(), manifest.primary.as_ref()) {
-            if before.ip == current.ip {
+        if let Some(current) = manifest.primary.as_ref() {
+            let baseline = previous_manifest.as_ref().and_then(|manifest| {
+                manifest
+                    .primary
+                    .iter()
+                    .chain(manifest.backups.iter())
+                    .find(|result| result.ip == current.ip)
+            });
+            if let Some(before) = baseline {
                 if let Some(threshold) = alert_p95_increase_ms {
                     let delta = (current.p95 - before.p95) * 1000.0;
                     if delta >= threshold {
-                        alerts.push(serde_json::json!({"kind":"p95_regression", "increase_ms":delta, "threshold_ms":threshold}));
+                        alerts.push(serde_json::json!({"kind":"p95_regression", "ip":current.ip, "increase_ms":delta, "threshold_ms":threshold}));
                     }
                 }
                 if let Some(threshold) = alert_packet_loss_increase {
                     let delta = current.packet_loss - before.packet_loss;
                     if delta >= threshold {
-                        alerts.push(serde_json::json!({"kind":"packet_loss_regression", "increase":delta, "threshold":threshold}));
+                        alerts.push(serde_json::json!({"kind":"packet_loss_regression", "ip":current.ip, "increase":delta, "threshold":threshold}));
                     }
                 }
                 if before.colo != current.colo {
-                    alerts.push(serde_json::json!({"kind":"colo_changed", "from":before.colo, "to":current.colo}));
+                    alerts.push(serde_json::json!({"kind":"colo_changed", "ip":current.ip, "from":before.colo, "to":current.colo}));
                 }
             }
         }
@@ -891,7 +898,13 @@ fn cli_watch(
         previous = manifest.primary.clone();
         previous_healthy = Some(healthy);
         previous_manifest = Some(manifest);
-        if (fail_if_no_healthy_target && !healthy) || (fail_on_alert && !alerts.is_empty()) {
+        let actionable_alert = alerts.iter().any(|alert| {
+            alert
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind != "recommendation_changed")
+        });
+        if (fail_if_no_healthy_target && !healthy) || (fail_on_alert && actionable_alert) {
             println!(
                 "{}",
                 serde_json::json!({"event":"health_failure", "cycle":cycle, "alerts":alerts})

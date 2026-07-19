@@ -550,6 +550,8 @@ fn validate_response(
                 elapsed_ms: None,
             });
         };
+        let name = name.trim();
+        let expected = expected.trim();
         if headers.get(name).and_then(|value| value.to_str().ok()) != Some(expected) {
             return Some(ProbeDiagnostic {
                 category: DiagnosticCategory::ValidationHeader,
@@ -1421,7 +1423,7 @@ mod tests {
     fn validation_accepts_default_2xx_and_required_content() {
         let config = AppConfig {
             required_body_markers: vec!["colo=FRA".to_string()],
-            required_headers: vec!["content-type=text/plain".to_string()],
+            required_headers: vec![" content-type = text/plain ".to_string()],
             ..AppConfig::default()
         };
         let mut headers = reqwest::header::HeaderMap::new();
