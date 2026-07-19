@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.0](https://github.com/nexuslibs/cleanscan/compare/v0.7.0...v0.8.0) (2026-07-19)
+
+
+### Features
+
+* enhance probe results with completed requests and update ranking criteria to include jitter and packet loss ([1980114](https://github.com/nexuslibs/cleanscan/commit/1980114b4a10b714ba6ad8c58ff9a60c32991ca5))
+* measure latency jitter and packet loss with stability-aware ran… ([554b748](https://github.com/nexuslibs/cleanscan/commit/554b748e6b1d699941089ffaa7671d0781b5d15e))
+* measure latency jitter and packet loss with stability-aware ranking ([88fb087](https://github.com/nexuslibs/cleanscan/commit/88fb0874b435d18deeefe353aea7e92c817215ec))
+* update ranking system to prioritize recommendation score, add validation for stability and loss weights ([96ffebb](https://github.com/nexuslibs/cleanscan/commit/96ffebbb40d1c3fcfbc9c9c2f784c212d8e27c29))
+* update README and dashboard to reflect new ranking criteria and adjustable weights for stability and loss ([624fd87](https://github.com/nexuslibs/cleanscan/commit/624fd87c60a999bc6a3b77d948646d777e3e11c5))
+
 ## [0.7.0](https://github.com/nexuslibs/cleanscan/compare/v0.6.0...v0.7.0) (2026-07-18)
 
 
