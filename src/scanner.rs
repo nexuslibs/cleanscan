@@ -1327,7 +1327,8 @@ pub async fn run_profile_scan(
         } else {
             0.0
         };
-        merged.health_ok = required_ok;
+        let aggregate_healthy = entries.iter().any(|(_, result)| result.ok > 0);
+        merged.health_ok = required_ok && aggregate_healthy;
         merged.checks = entries
             .iter()
             .map(|(check, result)| CheckResult {
@@ -1345,7 +1346,6 @@ pub async fn run_profile_scan(
                 colo: result.colo.clone(),
             })
             .collect();
-        let aggregate_healthy = entries.iter().any(|(_, result)| result.ok > 0);
         merged.decision = if !required_ok {
             "required_check_failed".to_string()
         } else if !aggregate_healthy {
