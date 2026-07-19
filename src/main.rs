@@ -401,6 +401,7 @@ fn main() -> Result<()> {
             args.min_success_rate,
             args.max_p95_ms,
             args.manifest_min_confidence,
+            args.manifest_backups,
         )
     }
 }

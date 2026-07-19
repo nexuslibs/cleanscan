@@ -308,6 +308,7 @@ pub struct App {
     pub manifest_path: Option<String>,
     pub manifest_thresholds: crate::HealthThresholds,
     pub manifest_min_confidence: String,
+    pub manifest_backups: usize,
     pub last_watch_primary: Option<String>,
     pub last_watch_healthy: Option<bool>,
     pub alert_message: Option<String>,
@@ -571,6 +572,7 @@ impl App {
                 max_p95_ms: None,
             },
             manifest_min_confidence: "UNKNOWN".to_string(),
+            manifest_backups: 3,
             last_watch_primary: None,
             last_watch_healthy: None,
             alert_message: None,
@@ -1139,7 +1141,7 @@ fn build_current_manifest(app: &App) -> crate::Manifest {
         &app.results,
         app.manifest_thresholds,
         &app.manifest_min_confidence,
-        3,
+        app.manifest_backups,
     )
 }
 
@@ -1168,6 +1170,7 @@ pub fn run_tui(
     min_success_rate: Option<f64>,
     max_p95_ms: Option<f64>,
     manifest_min_confidence: String,
+    manifest_backups: usize,
 ) -> anyhow::Result<()> {
     let has_cli_targets = cli_ips.is_some() || !cli_cidr.is_empty();
 
@@ -1198,6 +1201,7 @@ pub fn run_tui(
         max_p95_ms,
     };
     app.manifest_min_confidence = manifest_min_confidence;
+    app.manifest_backups = manifest_backups;
     if has_cli_targets {
         app.set_explicit_target_source(cli_cidr.clone(), cli_ips.clone());
     }
