@@ -41,6 +41,9 @@ const WIDTHS: [Constraint; 14] = [
 pub fn render(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) {
     if area.width < 80 || area.height < 24 {
         render_terminal_too_small(frame, area);
+        // Keep the result-details overlay's lifecycle running (so it can still
+        // be dismissed with its close animation) even on a too-small terminal.
+        render_result_details(app, frame, area, elapsed);
         return;
     }
 

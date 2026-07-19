@@ -2236,14 +2236,20 @@ impl App {
         // Track the pointer so buttons can render a hover state.
         self.hover_pos = Some((m.column, m.row));
 
-        // While the quit-confirm modal is up, only its buttons are live.
-        if self.confirm_quit {
+        // While the quit-confirm overlay is lifecycle-active (opening, open,
+        // or closing), all input is captured. Buttons are only activatable
+        // once the overlay has fully opened, so clicks during the open/close
+        // animation neither fall through to the dashboard nor dismiss the
+        // modal prematurely.
+        if self.quit_overlay.inner_area().is_some() {
             if let MouseEventKind::Down(MouseButton::Left) = m.kind {
                 let p = (m.column, m.row);
-                for (rect, action) in self.buttons.clone() {
-                    if point_in(rect, p) {
-                        self.activate_button(action);
-                        break;
+                if self.quit_overlay.is_open() {
+                    for (rect, action) in self.buttons.clone() {
+                        if point_in(rect, p) {
+                            self.activate_button(action);
+                            break;
+                        }
                     }
                 }
             }
@@ -2251,8 +2257,12 @@ impl App {
         }
 
         // Other overlays consume all mouse input so clicks cannot activate
-        // controls rendered underneath them.
-        if self.confirm_speed_start || self.show_command_palette || self.show_result_details {
+        // controls rendered underneath them, including during their close
+        // animation (when the visibility flag has already been cleared).
+        if self.speed_confirm_overlay.inner_area().is_some()
+            || self.command_palette_overlay.inner_area().is_some()
+            || self.result_details_overlay.inner_area().is_some()
+        {
             return;
         }
 
