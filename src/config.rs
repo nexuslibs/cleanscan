@@ -72,6 +72,14 @@ pub struct AppConfig {
     /// `two_phase` is enabled (the remainder is spent focusing on good colos).
     #[serde(default = "default_discover_fraction")]
     pub discover_fraction: f64,
+    #[serde(default)]
+    pub adaptive_probing: bool,
+    #[serde(default = "default_min_probes")]
+    pub min_probes: usize,
+    #[serde(default = "default_max_probes")]
+    pub max_probes: usize,
+    #[serde(default = "default_confidence")]
+    pub confidence: f64,
     pub custom_cidrs: Vec<String>,
     #[serde(default)]
     pub selected_cidrs: Vec<String>,
@@ -143,6 +151,16 @@ fn default_discover_fraction() -> f64 {
     0.25
 }
 
+fn default_min_probes() -> usize {
+    3
+}
+fn default_max_probes() -> usize {
+    40
+}
+fn default_confidence() -> f64 {
+    0.95
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -171,6 +189,10 @@ impl Default for AppConfig {
             early_stop_prune_margin: default_early_stop_prune_margin(),
             two_phase: default_two_phase(),
             discover_fraction: default_discover_fraction(),
+            adaptive_probing: false,
+            min_probes: default_min_probes(),
+            max_probes: default_max_probes(),
+            confidence: default_confidence(),
             custom_cidrs: Vec::new(),
             selected_cidrs: crate::scanner::DEFAULT_CLOUDFLARE_CIDRS
                 .iter()
@@ -187,6 +209,31 @@ fn config_path() -> Option<PathBuf> {
         p.push("config.json");
         p
     })
+}
+
+pub fn append_history(record: &serde_json::Value) -> Result<()> {
+    let mut path = config_path().unwrap_or_else(|| PathBuf::from("."));
+    path.pop();
+    path.push("history");
+    fs::create_dir_all(&path)?;
+    path.push(format!("runs-{}.jsonl", chrono_like_date()));
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    serde_json::to_writer(&mut file, record)?;
+    writeln!(file)?;
+    Ok(())
+}
+
+fn chrono_like_date() -> String {
+    // Keep the history filename dependency-free and lexically sortable.
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / 86_400;
+    format!("day-{days}")
 }
 
 pub fn load_config() -> AppConfig {

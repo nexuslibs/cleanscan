@@ -364,6 +364,11 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect, elapsed: 
                         .unwrap_or_else(|| "n/a".to_string())
                 )),
                 Line::from(format!("Confidence  : {}", result_confidence(result))),
+                Line::from(format!(
+                    "Score range : {:.4} – {:.4}",
+                    result.min_score, result.max_score
+                )),
+                Line::from(format!("Decision    : {}", result.decision)),
             ];
             render_detail_text(frame, chunks[2], lines);
         }
@@ -382,6 +387,18 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect, elapsed: 
                 }
                 for (reason, count) in failures {
                     lines.push(Line::from(format!("  {reason:<24} {count}")));
+                }
+                for diagnostic in &result.diagnostics {
+                    lines.push(Line::from(format!(
+                        "  [{:?}/{:?}] {}{}",
+                        diagnostic.category,
+                        diagnostic.phase,
+                        diagnostic.message,
+                        diagnostic
+                            .status
+                            .map(|s| format!(" (HTTP {s})"))
+                            .unwrap_or_default()
+                    )));
                 }
             }
             render_detail_text(frame, chunks[2], lines);
@@ -561,7 +578,9 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
         elapsed.as_secs() % 60
     );
 
-    let status = if app.scan_complete {
+    let status = if app.scan_complete && app.watch_due.is_some() {
+        "WATCH"
+    } else if app.scan_complete {
         "DONE"
     } else if app.paused.load(std::sync::atomic::Ordering::Relaxed) {
         "PAUSED"
@@ -572,6 +591,15 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
     // A spinner reinforces the "live" state while scanning.
     let status_text = if status == "SCANNING" {
         format!("{} {}", widgets::spinner_frame(app.tick), status)
+    } else if status == "WATCH" {
+        let remaining = app
+            .watch_due
+            .map(|due| {
+                due.saturating_duration_since(std::time::Instant::now())
+                    .as_secs()
+            })
+            .unwrap_or(0);
+        format!("WATCH #{} ({}s)", app.watch_cycle, remaining)
     } else {
         status.to_string()
     };

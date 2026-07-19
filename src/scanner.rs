@@ -17,6 +17,40 @@ use tokio::sync::Semaphore;
 
 use crate::config::AppConfig;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticCategory {
+    ClientSetup,
+    Connect,
+    Tls,
+    Timeout,
+    HttpStatus,
+    Redirect,
+    BodyRead,
+    Cancelled,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticPhase {
+    ClientConstruction,
+    ConnectionTls,
+    ResponseHeaders,
+    ResponseBody,
+    Cancellation,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProbeDiagnostic {
+    pub category: DiagnosticCategory,
+    pub phase: DiagnosticPhase,
+    pub message: String,
+    pub status: Option<u16>,
+    pub location: Option<String>,
+    pub elapsed_ms: Option<f64>,
+}
+
 /// Built-in list of common Cloudflare edge CIDR ranges offered for selection
 /// in the TUI when no targets are supplied on the command line.
 pub const DEFAULT_CLOUDFLARE_CIDRS: &[&str] = &[
@@ -65,6 +99,7 @@ pub struct ProbeResult {
     pub packet_loss: f64,
     pub samples: Vec<f64>,
     pub failures: Vec<String>,
+    pub diagnostics: Vec<ProbeDiagnostic>,
     pub success_rate: f64,
     pub score: f64,
     /// Cloudflare datacenter code (e.g. "FRA") parsed from `/cdn-cgi/trace`,
@@ -80,6 +115,12 @@ pub struct ProbeResult {
     /// Whether this target was emitted before exhausting its configured probe
     /// budget because an early-stop rule determined it could be abandoned.
     pub stopped_early: bool,
+    pub min_score: f64,
+    pub max_score: f64,
+    pub success_rate_lower: f64,
+    pub success_rate_upper: f64,
+    pub score_confidence: f64,
+    pub decision: String,
 }
 
 pub fn result_status(result: &ProbeResult) -> &'static str {
@@ -136,6 +177,51 @@ fn score_from_samples(
     let latency_penalty = max.max(0.001);
     let loss_penalty = loss as f64 / total as f64;
     reliability / (latency_penalty + stability_weight * jitter + loss_weight * loss_penalty)
+}
+
+fn wilson_interval(successes: usize, total: usize, confidence: f64) -> (f64, f64) {
+    if total == 0 {
+        return (0.0, 1.0);
+    }
+    let z = match confidence {
+        c if c >= 0.99 => 2.576,
+        c if c >= 0.95 => 1.96,
+        _ => 1.645,
+    };
+    let n = total as f64;
+    let p = successes as f64 / n;
+    let denom = 1.0 + z * z / n;
+    let centre = (p + z * z / (2.0 * n)) / denom;
+    let spread = z * ((p * (1.0 - p) / n + z * z / (4.0 * n * n)).sqrt()) / denom;
+    ((centre - spread).max(0.0), (centre + spread).min(1.0))
+}
+
+fn bootstrap_score_interval(state: &TargetState, confidence: f64) -> (f64, f64) {
+    if state.samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    let iterations = 256usize;
+    let mut seed = 0xcbf29ce484222325u64;
+    for byte in state.ip.as_bytes() {
+        seed = (seed ^ *byte as u64).wrapping_mul(0x100000001b3);
+    }
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut scores = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let sample: Vec<f64> = (0..state.samples.len())
+            .map(|_| state.samples[rng.gen_range(0..state.samples.len())])
+            .collect();
+        scores.push(score_from_samples(
+            &sample,
+            state.completed,
+            state.loss,
+            state.stability_weight,
+            state.loss_weight,
+        ));
+    }
+    scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let alpha = (1.0 - confidence) / 2.0;
+    (percentile(&scores, alpha), percentile(&scores, 1.0 - alpha))
 }
 
 fn random_ip_from_net(net: IpNet, rng: &mut impl Rng) -> Option<IpAddr> {
@@ -318,6 +404,7 @@ fn client_for_ip(host: &str, ip: &str, args: &AppConfig) -> Result<Client> {
         .http2_adaptive_window(true)
         .no_proxy()
         .resolve_to_addrs(host, &[socket])
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_millis(args.connect_timeout_ms))
         .timeout(Duration::from_millis(args.timeout_ms))
         .build()?;
@@ -325,7 +412,10 @@ fn client_for_ip(host: &str, ip: &str, args: &AppConfig) -> Result<Client> {
     Ok(client)
 }
 
-async fn probe_once(client: &Client, url: &str) -> Result<(f64, String, Option<String>), String> {
+async fn probe_once(
+    client: &Client,
+    url: &str,
+) -> Result<(f64, String, Option<String>), ProbeDiagnostic> {
     let start = Instant::now();
 
     let resp = client
@@ -334,17 +424,54 @@ async fn probe_once(client: &Client, url: &str) -> Result<(f64, String, Option<S
         .send()
         .await
         .map_err(|error| {
-            if error.is_timeout() {
-                "request timeout".to_string()
+            let category = if error.is_timeout() {
+                DiagnosticCategory::Timeout
+            } else if error.is_connect()
+                && error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("certificate")
+            {
+                DiagnosticCategory::Tls
             } else if error.is_connect() {
-                "connect/TLS failure".to_string()
+                DiagnosticCategory::Connect
             } else {
-                "request failure".to_string()
+                DiagnosticCategory::Unknown
+            };
+            ProbeDiagnostic {
+                category,
+                phase: if error.is_connect() {
+                    DiagnosticPhase::ConnectionTls
+                } else {
+                    DiagnosticPhase::ResponseHeaders
+                },
+                message: error.to_string(),
+                status: None,
+                location: None,
+                elapsed_ms: Some(start.elapsed().as_secs_f64() * 1000.0),
             }
         })?;
 
     if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status()));
+        let status = resp.status().as_u16();
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let category = if location.is_some() {
+            DiagnosticCategory::Redirect
+        } else {
+            DiagnosticCategory::HttpStatus
+        };
+        return Err(ProbeDiagnostic {
+            category,
+            phase: DiagnosticPhase::ResponseHeaders,
+            message: format!("HTTP {}", resp.status()),
+            status: Some(status),
+            location,
+            elapsed_ms: Some(start.elapsed().as_secs_f64() * 1000.0),
+        });
     }
 
     let protocol = match resp.version() {
@@ -361,10 +488,14 @@ async fn probe_once(client: &Client, url: &str) -> Result<(f64, String, Option<S
 
     // Read the full body so keep-alive connections can be reused, and to
     // extract the Cloudflare datacenter code from `/cdn-cgi/trace`.
-    let body = resp
-        .text()
-        .await
-        .map_err(|_| "body read failure".to_string())?;
+    let body = resp.text().await.map_err(|error| ProbeDiagnostic {
+        category: DiagnosticCategory::BodyRead,
+        phase: DiagnosticPhase::ResponseBody,
+        message: error.to_string(),
+        status: None,
+        location: None,
+        elapsed_ms: Some(start.elapsed().as_secs_f64() * 1000.0),
+    })?;
     let colo = parse_colo(&body);
 
     Ok((latency, protocol.to_string(), colo))
@@ -389,11 +520,14 @@ fn parse_colo(body: &str) -> Option<String> {
 /// response) rather than an application-level error. Timeouts and
 /// connect/TLS failures reflect packet loss; non-2xx status and body read
 /// failures mean the server *did* respond.
-fn is_loss_reason(reason: &str) -> bool {
-    reason.starts_with("request timeout")
-        || reason.starts_with("connect/TLS failure")
-        || reason.starts_with("request failure")
-        || reason == "cancelled"
+fn is_loss_reason(reason: &ProbeDiagnostic) -> bool {
+    matches!(
+        reason.category,
+        DiagnosticCategory::Timeout
+            | DiagnosticCategory::Connect
+            | DiagnosticCategory::Tls
+            | DiagnosticCategory::Cancelled
+    )
 }
 
 struct TargetState {
@@ -408,6 +542,7 @@ struct TargetState {
     completed: usize,
     in_flight: bool,
     failures: Vec<String>,
+    diagnostics: Vec<ProbeDiagnostic>,
     /// Cloudflare datacenter code captured from the first successful probe.
     colo: Option<String>,
     /// Cold-request (TCP + TLS connection-establishment) round-trip time from
@@ -423,6 +558,7 @@ struct TargetState {
     warmup_discard_first: bool,
     stability_weight: f64,
     loss_weight: f64,
+    confidence: f64,
     /// Number of consecutive dropped probes (timeouts / connect failures).
     /// Reset on any successful probe; drives the early-stop loss-streak rule.
     loss_streak: usize,
@@ -457,6 +593,21 @@ impl TargetState {
             } else {
                 vec!["invalid target/client setup".to_string(); probe_count]
             },
+            diagnostics: if client_ok {
+                Vec::new()
+            } else {
+                vec![
+                    ProbeDiagnostic {
+                        category: DiagnosticCategory::ClientSetup,
+                        phase: DiagnosticPhase::ClientConstruction,
+                        message: "invalid target/client setup".to_string(),
+                        status: None,
+                        location: None,
+                        elapsed_ms: None
+                    };
+                    probe_count
+                ]
+            },
             colo: None,
             cold_ms: None,
             warmup_done: !args.warmup || !client_ok,
@@ -464,6 +615,7 @@ impl TargetState {
             warmup_discard_first: false,
             stability_weight: args.stability_weight,
             loss_weight: args.loss_weight,
+            confidence: args.confidence,
             loss_streak: 0,
             stopped_early: false,
         }
@@ -485,7 +637,12 @@ impl TargetState {
         )
     }
 
+    #[allow(dead_code)]
     fn result(&mut self) -> ProbeResult {
+        self.result_with_mode(false)
+    }
+
+    fn result_with_mode(&mut self, adaptive: bool) -> ProbeResult {
         self.samples
             .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let ok = self.samples.len();
@@ -510,13 +667,17 @@ impl TargetState {
         let total = self.completed.max(1);
         let success_rate = ok as f64 / total as f64;
         let packet_loss = self.loss as f64 / total as f64;
-        let score = score_from_samples(
+        let point_score = score_from_samples(
             &self.samples,
             self.completed,
             self.loss,
             self.stability_weight,
             self.loss_weight,
         );
+        let (success_rate_lower, success_rate_upper) =
+            wilson_interval(ok, self.completed, self.confidence);
+        let (min_score, max_score) = bootstrap_score_interval(self, self.confidence);
+        let score = if adaptive { min_score } else { point_score };
 
         ProbeResult {
             ip: self.ip.clone(),
@@ -535,6 +696,7 @@ impl TargetState {
             packet_loss,
             samples: self.samples.clone(),
             failures: self.failures.clone(),
+            diagnostics: self.diagnostics.clone(),
             success_rate,
             score,
             colo: self.colo.clone(),
@@ -544,6 +706,19 @@ impl TargetState {
                 .and_then(|code| crate::colo::lookup_country(code).map(str::to_string)),
             cold_ms: self.cold_ms.map(|seconds| seconds * 1000.0),
             stopped_early: self.stopped_early,
+            min_score,
+            max_score,
+            success_rate_lower,
+            success_rate_upper,
+            score_confidence: self.confidence,
+            decision: if ok == 0 {
+                "discarded"
+            } else if self.completed < 3 {
+                "insufficient_data"
+            } else {
+                "competitive"
+            }
+            .to_string(),
         }
     }
 }
@@ -622,6 +797,59 @@ fn select_next_target(states: &[TargetState], probe_count: usize) -> Option<usiz
         .map(|(index, _)| index)
 }
 
+fn select_next_target_adaptive(
+    states: &[TargetState],
+    probe_count: usize,
+    min_probes: usize,
+) -> Option<usize> {
+    let bootstrap_intervals: Vec<(f64, f64)> = states
+        .iter()
+        .map(|state| bootstrap_score_interval(state, state.confidence))
+        .collect();
+    states
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| state.has_remaining_probe(probe_count))
+        .min_by(|(left_index, left), (right_index, right)| {
+            let left_min = left.completed < min_probes;
+            let right_min = right.completed < min_probes;
+            right_min
+                .cmp(&left_min)
+                .then_with(|| {
+                    let (left_min, left_max) = bootstrap_intervals[*left_index];
+                    let (right_min, right_max) = bootstrap_intervals[*right_index];
+                    let lw = left_max - left_min;
+                    let rw = right_max - right_min;
+                    rw.partial_cmp(&lw).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| {
+                    right
+                        .current_score()
+                        .partial_cmp(&left.current_score())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        })
+        .map(|(index, _)| index)
+}
+
+fn adaptive_should_stop(index: usize, states: &[TargetState], cfg: &AppConfig) -> bool {
+    let state = &states[index];
+    if state.completed < cfg.min_probes || state.samples.is_empty() {
+        return false;
+    }
+    let bootstrap_intervals: Vec<(f64, f64)> = states
+        .iter()
+        .map(|state| bootstrap_score_interval(state, cfg.confidence))
+        .collect();
+    let own = bootstrap_intervals[index];
+    states.iter().enumerate().any(|(other_index, other)| {
+        other_index != index && other.completed >= cfg.min_probes && !other.samples.is_empty() && {
+            let other_bounds = bootstrap_intervals[other_index];
+            other_bounds.0 > own.1
+        }
+    })
+}
+
 /// Decide whether a target should stop being probed before its full probe
 /// budget is exhausted. Returns `true` when any early-stop rule applies:
 ///  * loss streak: `early_stop_loss_streak` consecutive dropped probes;
@@ -681,11 +909,11 @@ fn record_best(best: &mut Vec<(f64, f64)>, result: &ProbeResult, top: usize) {
 enum ProbeOutcome {
     Warmup {
         index: usize,
-        sample: Result<(f64, String, Option<String>), String>,
+        sample: Result<(f64, String, Option<String>), ProbeDiagnostic>,
     },
     Measured {
         index: usize,
-        sample: Result<(f64, String, Option<String>), String>,
+        sample: Result<(f64, String, Option<String>), ProbeDiagnostic>,
     },
 }
 
@@ -701,7 +929,11 @@ pub async fn run_scan(
 ) {
     let sem = Arc::new(Semaphore::new(args.concurrency.max(1)));
 
-    let probe_count = args.probes.max(1);
+    let probe_count = if args.adaptive_probing {
+        args.max_probes.max(args.min_probes).max(1)
+    } else {
+        args.probes.max(1)
+    };
     let workers = args.concurrency.max(1);
     let mut states: Vec<TargetState> = targets
         .into_iter()
@@ -711,7 +943,7 @@ pub async fn run_scan(
 
     for state in &mut states {
         if state.completed == probe_count {
-            let _ = tx.send(state.result());
+            let _ = tx.send(state.result_with_mode(args.adaptive_probing));
         }
     }
 
@@ -764,14 +996,26 @@ pub async fn run_scan(
                         };
                         let sample = match permit {
                             Some(_permit) => probe_once(&client, &url).await,
-                            None => Err("cancelled".to_string()),
+                            None => Err(ProbeDiagnostic {
+                                category: DiagnosticCategory::Cancelled,
+                                phase: DiagnosticPhase::Cancellation,
+                                message: "cancelled".to_string(),
+                                status: None,
+                                location: None,
+                                elapsed_ms: None,
+                            }),
                         };
                         ProbeOutcome::Warmup { index, sample }
                     }));
                 }
             }
 
-            let Some(index) = select_next_target(&states, probe_count) else {
+            let next = if args.adaptive_probing {
+                select_next_target_adaptive(&states, probe_count, args.min_probes)
+            } else {
+                select_next_target(&states, probe_count)
+            };
+            let Some(index) = next else {
                 break;
             };
             let state = &mut states[index];
@@ -798,7 +1042,14 @@ pub async fn run_scan(
                 };
                 let sample = match permit {
                     Some(_permit) => probe_once(&client, &url).await,
-                    None => Err("cancelled".to_string()),
+                    None => Err(ProbeDiagnostic {
+                        category: DiagnosticCategory::Cancelled,
+                        phase: DiagnosticPhase::Cancellation,
+                        message: "cancelled".to_string(),
+                        status: None,
+                        location: None,
+                        elapsed_ms: None,
+                    }),
                 };
                 ProbeOutcome::Measured { index, sample }
             }));
@@ -831,7 +1082,7 @@ pub async fn run_scan(
                                     state.colo = colo;
                                 }
                             }
-                            Err(_) => {
+                            Err(diagnostic) => {
                                 // The warmup could not establish the connection,
                                 // so it is not ready for steady-state timing. End
                                 // the warmup phase but flag the first successful
@@ -839,6 +1090,8 @@ pub async fn run_scan(
                                 // request, keeping its setup cost out of latency.
                                 state.warmup_done = true;
                                 state.warmup_discard_first = true;
+                                state.diagnostics.push(diagnostic.clone());
+                                state.failures.push(diagnostic.message);
                             }
                         }
                     }
@@ -866,25 +1119,33 @@ pub async fn run_scan(
                                     }
                                 }
                             }
-                            Err(reason) => {
+                            Err(diagnostic) => {
                                 state.fail += 1;
-                                if is_loss_reason(&reason) {
+                                if is_loss_reason(&diagnostic) {
                                     state.loss += 1;
                                     state.loss_streak += 1;
                                 }
-                                state.failures.push(reason);
+                                state.failures.push(diagnostic.message.clone());
+                                state.diagnostics.push(diagnostic);
                             }
                         }
-                        if should_stop_early(state, &args, &best) {
+                        let adaptive_min_reached = !args.adaptive_probing || state.completed >= args.min_probes;
+                        let legacy_stop = adaptive_min_reached && should_stop_early(state, &args, &best);
+                        let completed = state.completed;
+                        let _ = state;
+                        let adaptive_stop = args.adaptive_probing && adaptive_should_stop(index, &states, &args);
+                        if adaptive_stop || legacy_stop {
                             // Target is dead or cannot beat the current
                             // leaderboard; stop probing it and emit a partial
                             // result now rather than spending the full budget.
+                            let state = &mut states[index];
                             state.stopped_early = true;
-                            let result = state.result();
+                            let result = state.result_with_mode(args.adaptive_probing);
                             record_best(&mut best, &result, args.top);
                             let _ = tx.send(result);
-                        } else if state.completed == probe_count {
-                            let result = state.result();
+                        } else if completed == probe_count {
+                            let state = &mut states[index];
+                            let result = state.result_with_mode(args.adaptive_probing);
                             record_best(&mut best, &result, args.top);
                             let _ = tx.send(result);
                         }
@@ -1043,9 +1304,9 @@ pub async fn run_scan_two_phase(
 #[cfg(test)]
 mod tests {
     use super::{
-        cidr_valid, collect_from_cidrs_with_seed, parse_colo, record_best, result_confidence,
-        result_status, select_focus_cidrs, select_next_target, should_stop_early, ProbeResult,
-        TargetState,
+        bootstrap_score_interval, cidr_valid, collect_from_cidrs_with_seed, parse_colo,
+        record_best, result_confidence, result_status, select_focus_cidrs, select_next_target,
+        should_stop_early, wilson_interval, ProbeResult, TargetState,
     };
     use crate::config::AppConfig;
 
@@ -1068,6 +1329,7 @@ mod tests {
             completed,
             in_flight: false,
             failures: Vec::new(),
+            diagnostics: Vec::new(),
             colo: None,
             cold_ms: None,
             warmup_done: true,
@@ -1075,6 +1337,7 @@ mod tests {
             warmup_discard_first: false,
             stability_weight: 1.0,
             loss_weight: 1.0,
+            confidence: 0.95,
             loss_streak: 0,
             stopped_early: false,
         }
@@ -1155,6 +1418,23 @@ mod tests {
     }
 
     #[test]
+    fn wilson_interval_is_wider_for_small_samples() {
+        let small = wilson_interval(3, 3, 0.95);
+        let large = wilson_interval(30, 30, 0.95);
+        assert!(small.0 < large.0);
+        assert!(small.1 - small.0 > large.1 - large.0);
+    }
+
+    #[test]
+    fn bootstrap_interval_is_deterministic_for_an_ip() {
+        let state = state("192.0.2.77", 4, 4, &[0.010, 0.011, 0.012, 0.013], 0);
+        assert_eq!(
+            bootstrap_score_interval(&state, 0.95),
+            bootstrap_score_interval(&state, 0.95)
+        );
+    }
+
+    #[test]
     fn parse_colo_extracts_datacenter_code() {
         let body = "fl=abc\nh=example.com\nip=1.2.3.4\ncolo=fra\nts=123\n";
         assert_eq!(parse_colo(body), Some("FRA".to_string()));
@@ -1209,6 +1489,7 @@ mod tests {
             completed: 3,
             in_flight: false,
             failures: Vec::new(),
+            diagnostics: Vec::new(),
             colo: Some("FRA".to_string()),
             cold_ms: Some(0.05),
             warmup_done: true,
@@ -1216,6 +1497,7 @@ mod tests {
             warmup_discard_first: false,
             stability_weight: 1.0,
             loss_weight: 1.0,
+            confidence: 0.95,
             loss_streak: 0,
             stopped_early: false,
         };
@@ -1243,6 +1525,7 @@ mod tests {
             completed: 4,
             in_flight: false,
             failures: vec!["request timeout".to_string()],
+            diagnostics: Vec::new(),
             colo: None,
             cold_ms: None,
             warmup_done: true,
@@ -1250,6 +1533,7 @@ mod tests {
             warmup_discard_first: false,
             stability_weight: 1.0,
             loss_weight: 1.0,
+            confidence: 0.95,
             loss_streak: 0,
             stopped_early: false,
         };
@@ -1281,6 +1565,7 @@ mod tests {
             completed: 4,
             in_flight: false,
             failures: Vec::new(),
+            diagnostics: Vec::new(),
             colo: None,
             cold_ms: None,
             warmup_done: true,
@@ -1288,6 +1573,7 @@ mod tests {
             warmup_discard_first: false,
             stability_weight: 1.0,
             loss_weight: 0.0,
+            confidence: 0.95,
             loss_streak: 0,
             stopped_early: false,
         }
@@ -1304,6 +1590,7 @@ mod tests {
             completed: 4,
             in_flight: false,
             failures: Vec::new(),
+            diagnostics: Vec::new(),
             colo: None,
             cold_ms: None,
             warmup_done: true,
@@ -1311,6 +1598,7 @@ mod tests {
             warmup_discard_first: false,
             stability_weight: 1.0,
             loss_weight: 0.0,
+            confidence: 0.95,
             loss_streak: 0,
             stopped_early: false,
         }
@@ -1334,6 +1622,7 @@ mod tests {
             completed: 4,
             in_flight: false,
             failures: vec!["HTTP status 500".to_string()],
+            diagnostics: Vec::new(),
             colo: None,
             cold_ms: None,
             warmup_done: true,
@@ -1341,6 +1630,7 @@ mod tests {
             warmup_discard_first: false,
             stability_weight: 0.0,
             loss_weight: 1.0,
+            confidence: 0.95,
             loss_streak: 0,
             stopped_early: false,
         }
@@ -1357,6 +1647,7 @@ mod tests {
             completed: 4,
             in_flight: false,
             failures: vec!["request timeout".to_string()],
+            diagnostics: Vec::new(),
             colo: None,
             cold_ms: None,
             warmup_done: true,
@@ -1364,6 +1655,7 @@ mod tests {
             warmup_discard_first: false,
             stability_weight: 0.0,
             loss_weight: 1.0,
+            confidence: 0.95,
             loss_streak: 0,
             stopped_early: false,
         }
@@ -1400,6 +1692,7 @@ mod tests {
             completed: 4,
             in_flight: false,
             failures: vec!["request timeout".to_string()],
+            diagnostics: Vec::new(),
             colo: None,
             cold_ms: None,
             warmup_done: true,
@@ -1407,6 +1700,7 @@ mod tests {
             warmup_discard_first: false,
             stability_weight: 1.0,
             loss_weight: 1.0,
+            confidence: 0.95,
             loss_streak: 0,
             stopped_early: false,
         };
@@ -1510,12 +1804,19 @@ mod tests {
             packet_loss: 0.0,
             samples: vec![0.1],
             failures: Vec::new(),
+            diagnostics: Vec::new(),
             success_rate: 1.0,
             score,
             colo: None,
             country: None,
             cold_ms: None,
             stopped_early: false,
+            min_score: score,
+            max_score: score,
+            success_rate_lower: 1.0,
+            success_rate_upper: 1.0,
+            score_confidence: 0.95,
+            decision: "competitive".to_string(),
         };
         for s in [1.0, 5.0, 3.0, 9.0, 2.0] {
             record_best(&mut best, &make(s), 3);
@@ -1544,12 +1845,19 @@ mod tests {
             packet_loss: 0.0,
             samples: vec![0.1; ok],
             failures: Vec::new(),
+            diagnostics: Vec::new(),
             success_rate: 1.0,
             score,
             colo: colo.map(|c| c.to_string()),
             country: None,
             cold_ms: None,
             stopped_early: false,
+            min_score: score,
+            max_score: score,
+            success_rate_lower: 1.0,
+            success_rate_upper: 1.0,
+            score_confidence: 0.95,
+            decision: "competitive".to_string(),
         }
     }
 

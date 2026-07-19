@@ -139,6 +139,26 @@ pub struct Args {
     /// Fraction of `sample_per_cidr` used for the discovery pass with `--two-phase`.
     #[arg(long)]
     pub discover_fraction: Option<f64>,
+
+    /// Enable confidence-aware adaptive probing.
+    #[arg(long)]
+    pub adaptive_probing: bool,
+
+    /// Minimum measured probes per target in adaptive mode.
+    #[arg(long)]
+    pub min_probes: Option<usize>,
+
+    /// Maximum measured probes per target in adaptive mode.
+    #[arg(long)]
+    pub max_probes: Option<usize>,
+
+    /// Confidence level for adaptive intervals (0.90, 0.95, or 0.99).
+    #[arg(long, value_parser = ["0.90", "0.95", "0.99"])]
+    pub confidence: Option<String>,
+
+    /// Repeat scans every N seconds using the same exact target list.
+    #[arg(long)]
+    pub watch: Option<u64>,
 }
 
 fn main() -> Result<()> {
@@ -208,12 +228,41 @@ fn main() -> Result<()> {
         }
         config.discover_fraction = fraction;
     }
+    if args.adaptive_probing {
+        config.adaptive_probing = true;
+    }
+    if let Some(min) = args.min_probes {
+        config.min_probes = min;
+    }
+    if let Some(max) = args.max_probes {
+        config.max_probes = max;
+    }
+    if let Some(confidence) = args.confidence.as_deref() {
+        config.confidence = confidence.parse()?;
+    }
 
     if !config.stability_weight.is_finite() || config.stability_weight < 0.0 {
         anyhow::bail!("--stability-weight must be a finite, non-negative value");
     }
     if !config.loss_weight.is_finite() || config.loss_weight < 0.0 {
         anyhow::bail!("--loss-weight must be a finite, non-negative value");
+    }
+    if !(0.0..=1.0).contains(&config.confidence)
+        || !config.confidence.is_finite()
+        || !matches!(config.confidence, 0.90 | 0.95 | 0.99)
+    {
+        anyhow::bail!("--confidence must be exactly 0.90, 0.95, or 0.99");
+    }
+    if config.min_probes == 0 || config.max_probes < config.min_probes {
+        anyhow::bail!(
+            "adaptive probe bounds are invalid: max must be >= min and both must be non-zero"
+        );
+    }
+    if args.watch.is_some() && config.two_phase {
+        anyhow::bail!("--watch cannot be combined with --two-phase");
+    }
+    if args.cli && args.watch.is_some() && args.format != "ndjson" {
+        anyhow::bail!("--watch requires --cli --format ndjson");
     }
 
     normalize_config(&mut config);
@@ -257,9 +306,10 @@ fn main() -> Result<()> {
             args.seed,
             args.colo,
             args.country,
+            args.watch,
         )
     } else {
-        tui::run_tui(config, args.cidr, args.ips, args.seed)
+        tui::run_tui(config, args.cidr, args.ips, args.seed, args.watch)
     }
 }
 
@@ -289,6 +339,7 @@ fn cli_mode(
     seed: Option<u64>,
     colo: Option<String>,
     country: Option<String>,
+    watch: Option<u64>,
 ) -> Result<()> {
     let has_explicit_targets = ips.is_some() || targets_file.is_some();
     let targets = if let Some(path) = targets_file {
@@ -296,6 +347,18 @@ fn cli_mode(
     } else {
         scanner::collect_targets_with_optional_seed(&config, &cidr, &ips, seed)?
     };
+    if let Some(interval) = watch {
+        return cli_watch(
+            config,
+            targets,
+            interval,
+            min_success_rate,
+            max_p95_ms,
+            fail_if_no_healthy_target,
+            colo,
+            country,
+        );
+    }
     let total = targets.len();
     let use_two_phase = config.two_phase && !has_explicit_targets;
 
@@ -375,7 +438,7 @@ fn cli_mode(
             .collect::<std::result::Result<Vec<_>, _>>()?
             .join("\n"),
         _ => {
-            let mut text = String::from("rank\tip\tcolo\tcountry\tprotocol\tok\tfail\tsuccess_rate\tconfidence\tavg\tp50\tp90\tp95\tmax\tjitter\tloss\tpkt_loss\tcold_ms\tsamples\tfailures\n");
+            let mut text = String::from("rank\tip\tcolo\tcountry\tprotocol\tok\tfail\tsuccess_rate\tconfidence\tavg\tp50\tp90\tp95\tmax\tjitter\tloss\tpkt_loss\tcold_ms\tmin_score\tmax_score\tsamples\tfailures\n");
             for (i, r) in rows.iter().enumerate() {
                 let samples = r
                     .samples
@@ -385,7 +448,7 @@ fn cli_mode(
                     .join(",");
 
                 text.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{:.1}\t{}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{:.1}\t{}\t{:.5}\t{:.5}\t{}\t{}\n",
                     i + 1,
                     r.ip,
                     r.colo.clone().unwrap_or_default(),
@@ -404,6 +467,8 @@ fn cli_mode(
                     r.loss,
                     r.packet_loss * 100.0,
                     r.cold_ms.map(|ms| format!("{:.1}", ms)).unwrap_or_default(),
+                    r.min_score,
+                    r.max_score,
                     samples,
                     r.failures.join(",")
                 ));
@@ -422,6 +487,94 @@ fn cli_mode(
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cli_watch(
+    config: AppConfig,
+    targets: Vec<String>,
+    interval: u64,
+    min_success_rate: Option<f64>,
+    max_p95_ms: Option<f64>,
+    fail_if_no_healthy_target: bool,
+    colo: Option<String>,
+    country: Option<String>,
+) -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let mut cycle = 0u64;
+    let mut previous_recommendation: Option<String> = None;
+    let mut previous_healthy: Option<bool> = None;
+    loop {
+        cycle += 1;
+        println!(
+            "{}",
+            serde_json::json!({"event":"cycle_started", "cycle":cycle, "targets":targets.len()})
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime.block_on(scanner::run_scan(
+            targets.clone(),
+            Arc::new(config.clone()),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        let mut results: Vec<scanner::ProbeResult> = rx.iter().collect();
+        if let Some(want) = &colo {
+            results.retain(|r| {
+                r.colo
+                    .as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(want))
+            });
+        }
+        if let Some(want) = &country {
+            let want = want.to_lowercase();
+            results.retain(|r| {
+                r.country
+                    .as_deref()
+                    .is_some_and(|c| c.to_lowercase().contains(&want))
+            });
+        }
+        results.sort_by(crate::tui::App::natural_cmp);
+        let healthy = results.iter().any(|r| {
+            r.ok > 0
+                && min_success_rate.is_none_or(|v| r.success_rate >= v)
+                && max_p95_ms.is_none_or(|v| r.p95 * 1000.0 <= v)
+        });
+        let recommendation = results.first().map(|r| r.ip.clone());
+        println!(
+            "{}",
+            serde_json::json!({"event":"cycle_completed", "cycle":cycle, "healthy":healthy, "recommendation":recommendation, "results":results})
+        );
+        if cycle > 1 && recommendation != previous_recommendation {
+            println!(
+                "{}",
+                serde_json::json!({"event":"recommendation_changed", "cycle":cycle, "ip":recommendation})
+            );
+        }
+        if cycle > 1 && previous_healthy != Some(healthy) {
+            println!(
+                "{}",
+                serde_json::json!({"event":"target_health_changed", "cycle":cycle, "healthy":healthy})
+            );
+        }
+        let record = serde_json::json!({"schema_version":1, "cycle":cycle, "host":config.host, "path":config.path, "targets":targets, "healthy":healthy, "recommendation":recommendation, "results":results});
+        if let Err(error) = config::append_history(&record) {
+            eprintln!("history write failed: {error}");
+        }
+        let _ = results;
+        previous_recommendation = recommendation;
+        previous_healthy = Some(healthy);
+        if fail_if_no_healthy_target && !healthy {
+            println!(
+                "{}",
+                serde_json::json!({"event":"health_failure", "cycle":cycle})
+            );
+            return Err(anyhow::anyhow!(
+                "no target met the configured health thresholds"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(interval.max(1)));
+    }
 }
 
 #[cfg(test)]
@@ -463,12 +616,19 @@ mod tests {
             packet_loss: 0.0,
             samples: vec![0.0],
             failures: Vec::new(),
+            diagnostics: Vec::new(),
             success_rate: 1.0,
             score: 1.0,
             colo: Some("ABJ".to_string()),
             country: Some("Côte d'Ivoire".to_string()),
             cold_ms: None,
             stopped_early: false,
+            min_score: 1.0,
+            max_score: 1.0,
+            success_rate_lower: 1.0,
+            success_rate_upper: 1.0,
+            score_confidence: 0.95,
+            decision: "competitive".to_string(),
         }];
         let mut filtered = results.clone();
         filtered.retain(|r| {
