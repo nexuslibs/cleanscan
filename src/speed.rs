@@ -57,6 +57,9 @@ fn client_for_ip(host: &str, ip: &str, args: &AppConfig) -> Result<Client> {
         .strip_prefix('[')
         .and_then(|host| host.split_once(']').map(|(name, _)| name))
         .or_else(|| {
+            if host.parse::<IpAddr>().is_ok() {
+                return None;
+            }
             host.rsplit_once(':').and_then(|(name, port)| {
                 if port.parse::<u16>().is_ok() {
                     Some(name)

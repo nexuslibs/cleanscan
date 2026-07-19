@@ -303,6 +303,9 @@ pub struct App {
     pub show_result_details: bool,
     pub detail_tab: usize,
     pub watch_interval: Option<Duration>,
+    /// Source identity used to keep watch promotion/demotion state stable
+    /// when a cycle is relaunched through the exact-target rescan path.
+    pub watch_source_fingerprint: Option<u64>,
     pub watch_cycle: u64,
     pub watch_due: Option<Instant>,
     pub manifest_path: Option<String>,
@@ -568,6 +571,7 @@ impl App {
             show_result_details: false,
             detail_tab: 0,
             watch_interval: None,
+            watch_source_fingerprint: None,
             watch_cycle: 0,
             watch_due: None,
             manifest_path: None,
@@ -1037,7 +1041,7 @@ impl App {
         };
         writeln!(
             f,
-            "rank\tip\tcolo\tcountry\tprotocol\tok\tfail\tavg\tp50\tp90\tp95\tmax"
+            "rank\tip\tcolo\tcountry\tprotocol\tok\tfail\tavg\tp50\tp90\tp95\tmax\tjitter\tpacket_loss"
         )?;
         for (i, r) in ranked_export_results(&self.results, self.config.top)
             .into_iter()
@@ -1117,7 +1121,7 @@ fn ranked_export_results(results: &[ProbeResult], top: usize) -> Vec<&ProbeResul
 
 fn export_tsv_line(rank: usize, result: &ProbeResult) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}%",
         rank,
         result.ip,
         result.colo.as_deref().unwrap_or(""),
@@ -1130,6 +1134,8 @@ fn export_tsv_line(rank: usize, result: &ProbeResult) -> String {
         result.p90,
         result.p95,
         result.max,
+        result.jitter,
+        result.packet_loss * 100.0,
     )
 }
 
@@ -1351,9 +1357,15 @@ pub fn run_tui(
                 explicit_seed,
                 app.scan_seed,
             ));
+            app.watch_source_fingerprint = Some(source_fingerprint);
             let targets = prepare_watch_targets(&mut app, targets, source_fingerprint);
             let total = targets.len();
             app.set_scan_targets(targets.clone());
+            if config_arc.two_phase && !config_arc.health_checks.is_empty() {
+                app.toast_warn(
+                    "Two-phase scanning is unavailable with health checks; using profile scan",
+                );
+            }
             let two_phase_cidrs: Vec<String> = if cli_ips.is_some() {
                 Vec::new()
             } else if !cli_cidr.is_empty() {
@@ -1407,12 +1419,24 @@ pub fn run_tui(
             };
             match targets {
                 Ok(targets) => {
-                    let source_fingerprint = crate::watch::fingerprint(&(
+                    if app.config.two_phase && !app.config.health_checks.is_empty() {
+                        app.toast_warn(
+                        "Two-phase scanning is unavailable with health checks; using profile scan",
+                    );
+                    }
+                    let computed_source_fingerprint = crate::watch::fingerprint(&(
                         cidrs.clone(),
                         app.config.sample_per_cidr,
                         explicit_seed,
                         app.scan_seed,
                     ));
+                    let source_fingerprint = if use_exact_targets {
+                        app.watch_source_fingerprint
+                            .unwrap_or(computed_source_fingerprint)
+                    } else {
+                        computed_source_fingerprint
+                    };
+                    app.watch_source_fingerprint = Some(source_fingerprint);
                     let targets = prepare_watch_targets(app, targets, source_fingerprint);
                     let total = targets.len();
                     let scan_config = Arc::new(app.config.clone());
@@ -2354,13 +2378,7 @@ impl App {
     }
 
     fn speed_status(result: &ProbeResult) -> &'static str {
-        if result.ok == 0 {
-            "FAILED"
-        } else if result.fail == 0 {
-            "READY"
-        } else {
-            "DEGRADED"
-        }
+        crate::scanner::result_status(result)
     }
 
     fn speed_optional_latency_cmp(a: Option<f64>, b: Option<f64>) -> std::cmp::Ordering {
@@ -2490,6 +2508,14 @@ impl App {
                     .min(self.speed_visible_indices().len().saturating_sub(1))
             }
             KeyCode::Char('s') => self.speed_sort_asc = !self.speed_sort_asc,
+            KeyCode::Char('<') => {
+                self.speed_sort_col = self.speed_sort_col.saturating_sub(1);
+                self.speed_cursor = 0;
+            }
+            KeyCode::Char('>') => {
+                self.speed_sort_col = (self.speed_sort_col + 1).min(4);
+                self.speed_cursor = 0;
+            }
             KeyCode::Enter => self.speed_select_activate_focused(),
             KeyCode::Esc => self.screen = Screen::Scanning,
             _ => {}
@@ -2590,6 +2616,7 @@ impl App {
         // animation (when the visibility flag has already been cleared).
         if self.speed_confirm_overlay.inner_area().is_some()
             || self.command_palette_overlay.inner_area().is_some()
+            || self.column_picker_overlay.inner_area().is_some()
             || self.result_details_overlay.inner_area().is_some()
         {
             return;
@@ -2934,7 +2961,7 @@ mod tests {
         edge.country = Some("Germany".to_string());
         assert_eq!(
             export_tsv_line(1, &edge),
-            "1\t192.0.2.1\tFRA\tGermany\th2\t1\t0\t0.020\t0.020\t0.020\t0.020\t0.020"
+            "1\t192.0.2.1\tFRA\tGermany\th2\t1\t0\t0.020\t0.020\t0.020\t0.020\t0.020\t0.000\t0.000%"
         );
     }
 

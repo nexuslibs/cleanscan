@@ -439,6 +439,24 @@ pub fn collect_from_cidrs_with_seed(
     Ok(targets.into_iter().collect())
 }
 
+fn resolve_host_for_ip(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|host| host.split_once(']').map(|(name, _)| name))
+        .or_else(|| {
+            if host.parse::<IpAddr>().is_ok() {
+                return None;
+            }
+            host.rsplit_once(':').and_then(|(name, port)| {
+                if port.parse::<u16>().is_ok() {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or(host)
+}
+
 fn client_for_ip(host: &str, ip: &str, args: &AppConfig) -> Result<Client> {
     let ip_addr = IpAddr::from_str(ip)?;
     let socket = SocketAddr::new(ip_addr, 443);
@@ -446,7 +464,7 @@ fn client_for_ip(host: &str, ip: &str, args: &AppConfig) -> Result<Client> {
     let client = reqwest::Client::builder()
         .http2_adaptive_window(true)
         .no_proxy()
-        .resolve_to_addrs(host, &[socket])
+        .resolve_to_addrs(resolve_host_for_ip(host), &[socket])
         .redirect(if args.follow_redirects {
             reqwest::redirect::Policy::limited(10)
         } else {
@@ -944,22 +962,34 @@ fn select_next_target_adaptive(
     probe_count: usize,
     min_probes: usize,
 ) -> Option<usize> {
-    let bootstrap_intervals: Vec<(f64, f64)> = states
-        .iter_mut()
-        .map(TargetState::cached_bootstrap_interval)
+    let candidates: Vec<usize> = states
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| state.has_remaining_probe(probe_count))
+        .map(|(index, _)| index)
+        .collect();
+    let bootstrap_intervals: Vec<(usize, (f64, f64))> = candidates
+        .iter()
+        .map(|&index| (index, states[index].cached_bootstrap_interval()))
         .collect();
     states
         .iter()
         .enumerate()
-        .filter(|(_, state)| state.has_remaining_probe(probe_count))
+        .filter(|(index, _)| candidates.binary_search(index).is_ok())
         .min_by(|(left_index, left), (right_index, right)| {
             let left_min = left.completed < min_probes;
             let right_min = right.completed < min_probes;
             right_min
                 .cmp(&left_min)
                 .then_with(|| {
-                    let (left_min, left_max) = bootstrap_intervals[*left_index];
-                    let (right_min, right_max) = bootstrap_intervals[*right_index];
+                    let (_, (left_min, left_max)) = bootstrap_intervals
+                        .binary_search_by_key(left_index, |(index, _)| *index)
+                        .map(|position| bootstrap_intervals[position])
+                        .unwrap_or((*left_index, (0.0, 0.0)));
+                    let (_, (right_min, right_max)) = bootstrap_intervals
+                        .binary_search_by_key(right_index, |(index, _)| *index)
+                        .map(|position| bootstrap_intervals[position])
+                        .unwrap_or((*right_index, (0.0, 0.0)));
                     let lw = left_max - left_min;
                     let rw = right_max - right_min;
                     rw.partial_cmp(&lw).unwrap_or(std::cmp::Ordering::Equal)
@@ -975,20 +1005,18 @@ fn select_next_target_adaptive(
 }
 
 fn adaptive_should_stop(index: usize, states: &mut [TargetState], cfg: &AppConfig) -> bool {
-    let state = &states[index];
-    if state.completed < cfg.min_probes || state.samples.is_empty() {
+    if states[index].completed < cfg.min_probes || states[index].samples.is_empty() {
         return false;
     }
-    let bootstrap_intervals: Vec<(f64, f64)> = states
-        .iter_mut()
-        .map(TargetState::cached_bootstrap_interval)
-        .collect();
-    let own = bootstrap_intervals[index];
-    states.iter().enumerate().any(|(other_index, other)| {
-        other_index != index && other.completed >= cfg.min_probes && !other.samples.is_empty() && {
-            let other_bounds = bootstrap_intervals[other_index];
-            other_bounds.0 > own.1
+    let own = states[index].cached_bootstrap_interval();
+    (0..states.len()).any(|other_index| {
+        if other_index == index
+            || states[other_index].completed < cfg.min_probes
+            || states[other_index].samples.is_empty()
+        {
+            return false;
         }
+        states[other_index].cached_bootstrap_interval().0 > own.1
     })
 }
 
@@ -1677,9 +1705,9 @@ pub async fn run_scan_two_phase(
 mod tests {
     use super::{
         bootstrap_score_interval, cidr_valid, collect_from_cidrs_with_seed, merge_profile_results,
-        parse_colo, record_best, result_confidence, result_status, score_from_samples,
-        select_focus_cidrs, select_next_target, should_stop_early, validate_response,
-        wilson_interval, DiagnosticCategory, ProbeResult, TargetState,
+        parse_colo, record_best, resolve_host_for_ip, result_confidence, result_status,
+        score_from_samples, select_focus_cidrs, select_next_target, should_stop_early,
+        validate_response, wilson_interval, DiagnosticCategory, ProbeResult, TargetState,
     };
     use crate::config::{AppConfig, HealthCheck};
 
@@ -1724,6 +1752,13 @@ mod tests {
         assert_eq!(cidr_valid("2001:db8::1").unwrap().prefix_len(), 128);
         assert!(cidr_valid("192.0.2.0/24").is_ok());
         assert!(cidr_valid("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn resolve_host_for_ip_strips_ports_without_breaking_ipv6() {
+        assert_eq!(resolve_host_for_ip("example.test:443"), "example.test");
+        assert_eq!(resolve_host_for_ip("[2001:db8::1]:443"), "2001:db8::1");
+        assert_eq!(resolve_host_for_ip("2001:db8::1"), "2001:db8::1");
     }
 
     #[test]

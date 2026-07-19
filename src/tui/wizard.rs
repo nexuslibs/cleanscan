@@ -7,7 +7,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, HealthCheck};
 use crate::tui::theme;
 use crate::tui::{widgets, App, ButtonAction, ButtonKind, WizardStep};
 use tui_checkbox::Checkbox;
@@ -22,6 +22,8 @@ pub enum SettingField {
     RequiredBodyMarkers,
     RequiredHeaders,
     FollowRedirects,
+    HealthChecks,
+    Warmup,
     DownloadPath,
     UploadPath,
     SpeedPayloadMb,
@@ -42,6 +44,10 @@ pub enum SettingField {
     EarlyStopPruneMargin,
     TwoPhase,
     DiscoverFraction,
+    AdaptiveProbing,
+    MinProbes,
+    MaxProbes,
+    Confidence,
 }
 
 const MAX_SAMPLE_PER_CIDR: usize = 10_000;
@@ -59,7 +65,7 @@ const MAX_SPEED_TIMEOUT_MS: u64 = 3_600_000;
 impl SettingField {
     /// All settings fields in display order, grouped by concern. Group
     /// boundaries are described by [`SettingField::GROUPS`].
-    pub const ALL: [SettingField; 26] = [
+    pub const ALL: [SettingField; 32] = [
         // Target
         SettingField::Host,
         SettingField::Path,
@@ -67,6 +73,8 @@ impl SettingField {
         SettingField::RequiredBodyMarkers,
         SettingField::RequiredHeaders,
         SettingField::FollowRedirects,
+        SettingField::HealthChecks,
+        SettingField::Warmup,
         // Latency scan
         SettingField::SamplePerCidr,
         SettingField::Probes,
@@ -85,6 +93,10 @@ impl SettingField {
         SettingField::EarlyStopPruneMargin,
         SettingField::TwoPhase,
         SettingField::DiscoverFraction,
+        SettingField::AdaptiveProbing,
+        SettingField::MinProbes,
+        SettingField::MaxProbes,
+        SettingField::Confidence,
         // Speed test
         SettingField::DownloadPath,
         SettingField::UploadPath,
@@ -97,10 +109,10 @@ impl SettingField {
     /// same order as [`SettingField::ALL`].
     pub const GROUPS: [(&'static str, usize); 6] = [
         ("Target", 2),
-        ("Validation", 4),
+        ("Validation", 6),
         ("Latency scan", 6),
         ("Ranking quality", 2),
-        ("Adaptive scan", 7),
+        ("Adaptive scan", 11),
         ("Speed test", 5),
     ];
 
@@ -112,6 +124,8 @@ impl SettingField {
             SettingField::RequiredBodyMarkers => "Required body markers",
             SettingField::RequiredHeaders => "Required headers",
             SettingField::FollowRedirects => "Follow redirects",
+            SettingField::HealthChecks => "Health checks",
+            SettingField::Warmup => "Warmup probe",
             SettingField::DownloadPath => "Download path",
             SettingField::UploadPath => "Upload path",
             SettingField::SpeedPayloadMb => "Speed payload (MB)",
@@ -132,6 +146,10 @@ impl SettingField {
             SettingField::EarlyStopPruneMargin => "Prune margin",
             SettingField::TwoPhase => "Two-phase scan",
             SettingField::DiscoverFraction => "Discover fraction",
+            SettingField::AdaptiveProbing => "Adaptive probing",
+            SettingField::MinProbes => "Minimum probes",
+            SettingField::MaxProbes => "Maximum probes",
+            SettingField::Confidence => "Confidence",
         }
     }
 
@@ -143,6 +161,8 @@ impl SettingField {
             SettingField::RequiredBodyMarkers => "Comma-separated literal substrings that must occur in the response body.",
             SettingField::RequiredHeaders => "Comma-separated exact header checks in name=value form.",
             SettingField::FollowRedirects => "Follow redirects during validation. Off preserves the default strict behavior.",
+            SettingField::HealthChecks => "Optional checks encoded as name|path|required|weight;... . Leave empty to use the primary path.",
+            SettingField::Warmup => "Send a discarded connection-establishment request before measured latency probes.",
             SettingField::DownloadPath => "Static file endpoint used for download speed tests.",
             SettingField::UploadPath => "POST endpoint used for upload speed tests; it should consume and discard the request body.",
             SettingField::SpeedPayloadMb => "Payload size used for each upload/download repetition. Larger payloads reduce short-test noise but use more bandwidth.",
@@ -163,6 +183,10 @@ impl SettingField {
             SettingField::EarlyStopPruneMargin => "How much better (as a fraction) a target's score must be versus the worst current top-N candidate to keep probing it under the prune rule.",
             SettingField::TwoPhase => "Run a sparse discovery pass first, then spend the rest of the probe budget focusing on the CIDRs that produced the best Cloudflare colos. Finds good edges faster and densifies there.",
             SettingField::DiscoverFraction => "Fraction of sample_per_cidr used for the discovery pass when two-phase scanning is enabled; the remainder is spent on the focused CIDRs.",
+            SettingField::AdaptiveProbing => "Allocate probes adaptively using confidence intervals instead of probing every target equally.",
+            SettingField::MinProbes => "Minimum measured probes before adaptive stopping can occur.",
+            SettingField::MaxProbes => "Maximum measured probes per target in adaptive mode.",
+            SettingField::Confidence => "Confidence level used by adaptive score intervals, from 0 to 1.",
         }
     }
 
@@ -181,6 +205,27 @@ impl SettingField {
             SettingField::RequiredHeaders => args.required_headers.join(","),
             SettingField::FollowRedirects => {
                 if args.follow_redirects {
+                    "On".to_string()
+                } else {
+                    "Off".to_string()
+                }
+            }
+            SettingField::HealthChecks => args
+                .health_checks
+                .iter()
+                .map(|check| {
+                    format!(
+                        "{}|{}|{}|{}",
+                        check.name,
+                        check.path,
+                        if check.required { "true" } else { "false" },
+                        check.weight
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(";"),
+            SettingField::Warmup => {
+                if args.warmup {
                     "On".to_string()
                 } else {
                     "Off".to_string()
@@ -224,6 +269,16 @@ impl SettingField {
                 }
             }
             SettingField::DiscoverFraction => args.discover_fraction.to_string(),
+            SettingField::AdaptiveProbing => {
+                if args.adaptive_probing {
+                    "On".to_string()
+                } else {
+                    "Off".to_string()
+                }
+            }
+            SettingField::MinProbes => args.min_probes.to_string(),
+            SettingField::MaxProbes => args.max_probes.to_string(),
+            SettingField::Confidence => args.confidence.to_string(),
         }
     }
 
@@ -236,11 +291,14 @@ impl SettingField {
                 | SettingField::RequiredBodyMarkers
                 | SettingField::RequiredHeaders
                 | SettingField::FollowRedirects
+                | SettingField::HealthChecks
                 | SettingField::DownloadPath
                 | SettingField::UploadPath
                 | SettingField::EarlyStop
                 | SettingField::EarlyStopPrune
                 | SettingField::TwoPhase
+                | SettingField::Warmup
+                | SettingField::AdaptiveProbing
         )
     }
 
@@ -253,6 +311,7 @@ impl SettingField {
             SettingField::SpeedTimeoutMs => 1_000,
             SettingField::EarlyStopPruneMargin => 5,
             SettingField::DiscoverFraction => 5,
+            SettingField::Confidence => 5,
             _ => 1,
         }
     }
@@ -264,6 +323,7 @@ impl SettingField {
                 | SettingField::LossWeight
                 | SettingField::EarlyStopPruneMargin
                 | SettingField::DiscoverFraction
+                | SettingField::Confidence
         )
     }
 
@@ -271,12 +331,16 @@ impl SettingField {
         match self {
             SettingField::StabilityWeight | SettingField::LossWeight => 0.1,
             SettingField::EarlyStopPruneMargin | SettingField::DiscoverFraction => 0.05,
+            SettingField::Confidence => 0.05,
             _ => unreachable!("fractional_step called for an integer field"),
         }
     }
 
     fn nudged_fractional_value(&self, value: f64, direction: i64) -> f64 {
-        let upper = if matches!(self, SettingField::DiscoverFraction) {
+        let upper = if matches!(
+            self,
+            SettingField::DiscoverFraction | SettingField::Confidence
+        ) {
             1.0
         } else {
             f64::MAX
@@ -312,19 +376,24 @@ impl SettingField {
             SettingField::EarlyStopMinSamples => MAX_EARLY_STOP_MIN_SAMPLES as i64,
             SettingField::EarlyStopPruneMargin => i64::MAX,
             SettingField::DiscoverFraction => i64::MAX,
+            SettingField::MinProbes | SettingField::MaxProbes => MAX_PROBES as i64,
             SettingField::Host
             | SettingField::Path
             | SettingField::ExpectedStatuses
             | SettingField::RequiredBodyMarkers
             | SettingField::RequiredHeaders
             | SettingField::FollowRedirects
+            | SettingField::HealthChecks
             | SettingField::DownloadPath
             | SettingField::UploadPath
             | SettingField::EarlyStop
             | SettingField::EarlyStopPrune
             | SettingField::TwoPhase
+            | SettingField::Warmup
+            | SettingField::AdaptiveProbing
             | SettingField::StabilityWeight
-            | SettingField::LossWeight => i64::MAX,
+            | SettingField::LossWeight
+            | SettingField::Confidence => i64::MAX,
         }
     }
 
@@ -357,6 +426,10 @@ impl SettingField {
                     (args.discover_fraction + direction as f64 * 0.05).max(0.0);
                 return;
             }
+            SettingField::Confidence => {
+                args.confidence = (args.confidence + direction as f64 * 0.05).clamp(0.01, 1.0);
+                return;
+            }
             _ => {}
         }
         let value = self.value_string(args).parse::<i64>().unwrap_or(1);
@@ -379,6 +452,8 @@ impl SettingField {
             | SettingField::RequiredBodyMarkers
             | SettingField::RequiredHeaders
             | SettingField::FollowRedirects
+            | SettingField::HealthChecks
+            | SettingField::Warmup
             | SettingField::DownloadPath
             | SettingField::UploadPath
             | SettingField::EarlyStop
@@ -386,6 +461,10 @@ impl SettingField {
             | SettingField::EarlyStopPruneMargin
             | SettingField::TwoPhase
             | SettingField::DiscoverFraction
+            | SettingField::AdaptiveProbing
+            | SettingField::MinProbes
+            | SettingField::MaxProbes
+            | SettingField::Confidence
             | SettingField::StabilityWeight
             | SettingField::LossWeight => {}
         }
@@ -453,6 +532,50 @@ impl SettingField {
             }
             SettingField::FollowRedirects => {
                 args.follow_redirects = match raw.to_lowercase().as_str() {
+                    "on" | "true" | "1" | "yes" => true,
+                    "off" | "false" | "0" | "no" => false,
+                    _ => return Err("enter on or off".to_string()),
+                };
+            }
+            SettingField::HealthChecks => {
+                if raw.is_empty() {
+                    args.health_checks.clear();
+                } else {
+                    let mut checks = Vec::new();
+                    for encoded in raw.split(';') {
+                        let fields: Vec<&str> = encoded.split('|').collect();
+                        if fields.len() != 4
+                            || fields[0].trim().is_empty()
+                            || !fields[1].trim().starts_with('/')
+                        {
+                            return Err(
+                                "checks must use name|/path|required|weight format".to_string()
+                            );
+                        }
+                        let required = match fields[2].trim().to_lowercase().as_str() {
+                            "true" | "on" | "yes" | "1" => true,
+                            "false" | "off" | "no" | "0" => false,
+                            _ => return Err("check required must be true or false".to_string()),
+                        };
+                        let weight = fields[3]
+                            .trim()
+                            .parse::<f64>()
+                            .map_err(|_| "check weight must be a number".to_string())?;
+                        if !weight.is_finite() || weight < 0.0 {
+                            return Err("check weight must be non-negative".to_string());
+                        }
+                        checks.push(HealthCheck {
+                            name: fields[0].trim().to_string(),
+                            path: fields[1].trim().to_string(),
+                            required,
+                            weight,
+                        });
+                    }
+                    args.health_checks = checks;
+                }
+            }
+            SettingField::Warmup => {
+                args.warmup = match raw.to_lowercase().as_str() {
                     "on" | "true" | "1" | "yes" => true,
                     "off" | "false" | "0" | "no" => false,
                     _ => return Err("enter on or off".to_string()),
@@ -632,6 +755,40 @@ impl SettingField {
                     return Err("must be a number between 0 and 1".to_string());
                 }
                 args.discover_fraction = v;
+            }
+            SettingField::AdaptiveProbing => {
+                args.adaptive_probing = match raw.to_lowercase().as_str() {
+                    "on" | "true" | "1" | "yes" => true,
+                    "off" | "false" | "0" | "no" => false,
+                    _ => return Err("enter on or off".to_string()),
+                };
+            }
+            SettingField::MinProbes => {
+                let v = raw
+                    .parse::<usize>()
+                    .map_err(|_| "invalid number".to_string())?;
+                if !(1..=MAX_PROBES).contains(&v) {
+                    return Err(format!("must be between 1 and {MAX_PROBES}"));
+                }
+                args.min_probes = v;
+            }
+            SettingField::MaxProbes => {
+                let v = raw
+                    .parse::<usize>()
+                    .map_err(|_| "invalid number".to_string())?;
+                if !(1..=MAX_PROBES).contains(&v) {
+                    return Err(format!("must be between 1 and {MAX_PROBES}"));
+                }
+                args.max_probes = v;
+            }
+            SettingField::Confidence => {
+                let v = raw
+                    .parse::<f64>()
+                    .map_err(|_| "invalid number".to_string())?;
+                if !v.is_finite() || !(0.0..=1.0).contains(&v) || v == 0.0 {
+                    return Err("must be a number between 0 and 1".to_string());
+                }
+                args.confidence = v;
             }
         }
         Ok(())
@@ -1591,7 +1748,7 @@ fn handle_review_key(app: &mut App, code: KeyCode) {
                 app.cursor = 0;
             }
             2 => app.pending_start = true,
-            _ => {}
+            _ => app.pending_start = true,
         },
         KeyCode::Left | KeyCode::Esc => {
             app.wizard_step = WizardStep::Settings;
@@ -1714,6 +1871,34 @@ mod tests {
             .is_err());
         assert!(SettingField::Path.apply("/trace", &mut config).is_ok());
         assert!(SettingField::Path.apply("trace", &mut config).is_err());
+    }
+
+    #[test]
+    fn advanced_scan_settings_and_health_checks_are_editable() {
+        let mut config = AppConfig::default();
+        SettingField::HealthChecks
+            .apply(
+                "primary|/health|true|2;optional|/ready|false|0.5",
+                &mut config,
+            )
+            .unwrap();
+        assert_eq!(config.health_checks.len(), 2);
+        assert_eq!(config.health_checks[0].path, "/health");
+        assert!(!config.health_checks[1].required);
+        assert_eq!(config.health_checks[1].weight, 0.5);
+
+        SettingField::Warmup.apply("off", &mut config).unwrap();
+        SettingField::AdaptiveProbing
+            .apply("on", &mut config)
+            .unwrap();
+        SettingField::MinProbes.apply("4", &mut config).unwrap();
+        SettingField::MaxProbes.apply("20", &mut config).unwrap();
+        SettingField::Confidence.apply("0.99", &mut config).unwrap();
+        assert!(!config.warmup);
+        assert!(config.adaptive_probing);
+        assert_eq!(config.min_probes, 4);
+        assert_eq!(config.max_probes, 20);
+        assert_eq!(config.confidence, 0.99);
     }
 
     #[test]

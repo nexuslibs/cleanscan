@@ -22,7 +22,7 @@ pub const RESULT_COLUMNS: [&str; 14] = [
 ];
 const WIDTHS: [Constraint; 14] = [
     Constraint::Length(5),
-    Constraint::Length(25),
+    Constraint::Length(42),
     Constraint::Length(8),
     Constraint::Length(5),
     Constraint::Length(6),
@@ -47,9 +47,9 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) {
         return;
     }
 
-    // The full 14-column table needs 136 (WIDTHS) + 13 column separators
-    // + 2 border columns = 151 columns to render without clipping.
-    if area.width < 151 {
+    // The full 14-column table needs 153 (WIDTHS) + 13 column separators
+    // + 2 border columns = 168 columns to render without clipping.
+    if area.width < 168 {
         render_compact(app, frame, area);
     } else {
         render_wide(app, frame, area);
@@ -185,7 +185,7 @@ fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
         let index = app.scroll + i;
         let selected = index == app.result_cursor;
         let reliability = format!("{}/{}", r.ok, r.completed);
-        let status = if r.fail == 0 { "READY" } else { "DEGRADED" };
+        let status = result_status(r);
         Row::new(vec![
             Cell::from((index + 1).to_string()),
             Cell::from(r.ip.clone()),
@@ -521,7 +521,7 @@ fn render_latency_map(frame: &mut Frame, area: Rect, app: &App) {
     let selected = selected_ip
         .as_deref()
         .and_then(|ip| results.iter().position(|result| result.ip == ip))
-        .unwrap_or_else(|| app.result_cursor.min(points.len().saturating_sub(1)));
+        .unwrap_or(0);
     let max_y = points
         .iter()
         .map(|(_, value)| *value)
