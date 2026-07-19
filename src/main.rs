@@ -97,6 +97,14 @@ pub struct Args {
     /// Skip the connection-establishment warmup probe (first counted probe includes connection time)
     #[arg(long)]
     pub no_warmup: bool,
+
+    /// Weight applied to latency jitter when ranking results (higher penalizes variable-latency IPs)
+    #[arg(long)]
+    pub stability_weight: Option<f64>,
+
+    /// Weight applied to packet loss when ranking results (higher penalizes lossy IPs)
+    #[arg(long)]
+    pub loss_weight: Option<f64>,
 }
 
 fn main() -> Result<()> {
@@ -132,6 +140,19 @@ fn main() -> Result<()> {
     }
     if args.no_warmup {
         config.warmup = false;
+    }
+    if let Some(weight) = args.stability_weight {
+        config.stability_weight = weight;
+    }
+    if let Some(weight) = args.loss_weight {
+        config.loss_weight = weight;
+    }
+
+    if !config.stability_weight.is_finite() || config.stability_weight < 0.0 {
+        anyhow::bail!("--stability-weight must be a finite, non-negative value");
+    }
+    if !config.loss_weight.is_finite() || config.loss_weight < 0.0 {
+        anyhow::bail!("--loss-weight must be a finite, non-negative value");
     }
 
     normalize_config(&mut config);
@@ -255,29 +276,7 @@ fn cli_mode(
         });
     }
 
-    results.sort_by(|a, b| {
-        a.fail
-            .cmp(&b.fail)
-            .then_with(|| a.p95.partial_cmp(&b.p95).unwrap())
-            .then_with(|| a.max.partial_cmp(&b.max).unwrap())
-            .then_with(|| a.avg.partial_cmp(&b.avg).unwrap())
-    });
-
-    results.sort_by(|a, b| {
-        b.success_rate
-            .partial_cmp(&a.success_rate)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                a.p95
-                    .partial_cmp(&b.p95)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| {
-                a.avg
-                    .partial_cmp(&b.avg)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-    });
+    results.sort_by(crate::tui::App::natural_cmp);
     let healthy = results.iter().any(|result| {
         result.ok > 0
             && min_success_rate.is_none_or(|min| result.success_rate >= min)
@@ -294,7 +293,7 @@ fn cli_mode(
             .collect::<std::result::Result<Vec<_>, _>>()?
             .join("\n"),
         _ => {
-            let mut text = String::from("rank\tip\tcolo\tcountry\tprotocol\tok\tfail\tsuccess_rate\tconfidence\tavg\tp50\tp90\tp95\tmax\tcold_ms\tsamples\tfailures\n");
+            let mut text = String::from("rank\tip\tcolo\tcountry\tprotocol\tok\tfail\tsuccess_rate\tconfidence\tavg\tp50\tp90\tp95\tmax\tjitter\tloss\tpkt_loss\tcold_ms\tsamples\tfailures\n");
             for (i, r) in rows.iter().enumerate() {
                 let samples = r
                     .samples
@@ -304,7 +303,7 @@ fn cli_mode(
                     .join(",");
 
                 text.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{:.1}\t{}\t{}\t{}\n",
                     i + 1,
                     r.ip,
                     r.colo.clone().unwrap_or_default(),
@@ -319,6 +318,9 @@ fn cli_mode(
                     r.p90,
                     r.p95,
                     r.max,
+                    r.jitter,
+                    r.loss,
+                    r.packet_loss * 100.0,
                     r.cold_ms.map(|ms| format!("{:.1}", ms)).unwrap_or_default(),
                     samples,
                     r.failures.join(",")
@@ -367,11 +369,16 @@ mod tests {
             protocol: "h2".to_string(),
             ok: 1,
             fail: 0,
+            completed: 1,
             avg: 0.0,
             p50: 0.0,
             p90: 0.0,
             p95: 0.0,
             max: 0.0,
+            jitter: 0.0,
+            stddev: 0.0,
+            loss: 0,
+            packet_loss: 0.0,
             samples: vec![0.0],
             failures: Vec::new(),
             success_rate: 1.0,

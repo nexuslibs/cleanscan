@@ -27,6 +27,8 @@ pub enum SettingField {
     TimeoutMs,
     ConnectTimeoutMs,
     Top,
+    StabilityWeight,
+    LossWeight,
 }
 
 const MAX_SAMPLE_PER_CIDR: usize = 10_000;
@@ -42,7 +44,7 @@ const MAX_SPEED_TIMEOUT_MS: u64 = 3_600_000;
 impl SettingField {
     /// All settings fields in display order, grouped by concern. Group
     /// boundaries are described by [`SettingField::GROUPS`].
-    pub const ALL: [SettingField; 13] = [
+    pub const ALL: [SettingField; 15] = [
         // Target
         SettingField::Host,
         SettingField::Path,
@@ -53,6 +55,9 @@ impl SettingField {
         SettingField::TimeoutMs,
         SettingField::ConnectTimeoutMs,
         SettingField::Top,
+        // Ranking quality
+        SettingField::StabilityWeight,
+        SettingField::LossWeight,
         // Speed test
         SettingField::DownloadPath,
         SettingField::UploadPath,
@@ -63,8 +68,12 @@ impl SettingField {
 
     /// Section headers and the number of consecutive fields in each, in the
     /// same order as [`SettingField::ALL`].
-    pub const GROUPS: [(&'static str, usize); 3] =
-        [("Target", 2), ("Latency scan", 6), ("Speed test", 5)];
+    pub const GROUPS: [(&'static str, usize); 4] = [
+        ("Target", 2),
+        ("Latency scan", 6),
+        ("Ranking quality", 2),
+        ("Speed test", 5),
+    ];
 
     pub fn label(&self) -> &'static str {
         match self {
@@ -81,6 +90,8 @@ impl SettingField {
             SettingField::TimeoutMs => "Timeout (ms)",
             SettingField::ConnectTimeoutMs => "Connect timeout (ms)",
             SettingField::Top => "Top results",
+            SettingField::StabilityWeight => "Stability weight",
+            SettingField::LossWeight => "Loss weight",
         }
     }
 
@@ -99,6 +110,8 @@ impl SettingField {
             SettingField::TimeoutMs => "Max time (in ms) allowed for an HTTP request to finish. Probes exceeding this threshold are treated as errors/failures.",
             SettingField::ConnectTimeoutMs => "Max time (in ms) to establish a TCP socket connection. Lower values skip dead, blacklisted, or blocked IPs more rapidly.",
             SettingField::Top => "Number of fastest, zero-fail IP addresses to show in the final dashboard results table and export to files.",
+            SettingField::StabilityWeight => "Weight of latency jitter in the recommendation score. Higher values rank a variable-latency (jittery) IP lower relative to a steadier one with similar average latency.",
+            SettingField::LossWeight => "Weight of packet loss in the recommendation score. Higher values rank a lossy IP lower even when its success rate still looks usable.",
         }
     }
 
@@ -118,6 +131,8 @@ impl SettingField {
             SettingField::TimeoutMs => args.timeout_ms.to_string(),
             SettingField::ConnectTimeoutMs => args.connect_timeout_ms.to_string(),
             SettingField::Top => args.top.to_string(),
+            SettingField::StabilityWeight => args.stability_weight.to_string(),
+            SettingField::LossWeight => args.loss_weight.to_string(),
         }
     }
 
@@ -156,7 +171,9 @@ impl SettingField {
             SettingField::Host
             | SettingField::Path
             | SettingField::DownloadPath
-            | SettingField::UploadPath => i64::MAX,
+            | SettingField::UploadPath
+            | SettingField::StabilityWeight
+            | SettingField::LossWeight => i64::MAX,
         }
     }
 
@@ -170,6 +187,17 @@ impl SettingField {
 
     #[allow(dead_code)]
     fn nudge_config(&self, args: &mut AppConfig, direction: i64) {
+        match self {
+            SettingField::StabilityWeight => {
+                args.stability_weight = (args.stability_weight + direction as f64 * 0.1).max(0.0);
+                return;
+            }
+            SettingField::LossWeight => {
+                args.loss_weight = (args.loss_weight + direction as f64 * 0.1).max(0.0);
+                return;
+            }
+            _ => {}
+        }
         let value = self.value_string(args).parse::<i64>().unwrap_or(1);
         let value = self.nudged_value(value, direction);
         match self {
@@ -185,7 +213,9 @@ impl SettingField {
             SettingField::Host
             | SettingField::Path
             | SettingField::DownloadPath
-            | SettingField::UploadPath => {}
+            | SettingField::UploadPath
+            | SettingField::StabilityWeight
+            | SettingField::LossWeight => {}
         }
     }
 
@@ -300,6 +330,24 @@ impl SettingField {
                     return Err(format!("must be between 1 and {MAX_TOP}"));
                 }
                 args.top = v;
+            }
+            SettingField::StabilityWeight => {
+                let v = raw
+                    .parse::<f64>()
+                    .map_err(|_| "invalid number".to_string())?;
+                if !v.is_finite() || v < 0.0 {
+                    return Err("must be a non-negative number".to_string());
+                }
+                args.stability_weight = v;
+            }
+            SettingField::LossWeight => {
+                let v = raw
+                    .parse::<f64>()
+                    .map_err(|_| "invalid number".to_string())?;
+                if !v.is_finite() || v < 0.0 {
+                    return Err("must be a non-negative number".to_string());
+                }
+                args.loss_weight = v;
             }
         }
         Ok(())

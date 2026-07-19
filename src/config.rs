@@ -30,6 +30,14 @@ pub struct AppConfig {
     /// than TCP + TLS handshake cost.
     #[serde(default = "default_warmup")]
     pub warmup: bool,
+    /// Weight applied to jitter in the recommendation score. Higher values make
+    /// a jittery (variable-latency) IP rank lower relative to a steadier one.
+    #[serde(default = "default_stability_weight")]
+    pub stability_weight: f64,
+    /// Weight applied to packet loss in the recommendation score. Higher values
+    /// make a lossy IP rank lower even when its success rate still looks usable.
+    #[serde(default = "default_loss_weight")]
+    pub loss_weight: f64,
     pub custom_cidrs: Vec<String>,
     #[serde(default)]
     pub selected_cidrs: Vec<String>,
@@ -61,6 +69,14 @@ fn default_warmup() -> bool {
     true
 }
 
+fn default_stability_weight() -> f64 {
+    1.0
+}
+
+fn default_loss_weight() -> f64 {
+    1.0
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -79,6 +95,8 @@ impl Default for AppConfig {
             speed_repetitions: default_speed_repetitions(),
             speed_timeout_ms: default_speed_timeout_ms(),
             warmup: default_warmup(),
+            stability_weight: default_stability_weight(),
+            loss_weight: default_loss_weight(),
             custom_cidrs: Vec::new(),
             selected_cidrs: crate::scanner::DEFAULT_CLOUDFLARE_CIDRS
                 .iter()

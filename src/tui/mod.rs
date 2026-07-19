@@ -237,7 +237,7 @@ pub struct App {
     pub show_failures: bool,
     pub colo_filter: Option<String>,
     pub country_filter: Option<String>,
-    pub result_column_visibility: [bool; 12],
+    pub result_column_visibility: [bool; 14],
     pub column_picker_cursor: usize,
     pub start_time: Instant,
     /// Help overlay visibility.
@@ -461,7 +461,7 @@ impl App {
             show_failures: false,
             colo_filter: None,
             country_filter: None,
-            result_column_visibility: [true; 12],
+            result_column_visibility: [true; 14],
             column_picker_cursor: 0,
             start_time: Instant::now(),
             show_help: false,
@@ -776,12 +776,27 @@ impl App {
 
     /// Natural ranking used as the default results order.
     pub fn natural_cmp(a: &ProbeResult, b: &ProbeResult) -> std::cmp::Ordering {
-        b.success_rate
-            .partial_cmp(&a.success_rate)
+        b.score
+            .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                b.success_rate
+                    .partial_cmp(&a.success_rate)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .then_with(|| {
                 a.p95
                     .partial_cmp(&b.p95)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                a.jitter
+                    .partial_cmp(&b.jitter)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                a.packet_loss
+                    .partial_cmp(&b.packet_loss)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .then_with(|| {
@@ -857,6 +872,14 @@ impl App {
                     .unwrap_or(std::cmp::Ordering::Equal),
                 10 => a.colo.cmp(&b.colo),
                 11 => a.country.cmp(&b.country),
+                12 => a
+                    .jitter
+                    .partial_cmp(&b.jitter)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                13 => a
+                    .packet_loss
+                    .partial_cmp(&b.packet_loss)
+                    .unwrap_or(std::cmp::Ordering::Equal),
                 _ => std::cmp::Ordering::Equal,
             };
             if self.sort_asc {
@@ -1197,6 +1220,8 @@ pub fn run_tui(
                         speed_repetitions: app.config.speed_repetitions,
                         speed_timeout_ms: app.config.speed_timeout_ms,
                         warmup: app.config.warmup,
+                        stability_weight: app.config.stability_weight,
+                        loss_weight: app.config.loss_weight,
                     });
                     app.set_scan_targets(targets.clone());
                     *scanner = Some(spawn_scanner(targets, scan_config));
@@ -1388,7 +1413,8 @@ impl App {
                     self.column_picker_cursor = self.column_picker_cursor.saturating_sub(1)
                 }
                 KeyCode::Down => {
-                    self.column_picker_cursor = (self.column_picker_cursor + 1).min(11)
+                    self.column_picker_cursor = (self.column_picker_cursor + 1)
+                        .min(dashboard::RESULT_COLUMNS.len().saturating_sub(1))
                 }
                 KeyCode::Char(' ') | KeyCode::Enter => self.toggle_column(),
                 _ => {}
@@ -1578,7 +1604,9 @@ impl App {
             Action::ConfigureColumns => {
                 if self.screen == Screen::Scanning {
                     self.show_column_picker = true;
-                    self.column_picker_cursor = self.column_picker_cursor.min(11);
+                    self.column_picker_cursor = self
+                        .column_picker_cursor
+                        .min(dashboard::RESULT_COLUMNS.len().saturating_sub(1));
                 }
             }
             Action::Confirm => {
@@ -2435,11 +2463,16 @@ mod tests {
             protocol: "h2".to_string(),
             ok: 1,
             fail,
+            completed: 1 + fail,
             avg: p95,
             p50: p95,
             p90: p95,
             p95,
             max: p95,
+            jitter: 0.0,
+            stddev: 0.0,
+            loss: 0,
+            packet_loss: 0.0,
             samples: vec![p95],
             failures: Vec::new(),
             success_rate: 1.0 / (1 + fail) as f64,
@@ -2459,7 +2492,7 @@ mod tests {
     #[test]
     fn export_ranks_successes_and_applies_top_limit() {
         let results = vec![
-            result("failed", 1, 0.001),
+            result("failed", 1, 0.5),
             result("slow", 0, 0.2),
             result("fast", 0, 0.1),
         ];

@@ -15,10 +15,11 @@ use crate::scanner::{result_confidence, result_status, ProbeResult};
 use crate::tui::theme;
 use crate::tui::{widgets, App, ButtonAction, ButtonKind};
 
-pub const RESULT_COLUMNS: [&str; 12] = [
+pub const RESULT_COLUMNS: [&str; 14] = [
     "#", "IP", "Proto", "OK", "Fail", "Avg", "P50", "P90", "P95", "Max", "Colo", "Country",
+    "Jitter", "Loss",
 ];
-const WIDTHS: [Constraint; 12] = [
+const WIDTHS: [Constraint; 14] = [
     Constraint::Length(5),
     Constraint::Length(25),
     Constraint::Length(8),
@@ -31,6 +32,8 @@ const WIDTHS: [Constraint; 12] = [
     Constraint::Length(10),
     Constraint::Length(7),
     Constraint::Length(14),
+    Constraint::Length(9),
+    Constraint::Length(7),
 ];
 
 /// Render the live scanning dashboard.
@@ -40,10 +43,9 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    // The full 12-column table needs 120 (WIDTHS) + 11 column separators
-    // + 2 border columns = 133 columns to render without clipping, so only
-    // enter wide mode once the area is at least that wide.
-    if area.width < 134 {
+    // The full 14-column table needs 136 (WIDTHS) + 13 column separators
+    // + 2 border columns = 151 columns to render without clipping.
+    if area.width < 151 {
         render_compact(app, frame, area);
     } else {
         render_wide(app, frame, area);
@@ -180,7 +182,7 @@ fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
     let rows = page.enumerate().map(|(i, r)| {
         let index = app.scroll + i;
         let selected = index == app.result_cursor;
-        let reliability = format!("{}/{}", r.ok, r.ok + r.fail);
+        let reliability = format!("{}/{}", r.ok, r.completed);
         let status = if r.fail == 0 { "READY" } else { "DEGRADED" };
         Row::new(vec![
             Cell::from((index + 1).to_string()),
@@ -313,12 +315,23 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
                 Line::from(format!(
                     "Success     : {}/{} ({:.1}%)",
                     result.ok,
-                    result.ok + result.fail,
+                    result.completed,
                     result.success_rate * 100.0
                 )),
                 Line::from(format!("Average     : {}", fmt_ms(result.avg))),
                 Line::from(format!("P95         : {}", fmt_ms(result.p95))),
                 Line::from(format!("Max         : {}", fmt_ms(result.max))),
+                Line::from(format!(
+                    "Jitter      : {} (σ {})",
+                    fmt_ms(result.jitter),
+                    fmt_ms(result.stddev)
+                )),
+                Line::from(format!(
+                    "Loss        : {}/{} ({:.1}%)",
+                    result.loss,
+                    result.completed,
+                    result.packet_loss * 100.0
+                )),
                 Line::from(format!(
                     "Cold        : {}",
                     result
@@ -592,7 +605,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
     let mut total_probes_done = 0;
     let mut total_probes_ok = 0;
     for r in &app.results {
-        total_probes_done += r.ok + r.fail;
+        total_probes_done += r.completed;
         total_probes_ok += r.ok;
     }
     let success_rate = if total_probes_done > 0 {
@@ -789,7 +802,7 @@ fn render_decision_panel(app: &App, frame: &mut Frame, area: Rect) {
         .iter()
         .filter(|r| result_status(r) == "FAILED")
         .count();
-    let total: usize = app.results.iter().map(|r| r.ok + r.fail).sum();
+    let total: usize = app.results.iter().map(|r| r.completed).sum();
     let ok: usize = app.results.iter().map(|r| r.ok).sum();
     let rate = if total > 0 {
         ok as f64 / total as f64 * 100.0
@@ -810,10 +823,12 @@ fn render_decision_panel(app: &App, frame: &mut Frame, area: Rect) {
     ])];
     if let Some(result) = candidates.first() {
         lines.push(Line::from(format!(
-            "Recommended: {} • {} • p95 {} • confidence {}",
+            "Recommended: {} • {} • p95 {} • jitter {} • loss {:.1}% • confidence {}",
             result.ip,
             result_status(result),
             fmt_ms(result.p95),
+            fmt_ms(result.jitter),
+            result.packet_loss * 100.0,
             result_confidence(result)
         )));
         let backups = candidates
@@ -832,7 +847,7 @@ fn render_decision_panel(app: &App, frame: &mut Frame, area: Rect) {
         )));
     }
     lines.push(Line::from(Span::styled(
-        "Ranking: reliability first, then p95 latency • f: show failures",
+        "Ranking: recommendation score first, then success rate, p95, jitter, packet loss, and average latency • f: show failures",
         theme::hint_style(),
     )));
     frame.render_widget(
@@ -1001,6 +1016,18 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
                 }),
                 Cell::from(r.colo.clone().unwrap_or_else(|| "—".to_string())).style(base_style),
                 Cell::from(r.country.clone().unwrap_or_else(|| "—".to_string())).style(base_style),
+                Cell::from(fmt_ms(r.jitter)).style(if is_selected {
+                    base_style
+                } else {
+                    theme::latency_style(r.jitter * 1000.0)
+                }),
+                Cell::from(format!("{:.1}%", r.packet_loss * 100.0)).style(if is_selected {
+                    base_style
+                } else if r.loss > 0 {
+                    theme::bad_style()
+                } else {
+                    base_style
+                }),
             ];
             Row::new(
                 cells
