@@ -313,6 +313,9 @@ pub struct App {
     pub last_watch_healthy: Option<bool>,
     pub alert_message: Option<String>,
     pub watch_state: Option<crate::watch::WatchState>,
+    pub watch_policy: crate::watch::WatchPolicy,
+    pub watch_state_path: Option<String>,
+    pub watch_new_sample: bool,
     /// Animation lifecycle state for each modal layer, driven by `render`.
     pub help_overlay: OverlayState,
     pub quit_overlay: OverlayState,
@@ -578,6 +581,9 @@ impl App {
             last_watch_healthy: None,
             alert_message: None,
             watch_state: None,
+            watch_policy: crate::watch::WatchPolicy::default(),
+            watch_state_path: None,
+            watch_new_sample: false,
             help_overlay: modal_state(),
             quit_overlay: modal_state(),
             speed_confirm_overlay: modal_state(),
@@ -1143,6 +1149,55 @@ fn queue_manifest_write(
     });
 }
 
+fn watch_profile_fingerprint(config: &AppConfig) -> u64 {
+    crate::watch::fingerprint(&(
+        config.host.clone(),
+        config.path.clone(),
+        config.expected_statuses.clone(),
+        config.required_body_markers.clone(),
+        config.required_headers.clone(),
+        config.follow_redirects,
+        config.health_checks.clone(),
+    ))
+}
+
+fn prepare_watch_targets(
+    app: &mut App,
+    mut targets: Vec<String>,
+    source_fingerprint: u64,
+) -> Vec<String> {
+    if app.watch_interval.is_none() || app.watch_state.is_some() {
+        return targets;
+    }
+    let profile_fingerprint = watch_profile_fingerprint(&app.config);
+    let path = app
+        .watch_state_path
+        .clone()
+        .map(std::path::PathBuf::from)
+        .or_else(|| crate::watch::default_state_path(&app.config.host, source_fingerprint));
+    let Some(path) = path else {
+        app.toast_warn("Unable to determine watch state path; continuing without persistence");
+        return targets;
+    };
+    app.watch_state_path = Some(path.to_string_lossy().into_owned());
+    if !app.watch_new_sample {
+        if let Some(saved) = crate::watch::load(&path)
+            .filter(|saved| saved.compatible(source_fingerprint, profile_fingerprint))
+        {
+            targets = saved.targets.clone();
+            app.watch_state = Some(saved);
+            return targets;
+        }
+    }
+    let state =
+        crate::watch::WatchState::new(source_fingerprint, profile_fingerprint, targets.clone());
+    if let Err(error) = crate::watch::save(&path, &state) {
+        app.toast_warn(format!("Watch state write failed: {error}"));
+    }
+    app.watch_state = Some(state);
+    targets
+}
+
 /// Run the full TUI loop.
 #[allow(clippy::too_many_arguments)]
 pub fn run_tui(
@@ -1156,6 +1211,9 @@ pub fn run_tui(
     max_p95_ms: Option<f64>,
     manifest_min_confidence: String,
     manifest_backups: usize,
+    watch_policy: crate::watch::WatchPolicy,
+    watch_state_path: Option<&str>,
+    watch_new_sample: bool,
 ) -> anyhow::Result<()> {
     let has_cli_targets = cli_ips.is_some() || !cli_cidr.is_empty();
 
@@ -1187,6 +1245,9 @@ pub fn run_tui(
     };
     app.manifest_min_confidence = manifest_min_confidence;
     app.manifest_backups = manifest_backups;
+    app.watch_policy = watch_policy;
+    app.watch_state_path = watch_state_path.map(str::to_string);
+    app.watch_new_sample = watch_new_sample;
     if has_cli_targets {
         app.set_explicit_target_source(cli_cidr.clone(), cli_ips.clone());
     }
@@ -1265,6 +1326,13 @@ pub fn run_tui(
                 &cli_ips,
                 app.scan_seed,
             )?;
+            let source_fingerprint = crate::watch::fingerprint(&(
+                cli_cidr.clone(),
+                cli_ips.clone(),
+                config_arc.sample_per_cidr,
+                explicit_seed,
+            ));
+            let targets = prepare_watch_targets(&mut app, targets, source_fingerprint);
             let total = targets.len();
             app.set_scan_targets(targets.clone());
             let two_phase_cidrs: Vec<String> = if cli_ips.is_some() {
@@ -1314,6 +1382,12 @@ pub fn run_tui(
         };
         match targets {
             Ok(targets) => {
+                let source_fingerprint = crate::watch::fingerprint(&(
+                    cidrs.clone(),
+                    app.config.sample_per_cidr,
+                    explicit_seed,
+                ));
+                let targets = prepare_watch_targets(app, targets, source_fingerprint);
                 let total = targets.len();
                 let scan_config = Arc::new(app.config.clone());
                 app.set_scan_targets(targets.clone());
@@ -1388,23 +1462,28 @@ pub fn run_tui(
                             .watch_state
                             .as_mut()
                             .expect("watch state initialized")
-                            .advance(
-                                &app.results,
-                                crate::watch::WatchPolicy::default(),
-                                |result| {
-                                    crate::healthy_result(
-                                        result,
-                                        watch_thresholds,
-                                        &watch_min_confidence,
-                                    )
-                                },
-                            );
+                            .advance(&app.results, app.watch_policy, |result| {
+                                crate::healthy_result(
+                                    result,
+                                    watch_thresholds,
+                                    &watch_min_confidence,
+                                )
+                            });
                         let mut alerts = Vec::new();
                         if transition.changed {
                             alerts.push("recommended target changed".to_string());
                         }
-                        if !transition.healthy && app.last_watch_healthy != Some(false) {
+                        if !healthy && app.last_watch_healthy != Some(false) {
                             alerts.push("no healthy target".to_string());
+                        }
+                        if let Some(path) = &app.watch_state_path {
+                            if let Some(state) = &app.watch_state {
+                                if let Err(error) =
+                                    crate::watch::save(std::path::Path::new(path), state)
+                                {
+                                    app.toast_warn(format!("Watch state write failed: {error}"));
+                                }
+                            }
                         }
                         app.alert_message = (!alerts.is_empty()).then(|| alerts.join("; "));
                         if let Some(message) = &app.alert_message {
