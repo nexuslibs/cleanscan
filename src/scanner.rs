@@ -439,7 +439,7 @@ pub fn collect_from_cidrs_with_seed(
     Ok(targets.into_iter().collect())
 }
 
-fn resolve_host_for_ip(host: &str) -> &str {
+pub(crate) fn resolve_host_for_ip(host: &str) -> &str {
     host.strip_prefix('[')
         .and_then(|host| host.split_once(']').map(|(name, _)| name))
         .or_else(|| {

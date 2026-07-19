@@ -13,7 +13,7 @@ use futures::stream;
 use reqwest::{Client, StatusCode};
 use tokio::{sync::Semaphore, task::JoinSet};
 
-use crate::config::AppConfig;
+use crate::{config::AppConfig, scanner::resolve_host_for_ip};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpeedDirection {
@@ -53,28 +53,12 @@ pub struct SpeedResult {
 fn client_for_ip(host: &str, ip: &str, args: &AppConfig) -> Result<Client> {
     let ip_addr = IpAddr::from_str(ip)?;
     let socket = SocketAddr::new(ip_addr, 443);
-    let resolve_host = host
-        .strip_prefix('[')
-        .and_then(|host| host.split_once(']').map(|(name, _)| name))
-        .or_else(|| {
-            if host.parse::<IpAddr>().is_ok() {
-                return None;
-            }
-            host.rsplit_once(':').and_then(|(name, port)| {
-                if port.parse::<u16>().is_ok() {
-                    Some(name)
-                } else {
-                    None
-                }
-            })
-        })
-        .unwrap_or(host);
     Ok(reqwest::Client::builder()
         .http2_adaptive_window(true)
         .pool_max_idle_per_host(0)
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .resolve_to_addrs(resolve_host, &[socket])
+        .resolve_to_addrs(resolve_host_for_ip(host), &[socket])
         .connect_timeout(Duration::from_millis(args.connect_timeout_ms))
         .timeout(Duration::from_millis(args.speed_timeout_ms))
         .build()?)

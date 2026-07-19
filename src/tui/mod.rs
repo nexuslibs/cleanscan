@@ -2288,6 +2288,7 @@ impl App {
                     !self.preview_targets.is_empty()
                 };
                 if generated {
+                    self.watch_source_fingerprint = None;
                     self.rescan_targets = Some(self.preview_targets.clone());
                     self.pending_start = true;
                 }

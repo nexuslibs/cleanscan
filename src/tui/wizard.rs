@@ -1701,8 +1701,16 @@ impl App {
             return true;
         };
         let field = SettingField::ALL[i];
-        match field.apply(&self.edit_buffer, &mut self.config) {
+        let mut updated_config = self.config.clone();
+        match field.apply(&self.edit_buffer, &mut updated_config) {
             Ok(()) => {
+                if matches!(field, SettingField::MinProbes | SettingField::MaxProbes)
+                    && updated_config.min_probes > updated_config.max_probes
+                {
+                    self.toast_error("Minimum probes cannot exceed maximum probes");
+                    return false;
+                }
+                self.config = updated_config;
                 self.edit_field = None;
                 self.edit_buffer.clear();
                 self.edit_caret = 0;
