@@ -731,11 +731,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
 
     // Panel 2: Latency summary
     let ok_results: Vec<&ProbeResult> = app.results.iter().filter(|r| r.ok > 0).collect();
-    let best_ip_str = if let Some(best) = ok_results.iter().min_by(|a, b| {
-        a.avg
-            .partial_cmp(&b.avg)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    }) {
+    let best_ip_str = if let Some(best) = ok_results.iter().min_by(|a, b| a.avg.total_cmp(&b.avg)) {
         format!("{} ({:.1}ms)", best.ip, best.avg * 1000.0)
     } else {
         "None".to_string()
@@ -968,11 +964,7 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
     // The fastest successful edge by average latency, starred wherever it appears.
     let best_ip: Option<String> = {
         let mut v: Vec<&ProbeResult> = app.results.iter().filter(|r| r.ok > 0).collect();
-        v.sort_by(|a, b| {
-            a.avg
-                .partial_cmp(&b.avg)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        v.sort_by(|a, b| a.avg.total_cmp(&b.avg));
         v.first().map(|r| r.ip.clone())
     };
 
@@ -1150,7 +1142,7 @@ fn fmt_ms(sec: f64) -> String {
 }
 
 fn median(mut values: Vec<f64>) -> f64 {
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    values.sort_by(f64::total_cmp);
     let mid = values.len() / 2;
     if values.len().is_multiple_of(2) {
         (values[mid - 1] + values[mid]) / 2.0

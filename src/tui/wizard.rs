@@ -309,8 +309,6 @@ impl SettingField {
             SettingField::SamplePerCidr => 10,
             SettingField::SpeedPayloadMb => 10,
             SettingField::SpeedTimeoutMs => 1_000,
-            SettingField::EarlyStopPruneMargin => 5,
-            SettingField::DiscoverFraction => 5,
             SettingField::Confidence => 5,
             _ => 1,
         }
@@ -403,71 +401,6 @@ impl SettingField {
         value
             .saturating_add(direction.saturating_mul(self.step()))
             .clamp(1, self.max_value())
-    }
-
-    #[allow(dead_code)]
-    fn nudge_config(&self, args: &mut AppConfig, direction: i64) {
-        match self {
-            SettingField::StabilityWeight => {
-                args.stability_weight = (args.stability_weight + direction as f64 * 0.1).max(0.0);
-                return;
-            }
-            SettingField::LossWeight => {
-                args.loss_weight = (args.loss_weight + direction as f64 * 0.1).max(0.0);
-                return;
-            }
-            SettingField::EarlyStopPruneMargin => {
-                args.early_stop_prune_margin =
-                    (args.early_stop_prune_margin + direction as f64 * 0.05).max(0.0);
-                return;
-            }
-            SettingField::DiscoverFraction => {
-                args.discover_fraction =
-                    (args.discover_fraction + direction as f64 * 0.05).max(0.0);
-                return;
-            }
-            SettingField::Confidence => {
-                args.confidence = (args.confidence + direction as f64 * 0.05).clamp(0.01, 1.0);
-                return;
-            }
-            _ => {}
-        }
-        let value = self.value_string(args).parse::<i64>().unwrap_or(1);
-        let value = self.nudged_value(value, direction);
-        match self {
-            SettingField::SamplePerCidr => args.sample_per_cidr = value as usize,
-            SettingField::Probes => args.probes = value as usize,
-            SettingField::Concurrency => args.concurrency = value as usize,
-            SettingField::TimeoutMs => args.timeout_ms = value as u64,
-            SettingField::ConnectTimeoutMs => args.connect_timeout_ms = value as u64,
-            SettingField::Top => args.top = value as usize,
-            SettingField::EarlyStopLossStreak => args.early_stop_loss_streak = value as usize,
-            SettingField::EarlyStopMinSamples => args.early_stop_min_samples = value as usize,
-            SettingField::SpeedPayloadMb => args.speed_payload_bytes = value as u64 * 1024 * 1024,
-            SettingField::SpeedRepetitions => args.speed_repetitions = value as usize,
-            SettingField::SpeedTimeoutMs => args.speed_timeout_ms = value as u64,
-            SettingField::Host
-            | SettingField::Path
-            | SettingField::ExpectedStatuses
-            | SettingField::RequiredBodyMarkers
-            | SettingField::RequiredHeaders
-            | SettingField::FollowRedirects
-            | SettingField::HealthChecks
-            | SettingField::Warmup
-            | SettingField::DownloadPath
-            | SettingField::UploadPath
-            | SettingField::EarlyStop
-            | SettingField::EarlyStopPrune
-            | SettingField::EarlyStopPruneMargin
-            | SettingField::TwoPhase
-            | SettingField::DiscoverFraction
-            | SettingField::AdaptiveProbing
-            | SettingField::MinProbes
-            | SettingField::MaxProbes
-            | SettingField::Confidence
-            | SettingField::StabilityWeight
-            | SettingField::LossWeight => {}
-        }
     }
 
     /// Parse `raw` and apply it to `args`. Returns an error message on failure.
@@ -1936,15 +1869,6 @@ mod tests {
         assert_eq!(SettingField::Probes.nudged_value(1, -1), 1);
         assert_eq!(SettingField::Probes.nudged_value(1000, 1), 1000);
         assert_eq!(SettingField::Top.nudged_value(10_000, 1), 10_000);
-    }
-
-    #[test]
-    fn numeric_nudge_updates_config() {
-        let mut config = AppConfig::default();
-        SettingField::TimeoutMs.nudge_config(&mut config, 1);
-        SettingField::SamplePerCidr.nudge_config(&mut config, -1);
-        assert_eq!(config.timeout_ms, 2600);
-        assert_eq!(config.sample_per_cidr, 90);
     }
 
     #[test]
