@@ -383,7 +383,7 @@ impl SettingField {
                                 .map_err(|_| "invalid status".to_string())
                         })
                         .collect::<Result<Vec<_>, _>>()?;
-                    if statuses.iter().any(|status| *status > 599) {
+                    if statuses.iter().any(|status| !(100..=599).contains(status)) {
                         return Err("statuses must be between 100 and 599".to_string());
                     }
                     args.expected_statuses = statuses;
@@ -1675,6 +1675,20 @@ mod tests {
             .is_err());
         assert!(SettingField::Path.apply("/trace", &mut config).is_ok());
         assert!(SettingField::Path.apply("trace", &mut config).is_err());
+    }
+
+    #[test]
+    fn expected_statuses_require_http_status_range() {
+        let mut config = AppConfig::default();
+        assert!(SettingField::ExpectedStatuses
+            .apply("100,200,599", &mut config)
+            .is_ok());
+        assert!(SettingField::ExpectedStatuses
+            .apply("99", &mut config)
+            .is_err());
+        assert!(SettingField::ExpectedStatuses
+            .apply("600", &mut config)
+            .is_err());
     }
 
     #[test]

@@ -664,7 +664,7 @@ fn cli_mode(
                 min_success_rate,
                 max_p95_ms,
             },
-            "UNKNOWN",
+            &manifest_min_confidence,
         )
     });
     let health_error = fail_if_no_healthy_target && !healthy;
