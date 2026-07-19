@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.10.0](https://github.com/nexuslibs/cleanscan/compare/v0.9.0...v0.10.0) (2026-07-19)
+
+
+### Features
+
+* add fail-fast early stopping and two-phase sampling ([8e58f21](https://github.com/nexuslibs/cleanscan/commit/8e58f218679e00ea4b326f1c628a7add0da69200))
+* add fail-fast early stopping and two-phase sampling ([95a401a](https://github.com/nexuslibs/cleanscan/commit/95a401abc92db545668eb4653d0ce4f97f3a38c8))
+* implement early stopping and refine discover fraction validation ([a5a4de3](https://github.com/nexuslibs/cleanscan/commit/a5a4de3507f3a5a7ad256f5507a594602d356089))
+
 ## [0.9.0](https://github.com/nexuslibs/cleanscan/compare/v0.8.0...v0.9.0) (2026-07-19)
 
 
