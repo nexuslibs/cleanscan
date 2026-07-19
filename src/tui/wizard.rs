@@ -179,8 +179,8 @@ impl SettingField {
             SettingField::EarlyStop => "Stop probing a target before its full probe budget once it is clearly dead (consecutive dropped probes) or clearly worse than the current top candidates. Saves wall-clock time on dead/timeout IPs.",
             SettingField::EarlyStopLossStreak => "Number of consecutive dropped probes (timeouts / connect failures) after which a target is declared dead and stopped. Only applies once enough probes have completed.",
             SettingField::EarlyStopMinSamples => "Minimum number of measured probes before any early-stop rule may fire, so a single first-timeout does not abort an otherwise-good target.",
-            SettingField::EarlyStopPrune => "Once at least 'Top results' READY candidates exist, stop probing targets whose current best score cannot beat that set by the prune margin.",
-            SettingField::EarlyStopPruneMargin => "How much better (as a fraction) a target's score must be versus the worst current top-N candidate to keep probing it under the prune rule.",
+            SettingField::EarlyStopPrune => "Once at least 'Top results' READY candidates exist, stop probing targets whose current score remains worse than the current top-N boundary after applying the margin tolerance.",
+            SettingField::EarlyStopPruneMargin => "How much worse (as a fraction) a target may be than the worst current top-N candidate before the prune rule stops probing it.",
             SettingField::TwoPhase => "Run a sparse discovery pass first, then spend the rest of the probe budget focusing on the CIDRs that produced the best Cloudflare colos. Finds good edges faster and densifies there.",
             SettingField::DiscoverFraction => "Fraction of sample_per_cidr used for the discovery pass when two-phase scanning is enabled; the remainder is spent on the focused CIDRs.",
             SettingField::AdaptiveProbing => "Allocate probes adaptively using confidence intervals instead of probing every target equally.",
@@ -1105,11 +1105,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
             .value_string(&app.config)
             .parse::<f64>()
             .unwrap_or(1.0);
-        let (min, max) = match current_field {
-            SettingField::StabilityWeight | SettingField::LossWeight => (0.0, 10.0),
-            SettingField::EarlyStopPruneMargin | SettingField::DiscoverFraction => (0.0, 1.0),
-            _ => (1.0, (current_field.max_value().min(1_000_000)) as f64),
-        };
+        let (min, max) = numeric_slider_bounds(current_field);
         let state = SliderState::new(value.clamp(min, max), min, max);
         let slider = Slider::from_state(&state)
             .show_value(true)
@@ -1146,6 +1142,16 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     }
 }
 
+fn numeric_slider_bounds(field: SettingField) -> (f64, f64) {
+    match field {
+        SettingField::StabilityWeight | SettingField::LossWeight => (0.0, 10.0),
+        SettingField::EarlyStopPruneMargin
+        | SettingField::DiscoverFraction
+        | SettingField::Confidence => (0.0, 1.0),
+        _ => (1.0, (field.max_value().min(1_000_000)) as f64),
+    }
+}
+
 fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
     let selected: Vec<String> = app
         .cidr_candidates
@@ -1164,8 +1170,8 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
     let total_probes = total_ips.saturating_mul(app.config.probes);
 
     // Ideal scan duration estimate
-    let ideal_seconds = (total_probes as f64 / app.config.concurrency as f64)
-        * (app.config.timeout_ms as f64 / 2000.0);
+    let ideal_seconds =
+        ideal_scan_seconds(total_probes, app.config.concurrency, app.config.timeout_ms);
     let est_duration_str = if ideal_seconds < 60.0 {
         format!("{:.1}s", ideal_seconds)
     } else {
@@ -1294,6 +1300,10 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
     let block_right = widgets::panel_block("Scope & Workload", false);
     let para_right = Paragraph::new(summary_right).block(block_right);
     frame.render_widget(para_right, main_layout[1]);
+}
+
+fn ideal_scan_seconds(total_probes: usize, concurrency: usize, timeout_ms: u64) -> f64 {
+    (total_probes as f64 / concurrency.max(1) as f64) * (timeout_ms as f64 / 2000.0)
 }
 
 fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -1785,7 +1795,10 @@ fn next_char_boundary(s: &str, index: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_settings_key, next_char_boundary, previous_char_boundary, SettingField};
+    use super::{
+        handle_settings_key, ideal_scan_seconds, next_char_boundary, numeric_slider_bounds,
+        previous_char_boundary, SettingField,
+    };
     use crate::config::AppConfig;
     use crate::tui::App;
     use std::sync::{atomic::AtomicBool, Arc};
@@ -1840,6 +1853,16 @@ mod tests {
         assert_eq!(config.min_probes, 4);
         assert_eq!(config.max_probes, 20);
         assert_eq!(config.confidence, 0.99);
+    }
+
+    #[test]
+    fn confidence_slider_uses_fractional_bounds() {
+        assert_eq!(numeric_slider_bounds(SettingField::Confidence), (0.0, 1.0));
+    }
+
+    #[test]
+    fn zero_concurrency_uses_one_worker_for_eta() {
+        assert_eq!(ideal_scan_seconds(100, 0, 2_000), 100.0);
     }
 
     #[test]

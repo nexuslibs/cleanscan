@@ -88,11 +88,12 @@ pub struct AppConfig {
     #[serde(default = "default_early_stop_success_floor")]
     pub early_stop_success_floor: f64,
     /// Once at least `top` READY candidates exist, stop probing targets whose
-    /// current best score cannot beat the worst of that set by the margin.
+    /// current best score remains worse than the worst candidate after the
+    /// configured margin tolerance is applied.
     #[serde(default = "default_early_stop_prune")]
     pub early_stop_prune: bool,
-    /// How much better (as a fraction) a target's score must be versus the
-    /// current worst top-N candidate to keep probing it under the prune rule.
+    /// How much worse (as a fraction) a target may be than the current worst
+    /// top-N candidate before it is pruned.
     #[serde(default = "default_early_stop_prune_margin")]
     pub early_stop_prune_margin: f64,
     /// Run a sparse discovery pass first, then focus the remaining probe budget

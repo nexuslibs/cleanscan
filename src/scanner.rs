@@ -198,6 +198,7 @@ fn percentile(sorted: &[f64], pct: f64) -> f64 {
 /// full `ProbeResult`.
 fn score_from_samples(
     samples: &[f64],
+    cold_ms: Option<f64>,
     ok: usize,
     completed: usize,
     loss: usize,
@@ -207,7 +208,20 @@ fn score_from_samples(
     if ok == 0 {
         return 0.0;
     }
-    let mut sorted = samples.to_vec();
+    let fallback = if samples.is_empty() {
+        cold_ms.map(|seconds| vec![seconds]).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let scoring_samples = if samples.is_empty() {
+        fallback.as_slice()
+    } else {
+        samples
+    };
+    if scoring_samples.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = scoring_samples.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let p50 = percentile(&sorted, 0.50);
     let p95 = percentile(&sorted, 0.95);
@@ -255,6 +269,7 @@ fn bootstrap_score_interval(state: &TargetState, confidence: f64) -> (f64, f64) 
             .collect();
         scores.push(score_from_samples(
             &sample,
+            None,
             state.ok,
             state.completed,
             state.loss,
@@ -758,6 +773,7 @@ impl TargetState {
     fn current_score(&self) -> f64 {
         score_from_samples(
             &self.samples,
+            self.cold_ms,
             self.ok,
             self.completed,
             self.loss,
@@ -826,6 +842,7 @@ impl TargetState {
         let packet_loss = self.loss as f64 / total as f64;
         let point_score = score_from_samples(
             &self.samples,
+            self.cold_ms,
             self.ok,
             self.completed,
             self.loss,
@@ -1025,7 +1042,8 @@ fn adaptive_should_stop(index: usize, states: &mut [TargetState], cfg: &AppConfi
 ///  * loss streak: `early_stop_loss_streak` consecutive dropped probes;
 ///  * low success: success rate below `early_stop_success_floor`;
 ///  * prune: at least `top` READY candidates exist and this target's current
-///    best score cannot beat the worst of them by `early_stop_prune_margin`.
+///    best score remains worse than the worst of them after applying the
+///    configured margin tolerance.
 ///
 /// `best` is the running leaderboard of `(score, p95)` for completed targets,
 /// capped at `top` entries (see `record_best`).
@@ -1058,6 +1076,8 @@ fn should_stop_early(
     {
         let current = state.prune_score(adaptive);
         let worst_top = best[best.len() - 1].0;
+        // The margin is slack: tolerate a target being somewhat worse before
+        // pruning it. This is equivalent to current * (1 + margin) < worst.
         if current < worst_top / (1.0 + cfg.early_stop_prune_margin) {
             return true;
         }
@@ -2169,12 +2189,35 @@ mod tests {
 
     #[test]
     fn score_limits_the_influence_of_a_single_extreme_tail() {
-        let ordinary = score_from_samples(&[0.10; 20], 20, 20, 0, 1.0, 0.0);
+        let ordinary = score_from_samples(&[0.10; 20], None, 20, 20, 0, 1.0, 0.0);
         let mut samples = vec![0.10; 19];
         samples.push(10.0);
-        let extreme = score_from_samples(&samples, 20, 20, 0, 1.0, 0.0);
+        let extreme = score_from_samples(&samples, None, 20, 20, 0, 1.0, 0.0);
 
         assert!(extreme > ordinary / 3.0);
+    }
+
+    #[test]
+    fn cold_fallback_prevents_empty_sample_score_inflation() {
+        let fallback = score_from_samples(&[], Some(0.10), 1, 1, 0, 1.0, 0.0);
+        let ordinary = score_from_samples(&[0.10], None, 1, 1, 0, 1.0, 0.0);
+
+        assert_eq!(fallback, ordinary);
+        assert!(fallback < 100.0);
+    }
+
+    #[test]
+    fn cold_fallback_is_used_for_result_score_but_not_latency_samples() {
+        let mut state = state("192.0.2.8", 1, 1, &[], 0);
+        state.ok = 1;
+        state.cold_ms = Some(0.10);
+
+        let result = state.result();
+
+        assert_eq!(result.samples, Vec::<f64>::new());
+        assert_eq!(result.avg, 0.0);
+        assert_eq!(result.p95, 0.0);
+        assert!(result.score < 100.0);
     }
 
     fn early_stop_config() -> AppConfig {
@@ -2266,6 +2309,23 @@ mod tests {
         let mut worse = state("192.0.2.9", 4, 4, &[0.9, 0.9, 0.9, 0.9], 0);
         // 0.9s latency => far below the leaderboard's score; should be pruned.
         assert!(should_stop_early(&mut worse, &cfg, &best, false));
+    }
+
+    #[test]
+    fn early_stop_prune_margin_is_tolerance_slack() {
+        let cfg = early_stop_config();
+        let best: Vec<(f64, f64)> = vec![(10.0, 0.05); cfg.top];
+
+        let mut within_tolerance = state("192.0.2.10", 3, 3, &[0.117647; 3], 0);
+        assert!(!should_stop_early(
+            &mut within_tolerance,
+            &cfg,
+            &best,
+            false
+        ));
+
+        let mut beyond_tolerance = state("192.0.2.11", 3, 3, &[0.125; 3], 0);
+        assert!(should_stop_early(&mut beyond_tolerance, &cfg, &best, false));
     }
 
     #[test]

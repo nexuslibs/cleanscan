@@ -148,7 +148,7 @@ pub struct Args {
     #[arg(long)]
     pub no_early_stop_prune: bool,
 
-    /// Score margin a target must beat the worst top-N candidate by to keep probing.
+    /// Tolerance for a target being worse than the worst top-N candidate before pruning.
     #[arg(long)]
     pub early_stop_prune_margin: Option<f64>,
 

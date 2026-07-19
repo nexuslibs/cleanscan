@@ -242,6 +242,14 @@ fn render_options_panel(app: &mut App, frame: &mut Frame, area: Rect) {
             Span::styled("Repetitions  : ", theme::title_style()),
             Span::raw(app.config.speed_repetitions.to_string()),
         ]),
+        Line::from(vec![
+            Span::styled("Concurrency  : ", theme::title_style()),
+            Span::raw(format!(
+                "{} (effective: {})",
+                app.config.concurrency,
+                app.config.concurrency.clamp(1, 4)
+            )),
+        ]),
         Line::from(""),
         Line::from(Span::styled(
             format!("GET  {}", app.config.download_path),
