@@ -103,6 +103,10 @@ pub struct AppConfig {
     /// `two_phase` is enabled (the remainder is spent focusing on good colos).
     #[serde(default = "default_discover_fraction")]
     pub discover_fraction: f64,
+    /// Maximum number of CIDRs selected for the two-phase focus pass. Zero
+    /// means all eligible CIDRs; this is independent of the display limit.
+    #[serde(default)]
+    pub two_phase_focus_cidrs: usize,
     #[serde(default)]
     pub adaptive_probing: bool,
     #[serde(default = "default_min_probes")]
@@ -225,6 +229,7 @@ impl Default for AppConfig {
             early_stop_prune_margin: default_early_stop_prune_margin(),
             two_phase: default_two_phase(),
             discover_fraction: default_discover_fraction(),
+            two_phase_focus_cidrs: 0,
             adaptive_probing: false,
             min_probes: default_min_probes(),
             max_probes: default_max_probes(),

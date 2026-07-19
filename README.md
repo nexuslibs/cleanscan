@@ -304,10 +304,19 @@ reliability with latency, jitter, and packet loss, so a slightly slower but
 steadier, loss-free IP outranks a fast-but-jittery or lossy one.
 
 With multiple checks, each path is probed against the same IP, but each check
-currently uses its own HTTP client and warmup request. Required checks gate
-manifest eligibility, while the aggregate score is the weighted mean of the
-check scores. Each check therefore has independent connection-establishment
-cost; its result summary reports the check's steady-state measurements.
+uses its own HTTP client and warmup request. Required checks gate manifest
+eligibility, and the displayed reliability and latency summary is the worst
+required check, so thresholds cannot hide a slow or unreliable required path.
+The aggregate score remains the weighted mean of all check scores, while the
+serialized `checks` entries retain each check's full statistics.
+
+When two-phase sampling is enabled, `two_phase_focus_cidrs` controls the
+maximum number of eligible CIDRs used for the focus pass. Its default value of
+`0` means all eligible CIDRs; it is independent of `top`, which only limits
+displayed results. A discarded cold-probe success contributes to reliability
+but never to steady-state latency statistics. Recommendation latency uses p95
+with a capped max-tail contribution, preventing one extreme outlier from
+dominating the ranking.
 
 Watch mode freezes its exact sampled target list on the first cycle and reuses
 it after restart when the source and health profile are unchanged. Use
