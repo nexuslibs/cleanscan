@@ -203,6 +203,9 @@ fn main() -> Result<()> {
         config.two_phase = true;
     }
     if let Some(fraction) = args.discover_fraction {
+        if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
+            anyhow::bail!("--discover-fraction must be a finite value between 0.0 and 1.0");
+        }
         config.discover_fraction = fraction;
     }
 
@@ -287,17 +290,21 @@ fn cli_mode(
     colo: Option<String>,
     country: Option<String>,
 ) -> Result<()> {
+    let has_explicit_targets = ips.is_some() || targets_file.is_some();
     let targets = if let Some(path) = targets_file {
         scanner::load_ip_manifest(&path)?
     } else {
         scanner::collect_targets_with_optional_seed(&config, &cidr, &ips, seed)?
     };
     let total = targets.len();
+    let use_two_phase = config.two_phase && !has_explicit_targets;
 
-    eprintln!(
-        "Testing {} targets × {} probes, concurrency={}",
-        total, config.probes, config.concurrency
-    );
+    if !use_two_phase {
+        eprintln!(
+            "Testing {} targets × {} probes, concurrency={}",
+            total, config.probes, config.concurrency
+        );
+    }
 
     let (tx, rx) = std::sync::mpsc::channel();
     let config_arc = Arc::new(config.clone());
@@ -309,7 +316,7 @@ fn cli_mode(
     };
 
     let rt = tokio::runtime::Runtime::new()?;
-    if config.two_phase {
+    if use_two_phase {
         rt.block_on(scanner::run_scan_two_phase(
             selected_cidrs,
             config_arc,
@@ -317,7 +324,7 @@ fn cli_mode(
             tx,
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
-        ));
+        ))?;
     } else {
         rt.block_on(scanner::run_scan(
             targets,
@@ -461,6 +468,7 @@ mod tests {
             colo: Some("ABJ".to_string()),
             country: Some("Côte d'Ivoire".to_string()),
             cold_ms: None,
+            stopped_early: false,
         }];
         let mut filtered = results.clone();
         filtered.retain(|r| {

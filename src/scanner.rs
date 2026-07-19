@@ -77,6 +77,9 @@ pub struct ProbeResult {
     /// TLS connection, captured separately from steady-state latency. `None`
     /// when the warmup/first request failed or warmup is disabled.
     pub cold_ms: Option<f64>,
+    /// Whether this target was emitted before exhausting its configured probe
+    /// budget because an early-stop rule determined it could be abandoned.
+    pub stopped_early: bool,
 }
 
 pub fn result_status(result: &ProbeResult) -> &'static str {
@@ -313,6 +316,7 @@ fn client_for_ip(host: &str, ip: &str, args: &AppConfig) -> Result<Client> {
 
     let client = reqwest::Client::builder()
         .http2_adaptive_window(true)
+        .no_proxy()
         .resolve_to_addrs(host, &[socket])
         .connect_timeout(Duration::from_millis(args.connect_timeout_ms))
         .timeout(Duration::from_millis(args.timeout_ms))
@@ -539,6 +543,7 @@ impl TargetState {
                 .as_ref()
                 .and_then(|code| crate::colo::lookup_country(code).map(str::to_string)),
             cold_ms: self.cold_ms.map(|seconds| seconds * 1000.0),
+            stopped_early: self.stopped_early,
         }
     }
 }
@@ -875,7 +880,6 @@ pub async fn run_scan(
                             // leaderboard; stop probing it and emit a partial
                             // result now rather than spending the full budget.
                             state.stopped_early = true;
-                            state.completed = probe_count;
                             let result = state.result();
                             record_best(&mut best, &result, args.top);
                             let _ = tx.send(result);
@@ -959,7 +963,7 @@ pub async fn run_scan_two_phase(
     tx: std::sync::mpsc::Sender<ProbeResult>,
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
-) {
+) -> Result<()> {
     if !config.two_phase || selected_cidrs.is_empty() {
         let targets = collect_from_cidrs_with_seed(
             &selected_cidrs,
@@ -969,10 +973,9 @@ pub async fn run_scan_two_phase(
             } else {
                 config.seed
             },
-        )
-        .expect("selected CIDRs must be valid for single-phase scan");
+        )?;
         run_scan(targets, config, tx, cancel, paused).await;
-        return;
+        return Ok(());
     }
 
     let discover_per = (config.sample_per_cidr as f64 * config.discover_fraction)
@@ -987,8 +990,7 @@ pub async fn run_scan_two_phase(
 
     // Discovery pass.
     let (p1_tx, p1_rx) = std::sync::mpsc::channel();
-    let targets1 = collect_from_cidrs_with_seed(&selected_cidrs, discover_per, base_seed)
-        .expect("selected CIDRs must be valid for discovery pass");
+    let targets1 = collect_from_cidrs_with_seed(&selected_cidrs, discover_per, base_seed)?;
     run_scan(
         targets1,
         config.clone(),
@@ -1002,7 +1004,7 @@ pub async fn run_scan_two_phase(
         let _ = tx.send(result.clone());
     }
     if cancel.load(Ordering::Relaxed) {
-        return;
+        return Ok(());
     }
 
     let focus = select_focus_cidrs(&phase1, &selected_cidrs, prefer_colo.as_deref(), config.top);
@@ -1035,6 +1037,7 @@ pub async fn run_scan_two_phase(
     if !targets2.is_empty() {
         run_scan(targets2.into_iter().collect(), config, tx, cancel, paused).await;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1467,6 +1470,27 @@ mod tests {
     }
 
     #[test]
+    fn early_stopped_result_uses_actual_measurements_and_serializes_marker() {
+        let mut s = state("192.0.2.1", 3, 3, &[0.1], 2);
+        s.loss = 2;
+        s.loss_streak = 2;
+        s.failures = vec!["request timeout".to_string(); 2];
+        s.stopped_early = true;
+
+        let result = s.result();
+        assert_eq!(result.completed, 3);
+        assert_eq!(result.ok, 1);
+        assert_eq!(result.fail, 2);
+        assert!((result.success_rate - (1.0 / 3.0)).abs() < f64::EPSILON);
+        assert!((result.packet_loss - (2.0 / 3.0)).abs() < f64::EPSILON);
+        assert!(result.stopped_early);
+        assert!(!s.has_remaining_probe(8));
+
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["stopped_early"], true);
+    }
+
+    #[test]
     fn record_best_keeps_top_scores_sorted() {
         let mut best: Vec<(f64, f64)> = Vec::new();
         let make = |score: f64| ProbeResult {
@@ -1491,6 +1515,7 @@ mod tests {
             colo: None,
             country: None,
             cold_ms: None,
+            stopped_early: false,
         };
         for s in [1.0, 5.0, 3.0, 9.0, 2.0] {
             record_best(&mut best, &make(s), 3);
@@ -1524,6 +1549,7 @@ mod tests {
             colo: colo.map(|c| c.to_string()),
             country: None,
             cold_ms: None,
+            stopped_early: false,
         }
     }
 

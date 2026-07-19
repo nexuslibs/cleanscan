@@ -290,7 +290,6 @@ impl SettingField {
             SettingField::Top => args.top = value as usize,
             SettingField::EarlyStopLossStreak => args.early_stop_loss_streak = value as usize,
             SettingField::EarlyStopMinSamples => args.early_stop_min_samples = value as usize,
-            SettingField::DiscoverFraction => args.discover_fraction = value as f64 / 100.0,
             SettingField::SpeedPayloadMb => args.speed_payload_bytes = value as u64 * 1024 * 1024,
             SettingField::SpeedRepetitions => args.speed_repetitions = value as usize,
             SettingField::SpeedTimeoutMs => args.speed_timeout_ms = value as u64,
@@ -302,6 +301,7 @@ impl SettingField {
             | SettingField::EarlyStopPrune
             | SettingField::EarlyStopPruneMargin
             | SettingField::TwoPhase
+            | SettingField::DiscoverFraction
             | SettingField::StabilityWeight
             | SettingField::LossWeight => {}
         }

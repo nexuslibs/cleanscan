@@ -1150,7 +1150,8 @@ pub fn run_tui(
                     scanner_tx,
                     scanner_cancel,
                     scanner_paused,
-                ));
+                ))
+                .map_err(|e| e.to_string())?;
             } else {
                 rt.block_on(crate::scanner::run_scan(
                     targets,
@@ -1201,7 +1202,9 @@ pub fn run_tui(
             )?;
             let total = targets.len();
             app.set_scan_targets(targets.clone());
-            let two_phase_cidrs: Vec<String> = if !cli_cidr.is_empty() {
+            let two_phase_cidrs: Vec<String> = if cli_ips.is_some() {
+                Vec::new()
+            } else if !cli_cidr.is_empty() {
                 cli_cidr.clone()
             } else {
                 config_arc.selected_cidrs.clone()
@@ -1247,36 +1250,7 @@ pub fn run_tui(
         match targets {
             Ok(targets) => {
                 let total = targets.len();
-                let scan_config = Arc::new(AppConfig {
-                    host: app.config.host.clone(),
-                    path: app.config.path.clone(),
-                    custom_cidrs: app.config.custom_cidrs.clone(),
-                    selected_cidrs: app.config.selected_cidrs.clone(),
-                    selected_cidrs_persisted: app.config.selected_cidrs_persisted,
-                    sample_per_cidr: app.config.sample_per_cidr,
-                    probes: app.config.probes,
-                    concurrency: app.config.concurrency,
-                    timeout_ms: app.config.timeout_ms,
-                    connect_timeout_ms: app.config.connect_timeout_ms,
-                    top: app.config.top,
-                    seed: app.config.seed,
-                    download_path: app.config.download_path.clone(),
-                    upload_path: app.config.upload_path.clone(),
-                    speed_payload_bytes: app.config.speed_payload_bytes,
-                    speed_repetitions: app.config.speed_repetitions,
-                    speed_timeout_ms: app.config.speed_timeout_ms,
-                    warmup: app.config.warmup,
-                    stability_weight: app.config.stability_weight,
-                    loss_weight: app.config.loss_weight,
-                    early_stop: app.config.early_stop,
-                    early_stop_loss_streak: app.config.early_stop_loss_streak,
-                    early_stop_min_samples: app.config.early_stop_min_samples,
-                    early_stop_success_floor: app.config.early_stop_success_floor,
-                    early_stop_prune: app.config.early_stop_prune,
-                    early_stop_prune_margin: app.config.early_stop_prune_margin,
-                    two_phase: app.config.two_phase,
-                    discover_fraction: app.config.discover_fraction,
-                });
+                let scan_config = Arc::new(app.config.clone());
                 app.set_scan_targets(targets.clone());
                 *scanner = Some(spawn_scanner(targets, cidrs.clone(), scan_config));
                 app.begin_scan(total);
@@ -2570,6 +2544,7 @@ mod tests {
             colo: None,
             country: None,
             cold_ms: None,
+            stopped_early: false,
         }
     }
 

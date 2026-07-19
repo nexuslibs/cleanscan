@@ -349,6 +349,14 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect, elapsed: 
                     result.packet_loss * 100.0
                 )),
                 Line::from(format!(
+                    "Scan        : {}",
+                    if result.stopped_early {
+                        "stopped early"
+                    } else {
+                        "full probe budget"
+                    }
+                )),
+                Line::from(format!(
                     "Cold        : {}",
                     result
                         .cold_ms
