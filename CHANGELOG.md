@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.12.0](https://github.com/nexuslibs/cleanscan/compare/v0.11.0...v0.12.0) (2026-07-19)
+
+
+### Features
+
+* add manifest backups configuration to App and TUI ([886fb85](https://github.com/nexuslibs/cleanscan/commit/886fb859079a4f8761abe7c5ebb7085cc4d1376b))
+* enhance manifest validation and alerting features in TUI ([e4a9c2c](https://github.com/nexuslibs/cleanscan/commit/e4a9c2caed12de9717b9c59c356040ccab4457ea))
+* enhance validation by trimming whitespace in header checks and expected values ([34d166f](https://github.com/nexuslibs/cleanscan/commit/34d166fa0849e6416a2685441967d6207a507d1c))
+* enhance validation features in AppConfig and CLI ([a33bd84](https://github.com/nexuslibs/cleanscan/commit/a33bd84301e66e0977daca9fd508ce4b835569ca))
+* enhance validation features in AppConfig and CLI ([cd7ac05](https://github.com/nexuslibs/cleanscan/commit/cd7ac0505b0b5d739ec7701b07866446ab10200b))
+* validate HTTP status range in expected statuses and add unit tests ([b8c7c63](https://github.com/nexuslibs/cleanscan/commit/b8c7c63db4d5ff1b20ec9a743d99fd4069eb58fc))
+
 ## [0.11.0](https://github.com/nexuslibs/cleanscan/compare/v0.10.0...v0.11.0) (2026-07-19)
 
 
