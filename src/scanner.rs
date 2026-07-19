@@ -1396,11 +1396,7 @@ pub async fn run_profile_scan(
         merged.colo = summary.colo.clone();
         merged.country = summary.country.clone();
         merged.cold_ms = summary.cold_ms;
-        merged.success_rate = entries
-            .iter()
-            .filter(|(check, _)| check.required)
-            .map(|(_, result)| result.success_rate)
-            .fold(1.0, f64::min);
+        merged.success_rate = summary.success_rate;
         merged.min_score = summary.min_score;
         merged.max_score = summary.max_score;
         merged.success_rate_lower = summary.success_rate_lower;
