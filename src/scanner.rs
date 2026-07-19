@@ -15,7 +15,18 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use reqwest::Client;
 use tokio::sync::Semaphore;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, HealthCheck};
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CheckResult {
+    pub name: String,
+    pub path: String,
+    pub required: bool,
+    pub weight: f64,
+    pub score: f64,
+    pub healthy: bool,
+    pub result: Box<ProbeResult>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -123,6 +134,28 @@ pub struct ProbeResult {
     pub success_rate_upper: f64,
     pub score_confidence: f64,
     pub decision: String,
+    #[serde(default)]
+    pub checks: Vec<CheckResult>,
+    #[serde(default = "default_health_ok")]
+    pub health_ok: bool,
+}
+
+#[allow(dead_code)]
+fn default_health_ok() -> bool {
+    true
+}
+
+pub fn effective_health_checks(config: &AppConfig) -> Vec<HealthCheck> {
+    if config.health_checks.is_empty() {
+        vec![HealthCheck {
+            name: "primary".to_string(),
+            path: config.path.clone(),
+            required: true,
+            weight: 1.0,
+        }]
+    } else {
+        config.health_checks.clone()
+    }
 }
 
 pub fn result_status(result: &ProbeResult) -> &'static str {
@@ -784,6 +817,8 @@ impl TargetState {
                 "competitive"
             }
             .to_string(),
+            checks: Vec::new(),
+            health_ok: ok > 0,
         }
     }
 }
@@ -1220,6 +1255,89 @@ pub async fn run_scan(
                 }
             }
         }
+    }
+}
+
+/// Run every configured health check and merge the per-path results into one
+/// target result. Checks share the same target set and validation policy; the
+/// first check remains the compatibility/primary result.
+pub async fn run_profile_scan(
+    targets: Vec<String>,
+    args: Arc<AppConfig>,
+    tx: std::sync::mpsc::Sender<ProbeResult>,
+    cancel: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+) {
+    let checks = effective_health_checks(&args);
+    if checks.len() <= 1 {
+        run_scan(targets, args, tx, cancel, paused).await;
+        return;
+    }
+
+    let mut by_ip: BTreeMap<String, Vec<(HealthCheck, ProbeResult)>> = BTreeMap::new();
+    for check in checks {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let mut check_args = (*args).clone();
+        check_args.path = check.path.clone();
+        check_args.health_checks.clear();
+        let (check_tx, check_rx) = std::sync::mpsc::channel();
+        run_scan(
+            targets.clone(),
+            Arc::new(check_args),
+            check_tx,
+            cancel.clone(),
+            paused.clone(),
+        )
+        .await;
+        for result in check_rx {
+            by_ip
+                .entry(result.ip.clone())
+                .or_default()
+                .push((check.clone(), result));
+        }
+    }
+
+    for (_, entries) in by_ip {
+        let Some((_, mut merged)) = entries.first().cloned() else {
+            continue;
+        };
+        let total_weight: f64 = entries.iter().map(|(check, _)| check.weight.max(0.0)).sum();
+        let weighted_score = entries
+            .iter()
+            .map(|(check, result)| check.weight.max(0.0) * result.score)
+            .sum::<f64>();
+        let required_ok = entries
+            .iter()
+            .filter(|(check, _)| check.required)
+            .all(|(_, result)| result.ok > 0);
+        merged.score = if total_weight > 0.0 {
+            weighted_score / total_weight
+        } else {
+            0.0
+        };
+        merged.health_ok = required_ok;
+        merged.checks = entries
+            .iter()
+            .map(|(check, result)| CheckResult {
+                name: check.name.clone(),
+                path: check.path.clone(),
+                required: check.required,
+                weight: check.weight,
+                score: result.score,
+                healthy: result.ok > 0,
+                result: Box::new(result.clone()),
+            })
+            .collect();
+        merged.decision = if !required_ok {
+            "required_check_failed".to_string()
+        } else if merged.ok == 0 {
+            "discarded".to_string()
+        } else {
+            "competitive".to_string()
+        };
+        let _ = tx.send(merged);
     }
 }
 
@@ -1934,6 +2052,8 @@ mod tests {
             success_rate_upper: 1.0,
             score_confidence: 0.95,
             decision: "competitive".to_string(),
+            checks: Vec::new(),
+            health_ok: true,
         };
         for s in [1.0, 5.0, 3.0, 9.0, 2.0] {
             record_best(&mut best, &make(s), 3);
@@ -1975,6 +2095,8 @@ mod tests {
             success_rate_upper: 1.0,
             score_confidence: 0.95,
             decision: "competitive".to_string(),
+            checks: Vec::new(),
+            health_ok: true,
         }
     }
 

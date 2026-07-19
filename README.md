@@ -90,6 +90,12 @@ cleanscan --ips ips.txt
 
 # Pipe-friendly tab-separated output
 cleanscan --cli --cidr 188.114.96.0/20 --top 20
+
+# Probe several required application paths.
+cleanscan --cli --host example.com \
+  --check edge=/cdn-cgi/trace \
+  --check app=/healthz \
+  --cidr 188.114.96.0/20
 ```
 
 ### TUI controls
@@ -201,6 +207,7 @@ latency dashboard.
 | `--cli`                | off              | Use tab-separated CLI output instead of the TUI  |
 | `--host`               | required         | Hostname for HTTPS / SNI / Host header (no built-in default) |
 | `--path`               | `/cdn-cgi/trace` | Path to probe                                    |
+| `--check NAME=PATH`    | —                | Additional required health check; repeatable     |
 | `--expect-status`      | any 2xx          | Expected HTTP status code (repeatable)           |
 | `--require-body`       | —                | Required literal response-body marker (repeatable) |
 | `--require-header`     | —                | Required exact response header as `name=value` (repeatable) |
@@ -232,6 +239,12 @@ latency dashboard.
 | `--alert-p95-increase-ms` | —              | Watch alert threshold for recommended p95 regression |
 | `--alert-packet-loss-increase` | —        | Watch alert threshold for recommended packet-loss regression |
 | `--fail-on-alert`       | off              | Exit watch mode when an alert is emitted         |
+| `--watch-promote-after` | `2`             | Healthy cycles required before promotion         |
+| `--watch-demote-after` | `2`              | Unhealthy cycles required before demotion        |
+| `--watch-switch-margin` | `0.10`           | Minimum relative score improvement before switch |
+| `--watch-cooldown-cycles` | `2`            | Minimum cycles between recommendation changes    |
+| `--watch-state`         | config directory | Restart-safe watch state path                    |
+| `--watch-new-sample`    | off              | Discard persisted watch targets and resample     |
 
 ## Output
 
@@ -289,6 +302,15 @@ in the details view and machine-readable output. The recommendation `score`
 (and therefore the TUI's default order and the CLI's top results) blends
 reliability with latency, jitter, and packet loss, so a slightly slower but
 steadier, loss-free IP outranks a fast-but-jittery or lossy one.
+
+With multiple checks, each path is probed against the same IP and connection
+pool. Required checks gate manifest eligibility, while the aggregate score is
+the weighted mean of the check scores. Warmup is performed once per target and
+`cold_ms` remains the target-level connection-establishment measurement.
+
+Watch mode freezes its exact sampled target list on the first cycle and reuses
+it after restart when the source and health profile are unchanged. Use
+`--watch-new-sample` to intentionally replace it.
 
 Speed tests use the same direct-IP connection behavior. The default endpoints
 are `/speed-test/100mb.bin` for downloads and `/speed-test/upload` for uploads;

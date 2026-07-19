@@ -3,13 +3,14 @@ mod config;
 mod scanner;
 mod speed;
 mod tui;
+mod watch;
 
 use clap::Parser;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use anyhow::Result;
-use config::AppConfig;
+use config::{AppConfig, HealthCheck};
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Cloudflare IP scanner / latency prober")]
@@ -25,6 +26,10 @@ pub struct Args {
     /// Path to test
     #[arg(long)]
     pub path: Option<String>,
+
+    /// Additional health check in NAME=PATH form. Global validation flags apply.
+    #[arg(long = "check")]
+    pub checks: Vec<String>,
 
     /// Expected HTTP status code. Repeat to allow multiple statuses; empty means any 2xx.
     #[arg(long = "expect-status")]
@@ -199,6 +204,30 @@ pub struct Args {
     /// Exit watch mode when an alert is emitted.
     #[arg(long)]
     pub fail_on_alert: bool,
+
+    /// Require this many consecutive healthy cycles before promotion.
+    #[arg(long, default_value_t = 2)]
+    pub watch_promote_after: u32,
+
+    /// Require this many consecutive unhealthy cycles before demotion.
+    #[arg(long, default_value_t = 2)]
+    pub watch_demote_after: u32,
+
+    /// Minimum score improvement required before switching a healthy primary.
+    #[arg(long, default_value_t = 0.10)]
+    pub watch_switch_margin: f64,
+
+    /// Minimum cycles between recommendation changes.
+    #[arg(long, default_value_t = 2)]
+    pub watch_cooldown_cycles: u64,
+
+    /// Persisted watch state path. Defaults to the cleanscan config directory.
+    #[arg(long)]
+    pub watch_state: Option<String>,
+
+    /// Discard persisted watch targets and start a fresh random sample.
+    #[arg(long)]
+    pub watch_new_sample: bool,
 }
 
 fn main() -> Result<()> {
@@ -208,8 +237,21 @@ fn main() -> Result<()> {
     if let Some(host) = args.host {
         config.host = host;
     }
+    let explicit_path = args.path.is_some();
     if let Some(path) = args.path {
         config.path = path;
+    }
+    if !args.checks.is_empty() {
+        if explicit_path {
+            anyhow::bail!(
+                "--check cannot be combined with --path; put the primary path in --check"
+            );
+        }
+        config.health_checks = args
+            .checks
+            .iter()
+            .map(|value| parse_health_check(value))
+            .collect::<Result<Vec<_>>>()?;
     }
     if !args.expected_statuses.is_empty() {
         config.expected_statuses = args.expected_statuses.clone();
@@ -296,6 +338,21 @@ fn main() -> Result<()> {
     if !config.stability_weight.is_finite() || config.stability_weight < 0.0 {
         anyhow::bail!("--stability-weight must be a finite, non-negative value");
     }
+    let mut check_names = std::collections::BTreeSet::new();
+    for check in &config.health_checks {
+        if check.name.trim().is_empty()
+            || check.path.trim().is_empty()
+            || !check.path.starts_with('/')
+        {
+            anyhow::bail!("health checks require a non-empty name and absolute path");
+        }
+        if !check_names.insert(check.name.to_ascii_lowercase()) {
+            anyhow::bail!("duplicate health check name: {}", check.name);
+        }
+        if !check.weight.is_finite() || check.weight < 0.0 {
+            anyhow::bail!("health check weights must be finite and non-negative");
+        }
+    }
     if !config.loss_weight.is_finite() || config.loss_weight < 0.0 {
         anyhow::bail!("--loss-weight must be a finite, non-negative value");
     }
@@ -353,6 +410,12 @@ fn main() -> Result<()> {
             anyhow::bail!("--max-p95-ms must be a finite, non-negative value");
         }
     }
+    if !args.watch_switch_margin.is_finite() || args.watch_switch_margin < 0.0 {
+        anyhow::bail!("--watch-switch-margin must be finite and non-negative");
+    }
+    if args.watch_promote_after == 0 || args.watch_demote_after == 0 {
+        anyhow::bail!("watch promotion and demotion thresholds must be non-zero");
+    }
 
     if args.targets_file.is_some() && (args.ips.is_some() || !args.cidr.is_empty()) {
         anyhow::bail!("--targets-file cannot be combined with --ips or --cidr");
@@ -389,6 +452,14 @@ fn main() -> Result<()> {
             args.alert_p95_increase_ms,
             args.alert_packet_loss_increase,
             args.fail_on_alert,
+            watch::WatchPolicy {
+                promote_after: args.watch_promote_after,
+                demote_after: args.watch_demote_after,
+                switch_margin: args.watch_switch_margin,
+                cooldown_cycles: args.watch_cooldown_cycles,
+            },
+            args.watch_state.as_deref(),
+            args.watch_new_sample,
         )
     } else {
         tui::run_tui(
@@ -416,6 +487,23 @@ fn normalize_config(config: &mut AppConfig) {
     if config.probes == 0 {
         config.probes = 1;
     }
+}
+
+fn parse_health_check(value: &str) -> Result<HealthCheck> {
+    let (name, path) = value
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("--check must use NAME=PATH form"))?;
+    let name = name.trim();
+    let path = path.trim();
+    if name.is_empty() || path.is_empty() || !path.starts_with('/') {
+        anyhow::bail!("--check must use a non-empty NAME and an absolute PATH");
+    }
+    Ok(HealthCheck {
+        name: name.to_string(),
+        path: path.to_string(),
+        required: true,
+        weight: 1.0,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -469,6 +557,7 @@ fn healthy_result(
     min_confidence: &str,
 ) -> bool {
     result.ok > 0
+        && result.health_ok
         && thresholds
             .min_success_rate
             .is_none_or(|min| result.success_rate >= min)
@@ -572,14 +661,29 @@ fn cli_mode(
     alert_p95_increase_ms: Option<f64>,
     alert_packet_loss_increase: Option<f64>,
     fail_on_alert: bool,
+    watch_policy: watch::WatchPolicy,
+    watch_state_path: Option<&str>,
+    watch_new_sample: bool,
 ) -> Result<()> {
     let has_explicit_targets = ips.is_some() || targets_file.is_some();
+    let ips_identity = ips.as_deref().and_then(|path| std::fs::read(path).ok());
+    let targets_file_identity = targets_file
+        .as_deref()
+        .and_then(|path| std::fs::read(path).ok());
+    let source_identity = (
+        cidr.clone(),
+        ips_identity,
+        targets_file_identity,
+        config.sample_per_cidr,
+        config.seed,
+        seed,
+    );
+    let source_fingerprint = watch::fingerprint(&source_identity);
     let targets = if let Some(path) = targets_file {
         scanner::load_ip_manifest(&path)?
     } else {
         scanner::collect_targets_with_optional_seed(&config, &cidr, &ips, seed)?
     };
-    let manifest_targets = targets.clone();
     if let Some(interval) = watch {
         return cli_watch(
             config,
@@ -596,8 +700,13 @@ fn cli_mode(
             alert_p95_increase_ms,
             alert_packet_loss_increase,
             fail_on_alert,
+            watch_policy,
+            watch_state_path,
+            watch_new_sample,
+            source_fingerprint,
         );
     }
+    let manifest_targets = targets.clone();
     let total = targets.len();
     let use_two_phase = config.two_phase && !has_explicit_targets;
 
@@ -628,7 +737,7 @@ fn cli_mode(
             Arc::new(AtomicBool::new(false)),
         ))?;
     } else {
-        rt.block_on(scanner::run_scan(
+        rt.block_on(scanner::run_profile_scan(
             targets,
             config_arc,
             tx,
@@ -771,16 +880,55 @@ fn cli_watch(
     alert_p95_increase_ms: Option<f64>,
     alert_packet_loss_increase: Option<f64>,
     fail_on_alert: bool,
+    watch_policy: watch::WatchPolicy,
+    watch_state_path: Option<&str>,
+    watch_new_sample: bool,
+    source_fingerprint: u64,
 ) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
-    let mut cycle = 0u64;
+    let profile_fingerprint = watch::fingerprint(&(
+        config.host.clone(),
+        config.path.clone(),
+        config.expected_statuses.clone(),
+        config.required_body_markers.clone(),
+        config.required_headers.clone(),
+        config.follow_redirects,
+        config.health_checks.clone(),
+    ));
+    let state_path = watch_state_path
+        .map(std::path::PathBuf::from)
+        .or_else(|| watch::default_state_path(&config.host, source_fingerprint))
+        .ok_or_else(|| anyhow::anyhow!("cannot determine watch state path"))?;
+    let mut state = if !watch_new_sample {
+        watch::load(&state_path)
+            .filter(|saved| saved.compatible(source_fingerprint, profile_fingerprint))
+    } else {
+        None
+    };
+    let targets = if let Some(saved) = &state {
+        saved.targets.clone()
+    } else {
+        let fresh =
+            watch::WatchState::new(source_fingerprint, profile_fingerprint, targets.clone());
+        watch::save(&state_path, &fresh)
+            .map_err(|error| anyhow::anyhow!("failed to persist watch targets: {error}"))?;
+        fresh.targets.clone()
+    };
+    let mut cycle = state.as_ref().map_or(0, |saved| saved.cycle);
     let thresholds = HealthThresholds {
         min_success_rate,
         max_p95_ms,
     };
-    let mut previous: Option<scanner::ProbeResult> = None;
     let mut previous_healthy: Option<bool> = None;
     let mut previous_manifest: Option<Manifest> = None;
+    if state.is_none() {
+        state = Some(watch::WatchState::new(
+            source_fingerprint,
+            profile_fingerprint,
+            targets.clone(),
+        ));
+    }
+    let mut watch_state = state.expect("watch state initialized");
     loop {
         cycle += 1;
         println!(
@@ -788,7 +936,7 @@ fn cli_watch(
             serde_json::json!({"event":"cycle_started", "cycle":cycle, "targets":targets.len()})
         );
         let (tx, rx) = std::sync::mpsc::channel();
-        runtime.block_on(scanner::run_scan(
+        runtime.block_on(scanner::run_profile_scan(
             targets.clone(),
             Arc::new(config.clone()),
             tx,
@@ -812,14 +960,45 @@ fn cli_watch(
             });
         }
         results.sort_by(crate::tui::App::natural_cmp);
+        let transition = watch_state.advance(&results, watch_policy, |result| {
+            healthy_result(result, thresholds, &manifest_min_confidence)
+        });
+        let mut manifest_results = results.clone();
+        if let Some(stable) = transition.stable_primary.as_deref() {
+            manifest_results.sort_by(|a, b| {
+                (a.ip != stable)
+                    .cmp(&(b.ip != stable))
+                    .then_with(|| crate::tui::App::natural_cmp(a, b))
+            });
+        }
         let manifest = build_manifest(
             &config,
             targets.clone(),
-            &results,
+            &manifest_results,
             thresholds,
             &manifest_min_confidence,
             manifest_backups,
         );
+        let mut manifest = manifest;
+        if let Some(stable) = transition.stable_primary.as_deref() {
+            manifest.primary = manifest_results.iter().find(|r| r.ip == stable).cloned();
+            manifest.backups = manifest_results
+                .iter()
+                .filter(|r| {
+                    r.ip != stable && healthy_result(r, thresholds, &manifest_min_confidence)
+                })
+                .take(manifest_backups)
+                .cloned()
+                .collect();
+            manifest.failure = manifest
+                .primary
+                .is_none()
+                .then(|| "stable primary is no longer available".to_string());
+        } else {
+            manifest.primary = None;
+            manifest.backups.clear();
+            manifest.failure = Some("no stable target met the watch policy".to_string());
+        }
         if let Some(path) = &manifest_path {
             write_manifest(path, &manifest)?;
             println!(
@@ -828,7 +1007,7 @@ fn cli_watch(
             );
         }
         let healthy = manifest.primary.is_some();
-        let recommendation = manifest.primary.as_ref().map(|r| r.ip.clone());
+        let recommendation = transition.stable_primary.clone();
         if let Some(before) = &previous_manifest {
             let before_ips = std::iter::once(before.primary.as_ref().map(|r| r.ip.clone()))
                 .chain(before.backups.iter().map(|r| Some(r.ip.clone())))
@@ -848,11 +1027,12 @@ fn cli_watch(
             serde_json::json!({"event":"cycle_completed", "cycle":cycle, "healthy":healthy, "recommendation":recommendation, "results":results})
         );
         let mut alerts = Vec::new();
-        if cycle > 1 {
-            let before_ip = previous.as_ref().map(|result| result.ip.clone());
-            if before_ip != recommendation {
-                alerts.push(serde_json::json!({"kind":"recommendation_changed", "from":before_ip, "to":recommendation}));
-            }
+        if cycle > 1 && transition.changed {
+            let before_ip = previous_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.primary.as_ref())
+                .map(|result| result.ip.clone());
+            alerts.push(serde_json::json!({"kind":"recommendation_changed", "from":before_ip, "to":recommendation}));
         }
         if let Some(current) = manifest.primary.as_ref() {
             let baseline = previous_manifest.as_ref().and_then(|manifest| {
@@ -899,7 +1079,8 @@ fn cli_watch(
         if let Err(error) = config::append_history(&record) {
             eprintln!("history write failed: {error}");
         }
-        previous = manifest.primary.clone();
+        watch::save(&state_path, &watch_state)
+            .map_err(|error| anyhow::anyhow!("failed to persist watch state: {error}"))?;
         previous_healthy = Some(healthy);
         previous_manifest = Some(manifest);
         let actionable_alert = alerts.iter().any(|alert| {
@@ -1016,6 +1197,8 @@ mod tests {
             success_rate_upper: 1.0,
             score_confidence: 0.95,
             decision: "competitive".to_string(),
+            checks: Vec::new(),
+            health_ok: true,
         }];
         let mut filtered = results.clone();
         filtered.retain(|r| {

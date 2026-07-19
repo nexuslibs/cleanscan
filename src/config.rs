@@ -1,12 +1,41 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::{fs, io::Write};
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct HealthCheck {
+    pub name: String,
+    pub path: String,
+    #[serde(default = "default_health_check_required")]
+    pub required: bool,
+    #[serde(default = "default_health_check_weight")]
+    pub weight: f64,
+}
+
+impl Hash for HealthCheck {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.path.hash(state);
+        self.required.hash(state);
+        self.weight.to_bits().hash(state);
+    }
+}
+
+fn default_health_check_required() -> bool {
+    true
+}
+fn default_health_check_weight() -> f64 {
+    1.0
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AppConfig {
     pub host: String,
     pub path: String,
+    #[serde(default)]
+    pub health_checks: Vec<HealthCheck>,
     /// Expected HTTP statuses. An empty list accepts any 2xx response.
     #[serde(default)]
     pub expected_statuses: Vec<u16>,
@@ -178,6 +207,7 @@ impl Default for AppConfig {
         Self {
             host: String::new(),
             path: "/cdn-cgi/trace".to_string(),
+            health_checks: Vec::new(),
             expected_statuses: Vec::new(),
             required_body_markers: Vec::new(),
             required_headers: Vec::new(),

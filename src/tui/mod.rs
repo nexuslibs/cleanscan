@@ -312,6 +312,7 @@ pub struct App {
     pub last_watch_primary: Option<String>,
     pub last_watch_healthy: Option<bool>,
     pub alert_message: Option<String>,
+    pub watch_state: Option<crate::watch::WatchState>,
     /// Animation lifecycle state for each modal layer, driven by `render`.
     pub help_overlay: OverlayState,
     pub quit_overlay: OverlayState,
@@ -576,6 +577,7 @@ impl App {
             last_watch_primary: None,
             last_watch_healthy: None,
             alert_message: None,
+            watch_state: None,
             help_overlay: modal_state(),
             quit_overlay: modal_state(),
             speed_confirm_overlay: modal_state(),
@@ -1117,6 +1119,7 @@ fn ranked_export_results(results: &[ProbeResult], top: usize) -> Vec<&ProbeResul
     ranked
 }
 
+#[allow(dead_code)]
 fn compute_watch_alerts(
     cycle: u64,
     previous_primary: Option<&str>,
@@ -1233,7 +1236,7 @@ pub fn run_tui(
                 ))
                 .map_err(|e| e.to_string())?;
             } else {
-                rt.block_on(crate::scanner::run_scan(
+                rt.block_on(crate::scanner::run_profile_scan(
                     targets,
                     scanner_config,
                     scanner_tx,
@@ -1380,13 +1383,47 @@ pub fn run_tui(
                         let healthy = manifest.primary.is_some();
                         let recommendation =
                             manifest.primary.as_ref().map(|result| result.ip.clone());
-                        let alerts = compute_watch_alerts(
-                            app.watch_cycle,
-                            app.last_watch_primary.as_deref(),
-                            app.last_watch_healthy,
-                            recommendation.as_deref(),
-                            healthy,
-                        );
+                        if app.watch_state.is_none() {
+                            let source_fingerprint = crate::watch::fingerprint(&app.last_targets);
+                            let profile_fingerprint = crate::watch::fingerprint(&(
+                                app.config.host.clone(),
+                                app.config.path.clone(),
+                                app.config.expected_statuses.clone(),
+                                app.config.required_body_markers.clone(),
+                                app.config.required_headers.clone(),
+                                app.config.follow_redirects,
+                                app.config.health_checks.clone(),
+                            ));
+                            app.watch_state = Some(crate::watch::WatchState::new(
+                                source_fingerprint,
+                                profile_fingerprint,
+                                app.last_targets.clone(),
+                            ));
+                        }
+                        let watch_thresholds = app.manifest_thresholds;
+                        let watch_min_confidence = app.manifest_min_confidence.clone();
+                        let transition = app
+                            .watch_state
+                            .as_mut()
+                            .expect("watch state initialized")
+                            .advance(
+                                &app.results,
+                                crate::watch::WatchPolicy::default(),
+                                |result| {
+                                    crate::healthy_result(
+                                        result,
+                                        watch_thresholds,
+                                        &watch_min_confidence,
+                                    )
+                                },
+                            );
+                        let mut alerts = Vec::new();
+                        if transition.changed {
+                            alerts.push("recommended target changed".to_string());
+                        }
+                        if !transition.healthy && app.last_watch_healthy != Some(false) {
+                            alerts.push("no healthy target".to_string());
+                        }
                         app.alert_message = (!alerts.is_empty()).then(|| alerts.join("; "));
                         if let Some(message) = &app.alert_message {
                             app.toast_warn(format!("Watch alert: {message}"));
@@ -1406,7 +1443,7 @@ pub fn run_tui(
                         if let Err(error) = crate::config::append_history(&record) {
                             app.toast_warn(format!("History write failed: {error}"));
                         }
-                        app.last_watch_primary = recommendation;
+                        app.last_watch_primary = transition.stable_primary;
                         app.last_watch_healthy = Some(healthy);
                     }
                     if app.watch_interval.is_none() {
@@ -2717,6 +2754,8 @@ mod tests {
             success_rate_upper: 1.0,
             score_confidence: 0.95,
             decision: "competitive".to_string(),
+            checks: Vec::new(),
+            health_ok: true,
         }
     }
 
