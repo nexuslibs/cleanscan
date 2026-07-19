@@ -30,6 +30,7 @@ use crate::config::AppConfig;
 use crate::scanner::ProbeResult;
 use crate::speed::{SpeedDirection, SpeedResult};
 use crate::tui::wizard::SettingField;
+use tui_overlay::{Anchor, Backdrop, Easing, Overlay, OverlayState, Slide};
 
 /// Which top-level screen the TUI is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,10 +302,53 @@ pub struct App {
     /// Full statistics drawer for the currently selected latency result.
     pub show_result_details: bool,
     pub detail_tab: usize,
+    /// Animation lifecycle state for each modal layer, driven by `render`.
+    pub help_overlay: OverlayState,
+    pub quit_overlay: OverlayState,
+    pub speed_confirm_overlay: OverlayState,
+    pub command_palette_overlay: OverlayState,
+    pub column_picker_overlay: OverlayState,
+    pub result_details_overlay: OverlayState,
+    /// Last frame timestamp used to derive per-frame animation deltas.
+    anim_clock: Option<Instant>,
     explicit_target_source: Option<(Vec<String>, Option<String>)>,
 }
 
+/// Default animation configuration shared by every modal overlay.
+fn modal_state() -> OverlayState {
+    OverlayState::new()
+        .with_duration(Duration::from_millis(140))
+        .with_easing(Easing::EaseOut)
+}
+
+/// Build a centered, dimmed, sliding modal overlay with a themed title block.
+pub(crate) fn modal_overlay(
+    title: &'static str,
+    percent_w: u16,
+    percent_h: u16,
+) -> Overlay<'static> {
+    Overlay::new()
+        .anchor(Anchor::Center)
+        .width(Constraint::Percentage(percent_w))
+        .height(Constraint::Percentage(percent_h))
+        .backdrop(Backdrop::new(theme::palette().sel_bg))
+        .block(widgets::panel_block(title, true))
+        .slide(Slide::Top)
+}
+
 impl App {
+    /// Elapsed time since the previous frame, used to advance overlay animations.
+    /// Called once per `render` so every modal ticks by the same delta.
+    fn anim_elapsed(&mut self) -> Duration {
+        let now = Instant::now();
+        let elapsed = match self.anim_clock {
+            Some(prev) => now.saturating_duration_since(prev),
+            None => Duration::ZERO,
+        };
+        self.anim_clock = Some(now);
+        elapsed
+    }
+
     /// Number of focusable regions on the current screen. Keeping this map
     /// small and predictable makes Tab useful even when a screen is compact.
     pub fn focus_count(&self) -> usize {
@@ -509,6 +553,13 @@ impl App {
             column_picker_list_state: ListState::default(),
             show_result_details: false,
             detail_tab: 0,
+            help_overlay: modal_state(),
+            quit_overlay: modal_state(),
+            speed_confirm_overlay: modal_state(),
+            command_palette_overlay: modal_state(),
+            column_picker_overlay: modal_state(),
+            result_details_overlay: modal_state(),
+            anim_clock: None,
             explicit_target_source: None,
         }
     }
@@ -1041,27 +1092,6 @@ fn ranked_export_results(results: &[ProbeResult], top: usize) -> Vec<&ProbeResul
     ranked.sort_by(|a, b| App::natural_cmp(a, b));
     ranked.truncate(top);
     ranked
-}
-
-/// Center a rectangle of the given percentage size within `area`.
-pub fn centered(area: Rect, percent_w: u16, percent_h: u16) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_h) / 2),
-            Constraint::Percentage(percent_h),
-            Constraint::Percentage((100 - percent_h) / 2),
-        ])
-        .split(area);
-    let horizontal = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_w) / 2),
-            Constraint::Percentage(percent_w),
-            Constraint::Percentage((100 - percent_w) / 2),
-        ])
-        .split(vertical[1]);
-    horizontal[1]
 }
 
 /// Run the full TUI loop.
@@ -1641,37 +1671,36 @@ impl App {
         self.speed_table_header = None;
         self.speed_table_col_bounds.clear();
 
+        let elapsed = self.anim_elapsed();
         match self.screen {
             Screen::Wizard => wizard::render(self, frame, frame.area()),
-            Screen::Scanning => dashboard::render(self, frame, frame.area()),
+            Screen::Scanning => dashboard::render(self, frame, frame.area(), elapsed),
             Screen::SpeedSelect | Screen::SpeedTesting | Screen::SpeedResults => {
                 speed::render(self, frame, frame.area())
             }
         }
 
-        if self.show_help {
-            help::overlay(self, frame, frame.area());
-        }
-
-        if self.confirm_quit {
-            self.render_quit_confirm(frame, frame.area());
-        }
-
-        if self.confirm_speed_start {
-            self.render_speed_confirm(frame, frame.area());
-        }
-
-        if self.show_command_palette {
-            self.render_command_palette(frame, frame.area());
-        }
-        if self.show_column_picker {
-            self.render_column_picker(frame, frame.area());
-        }
+        // Modal layers are always "rendered" so the overlay state machine can
+        // play its open/close animation; each overlay is a no-op while closed.
+        help::overlay(self, frame, frame.area(), elapsed);
+        self.render_quit_confirm(frame, frame.area(), elapsed);
+        self.render_speed_confirm(frame, frame.area(), elapsed);
+        self.render_command_palette(frame, frame.area(), elapsed);
+        self.render_column_picker(frame, frame.area(), elapsed);
     }
 
-    fn render_column_picker(&mut self, frame: &mut Frame, area: Rect) {
-        let popup = centered(area, 56, 46);
-        let inner = widgets::modal(frame, area, popup, " Result columns ");
+    fn render_column_picker(&mut self, frame: &mut Frame, area: Rect, elapsed: Duration) {
+        let overlay = modal_overlay(" Result columns ", 56, 46);
+        if self.show_column_picker {
+            self.column_picker_overlay.open();
+        } else {
+            self.column_picker_overlay.close();
+        }
+        self.column_picker_overlay.tick(elapsed);
+        frame.render_stateful_widget(overlay, area, &mut self.column_picker_overlay);
+        let Some(inner) = self.column_picker_overlay.inner_area() else {
+            return;
+        };
         let items = dashboard::RESULT_COLUMNS
             .iter()
             .enumerate()
@@ -1712,9 +1741,18 @@ impl App {
         );
     }
 
-    fn render_command_palette(&mut self, frame: &mut Frame, area: Rect) {
-        let popup = centered(area, 72, 70);
-        let inner = widgets::modal(frame, area, popup, " Command palette ");
+    fn render_command_palette(&mut self, frame: &mut Frame, area: Rect, elapsed: Duration) {
+        let overlay = modal_overlay(" Command palette ", 72, 70);
+        if self.show_command_palette {
+            self.command_palette_overlay.open();
+        } else {
+            self.command_palette_overlay.close();
+        }
+        self.command_palette_overlay.tick(elapsed);
+        frame.render_stateful_widget(overlay, area, &mut self.command_palette_overlay);
+        let Some(inner) = self.command_palette_overlay.inner_area() else {
+            return;
+        };
         let actions = self.filtered_actions();
         let visible = inner.height.saturating_sub(3) as usize;
         self.command_cursor = self.command_cursor.min(actions.len().saturating_sub(1));
@@ -1773,9 +1811,18 @@ impl App {
         );
     }
 
-    fn render_speed_confirm(&mut self, frame: &mut Frame, area: Rect) {
-        let popup = centered(area, 58, 32);
-        let inner = widgets::modal(frame, area, popup, " Start bandwidth test? ");
+    fn render_speed_confirm(&mut self, frame: &mut Frame, area: Rect, elapsed: Duration) {
+        let overlay = modal_overlay(" Start bandwidth test? ", 58, 32);
+        if self.confirm_speed_start {
+            self.speed_confirm_overlay.open();
+        } else {
+            self.speed_confirm_overlay.close();
+        }
+        self.speed_confirm_overlay.tick(elapsed);
+        frame.render_stateful_widget(overlay, area, &mut self.speed_confirm_overlay);
+        let Some(inner) = self.speed_confirm_overlay.inner_area() else {
+            return;
+        };
         let directions = match self.speed_direction {
             SpeedDirection::Download | SpeedDirection::Upload => 1,
             SpeedDirection::Both => 2,
@@ -1803,13 +1850,22 @@ impl App {
     }
 
     /// Modal shown when the user tries to quit mid-scan.
-    fn render_quit_confirm(&mut self, frame: &mut Frame, area: Rect) {
+    fn render_quit_confirm(&mut self, frame: &mut Frame, area: Rect, elapsed: Duration) {
         use ratatui::layout::Alignment;
         use ratatui::text::{Line, Span};
         use ratatui::widgets::Paragraph;
 
-        let popup = centered(area, 46, 30);
-        let inner = widgets::modal(frame, area, popup, " Quit cleanscan? ");
+        let overlay = modal_overlay(" Quit cleanscan? ", 46, 30);
+        if self.confirm_quit {
+            self.quit_overlay.open();
+        } else {
+            self.quit_overlay.close();
+        }
+        self.quit_overlay.tick(elapsed);
+        frame.render_stateful_widget(overlay, area, &mut self.quit_overlay);
+        let Some(inner) = self.quit_overlay.inner_area() else {
+            return;
+        };
 
         let body = Layout::default()
             .direction(Direction::Vertical)
@@ -2487,6 +2543,9 @@ mod tests {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| app.render(f)).unwrap();
+        // Advance real time between draws so overlay animations (which advance on
+        // wall-clock deltas) progress deterministically, matching ~60fps timing.
+        std::thread::sleep(std::time::Duration::from_millis(16));
     }
 
     #[test]
@@ -2561,6 +2620,9 @@ mod tests {
         app.scan_complete = true;
         app.show_result_details = true;
 
+        // Warm-up draw so the overlay animation has advanced past its first
+        // (zero-delta) frame; otherwise tab 0's body would never render.
+        draw(&mut app, 120, 40);
         for tab in 0..5 {
             app.detail_tab = tab;
             draw(&mut app, 120, 40);

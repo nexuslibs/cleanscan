@@ -10,6 +10,8 @@ use ratatui::{
 use crate::config::AppConfig;
 use crate::tui::theme;
 use crate::tui::{widgets, App, ButtonAction, ButtonKind, WizardStep};
+use tui_checkbox::Checkbox;
+use tui_slider::{Slider, SliderState};
 
 /// Identifies an editable scan parameter on the settings step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -424,36 +426,67 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
     let list_block =
         widgets::panel_block("Cloudflare CIDR ranges (space toggle, A all, N none)", true);
     let inner = list_block.inner(main_layout[0]);
+    frame.render_widget(list_block, main_layout[0]);
     app.ranges_inner = Some(inner);
 
-    let items: Vec<ListItem> = app
-        .cidr_candidates
-        .iter()
-        .enumerate()
-        .map(|(i, e)| {
-            let mark = if e.selected { "☑" } else { "☐" };
-            let style = if i == app.cursor {
+    let visible = inner.height as usize;
+    let total = app.cidr_candidates.len();
+    let max_scroll = total.saturating_sub(visible);
+    // Keep the cursor visible within the viewport.
+    if app.cursor < app.ranges_scroll {
+        app.ranges_scroll = app.cursor;
+    } else if visible > 0 && app.cursor >= app.ranges_scroll + visible {
+        app.ranges_scroll = app.cursor + 1 - visible;
+    }
+    app.ranges_scroll = app.ranges_scroll.min(max_scroll);
+
+    for (i, idx) in (app.ranges_scroll..).enumerate().take(visible) {
+        if idx >= total {
+            break;
+        }
+        let e = &app.cidr_candidates[idx];
+        let y = inner.y + i as u16;
+        // Cursor marker gutter (mirrors the list highlight symbol).
+        if idx == app.cursor {
+            frame.render_widget(
+                Paragraph::new("› ").style(theme::row_selected_style()),
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: 2,
+                    height: 1,
+                },
+            );
+        }
+        let checkbox = Checkbox::new(e.cidr.clone(), e.selected)
+            .label_style(if idx == app.cursor {
                 theme::row_selected_style()
             } else if e.selected {
                 Style::default().fg(theme::palette().info)
             } else {
                 theme::hint_style()
-            };
-            ListItem::new(Line::from(format!("{} {}", mark, e.cidr)).style(style))
-        })
-        .collect();
+            })
+            .checkbox_style(if e.selected {
+                Style::default().fg(theme::palette().success)
+            } else {
+                Style::default().fg(theme::palette().subtitle)
+            });
+        frame.render_widget(
+            checkbox,
+            Rect {
+                x: inner.x + 2,
+                y,
+                width: inner.width.saturating_sub(2),
+                height: 1,
+            },
+        );
+    }
+
+    // Maintain the ListState bookkeeping for external consumers and tests.
     app.ranges_list_state = app
         .ranges_list_state
         .with_offset(app.ranges_scroll)
         .with_selected((!app.cidr_candidates.is_empty()).then_some(app.cursor));
-    frame.render_stateful_widget(
-        List::new(items)
-            .block(list_block)
-            .highlight_style(theme::row_selected_style())
-            .highlight_symbol("› "),
-        main_layout[0],
-        &mut app.ranges_list_state,
-    );
     app.ranges_scroll = app.ranges_list_state.offset();
 
     // Right Side Info Panel
@@ -682,10 +715,62 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     }
 
     let desc_block = widgets::panel_block("Field Context", false);
-    let desc_widget = Paragraph::new(desc_para_lines)
-        .block(desc_block)
-        .wrap(Wrap { trim: true });
-    frame.render_widget(desc_widget, main_layout[1]);
+    let desc_inner = desc_block.inner(main_layout[1]);
+    frame.render_widget(desc_block, main_layout[1]);
+
+    // Numerically editable fields get a live slider visualizing the value.
+    if current_field.is_numeric() {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .split(desc_inner);
+        frame.render_widget(
+            Paragraph::new(desc_para_lines).wrap(Wrap { trim: true }),
+            chunks[0],
+        );
+
+        let value = current_field
+            .value_string(&app.config)
+            .parse::<f64>()
+            .unwrap_or(1.0);
+        let (min, max) = match current_field {
+            SettingField::StabilityWeight | SettingField::LossWeight => (0.0, 10.0),
+            _ => (1.0, (current_field.max_value().min(1_000_000)) as f64),
+        };
+        let state = SliderState::new(value.clamp(min, max), min, max);
+        let slider = Slider::from_state(&state)
+            .show_value(true)
+            .show_handle(true)
+            .filled_color(theme::palette().accent)
+            .empty_color(theme::palette().border)
+            .handle_color(theme::palette().highlight);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {} ", current_field.label().to_uppercase()),
+                theme::panel_title_style(),
+            ))),
+            Rect {
+                x: chunks[1].x,
+                y: chunks[1].y,
+                width: chunks[1].width,
+                height: 1,
+            },
+        );
+        frame.render_widget(
+            slider,
+            Rect {
+                x: chunks[1].x,
+                y: chunks[1].y + 1,
+                width: chunks[1].width,
+                height: 1,
+            },
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(desc_para_lines).wrap(Wrap { trim: true }),
+            desc_inner,
+        );
+    }
 }
 
 fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {

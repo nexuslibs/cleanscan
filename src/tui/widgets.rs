@@ -6,7 +6,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
@@ -234,37 +234,6 @@ pub fn status_bar(
     let hint = hint_line(hints, remaining);
     spans.extend(hint.spans);
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-/// Dim every cell in `area` so a modal on top reads as the focused layer.
-pub fn dim_backdrop(frame: &mut Frame, area: Rect) {
-    let buf = frame.buffer_mut();
-    for y in area.top()..area.bottom() {
-        for x in area.left()..area.right() {
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_style(
-                    Style::default()
-                        .add_modifier(Modifier::DIM)
-                        .fg(theme::palette().muted),
-                );
-            }
-        }
-    }
-}
-
-/// Prepare a centered modal panel: dim the backdrop, clear the popup region and
-/// draw a titled, accented block. Returns the inner content rect.
-pub fn modal(frame: &mut Frame, area: Rect, popup: Rect, title: &str) -> Rect {
-    dim_backdrop(frame, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_set(ratatui::symbols::border::ROUNDED)
-        .border_style(theme::border_active_style())
-        .title(Span::styled(title.to_string(), theme::header_style()));
-    let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(block, popup);
-    inner
 }
 
 #[cfg(test)]
