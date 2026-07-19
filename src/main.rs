@@ -398,6 +398,9 @@ fn main() -> Result<()> {
             args.seed,
             args.watch,
             args.manifest,
+            args.min_success_rate,
+            args.max_p95_ms,
+            args.manifest_min_confidence,
         )
     }
 }

@@ -258,8 +258,9 @@ latency map.
 
 When validation options are configured, a probe is counted as successful only
 when its status, required headers, and required body markers all match. A
-validation failure remains in the result diagnostics and does not contribute
-to latency or success-rate statistics. In watch mode, structured `alert`
+validation failure remains in the result diagnostics, contributes to the
+completed/failed counts, lowers the success rate, and does not contribute a
+successful latency sample. In watch mode, structured `alert`
 events are emitted for health loss, recommendation changes, configured p95 or
 packet-loss regressions, and colo changes. `--manifest` writes the current
 healthy primary and backup pool only after a completed scan; the JSON file is
