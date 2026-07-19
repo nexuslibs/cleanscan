@@ -44,6 +44,9 @@ pub struct ProbeResult {
     pub protocol: String,
     pub ok: usize,
     pub fail: usize,
+    /// Number of completed measured requests used as the denominator for
+    /// success rate and packet loss.
+    pub completed: usize,
     pub avg: f64,
     pub p50: f64,
     pub p90: f64,
@@ -87,7 +90,7 @@ pub fn result_status(result: &ProbeResult) -> &'static str {
 }
 
 pub fn result_confidence(result: &ProbeResult) -> &'static str {
-    match result.ok + result.fail {
+    match result.completed {
         0..=2 => "UNKNOWN",
         3..=7 => "LOW",
         8..=19 => "MEDIUM",
@@ -476,6 +479,7 @@ impl TargetState {
             protocol: summarize_protocols(&self.protocols),
             ok,
             fail: self.fail,
+            completed: self.completed,
             avg,
             p50,
             p90,
@@ -997,18 +1001,17 @@ mod tests {
 
     #[test]
     fn score_penalizes_jitter_and_loss() {
-        // Two IPs with identical p95 but different jitter; the steadier one
-        // must outrank the jittery one once weights are applied.
+        // Equal p95/max values with different p50 values isolate jitter.
         let steady = TargetState {
             ip: "192.0.2.1".to_string(),
             url: String::new(),
             client: None,
-            samples: vec![0.20, 0.20, 0.20],
-            protocols: vec!["h2".to_string(); 3],
+            samples: vec![0.20, 0.20, 0.30, 0.30],
+            protocols: vec!["h2".to_string(); 4],
             fail: 0,
             loss: 0,
-            scheduled: 3,
-            completed: 3,
+            scheduled: 4,
+            completed: 4,
             in_flight: false,
             failures: Vec::new(),
             colo: None,
@@ -1017,19 +1020,19 @@ mod tests {
             warmup_in_flight: false,
             warmup_discard_first: false,
             stability_weight: 1.0,
-            loss_weight: 1.0,
+            loss_weight: 0.0,
         }
         .result();
         let jittery = TargetState {
             ip: "192.0.2.2".to_string(),
             url: String::new(),
             client: None,
-            samples: vec![0.10, 0.20, 0.30],
-            protocols: vec!["h2".to_string(); 3],
+            samples: vec![0.10, 0.10, 0.30, 0.30],
+            protocols: vec!["h2".to_string(); 4],
             fail: 0,
             loss: 0,
-            scheduled: 3,
-            completed: 3,
+            scheduled: 4,
+            completed: 4,
             in_flight: false,
             failures: Vec::new(),
             colo: None,
@@ -1038,9 +1041,60 @@ mod tests {
             warmup_in_flight: false,
             warmup_discard_first: false,
             stability_weight: 1.0,
+            loss_weight: 0.0,
+        }
+        .result();
+        assert_eq!(steady.p95, jittery.p95);
+        assert_eq!(steady.max, jittery.max);
+        assert!(steady.jitter < jittery.jitter);
+        assert!(steady.score > jittery.score);
+
+        // Equal reliability with different failure classification isolates
+        // packet loss; disabling jitter must not disable the loss penalty.
+        let reliable = TargetState {
+            ip: "192.0.2.3".to_string(),
+            url: String::new(),
+            client: None,
+            samples: vec![0.20, 0.20, 0.20],
+            protocols: vec!["h2".to_string(); 3],
+            fail: 1,
+            loss: 0,
+            scheduled: 4,
+            completed: 4,
+            in_flight: false,
+            failures: vec!["HTTP status 500".to_string()],
+            colo: None,
+            cold_ms: None,
+            warmup_done: true,
+            warmup_in_flight: false,
+            warmup_discard_first: false,
+            stability_weight: 0.0,
             loss_weight: 1.0,
         }
         .result();
-        assert!(steady.score > jittery.score);
+        let lossy = TargetState {
+            ip: "192.0.2.4".to_string(),
+            url: String::new(),
+            client: None,
+            samples: vec![0.20, 0.20, 0.20],
+            protocols: vec!["h2".to_string(); 3],
+            fail: 1,
+            loss: 1,
+            scheduled: 4,
+            completed: 4,
+            in_flight: false,
+            failures: vec!["request timeout".to_string()],
+            colo: None,
+            cold_ms: None,
+            warmup_done: true,
+            warmup_in_flight: false,
+            warmup_discard_first: false,
+            stability_weight: 0.0,
+            loss_weight: 1.0,
+        }
+        .result();
+        assert_eq!(reliable.success_rate, lossy.success_rate);
+        assert!(reliable.packet_loss < lossy.packet_loss);
+        assert!(reliable.score > lossy.score);
     }
 }

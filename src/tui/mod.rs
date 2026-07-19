@@ -2460,6 +2460,7 @@ mod tests {
             protocol: "h2".to_string(),
             ok: 1,
             fail,
+            completed: 1 + fail,
             avg: p95,
             p50: p95,
             p90: p95,

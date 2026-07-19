@@ -276,44 +276,7 @@ fn cli_mode(
         });
     }
 
-    results.sort_by(|a, b| {
-        a.fail
-            .cmp(&b.fail)
-            .then_with(|| a.p95.partial_cmp(&b.p95).unwrap())
-            .then_with(|| a.max.partial_cmp(&b.max).unwrap())
-            .then_with(|| a.avg.partial_cmp(&b.avg).unwrap())
-    });
-
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                b.success_rate
-                    .partial_cmp(&a.success_rate)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| {
-                a.p95
-                    .partial_cmp(&b.p95)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| {
-                a.jitter
-                    .partial_cmp(&b.jitter)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| {
-                a.packet_loss
-                    .partial_cmp(&b.packet_loss)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| {
-                a.avg
-                    .partial_cmp(&b.avg)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-    });
+    results.sort_by(crate::tui::App::natural_cmp);
     let healthy = results.iter().any(|result| {
         result.ok > 0
             && min_success_rate.is_none_or(|min| result.success_rate >= min)
@@ -340,7 +303,7 @@ fn cli_mode(
                     .join(",");
 
                 text.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.1}\t{}\t{:.1}\t{}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{:.1}\t{}\t{}\t{}\n",
                     i + 1,
                     r.ip,
                     r.colo.clone().unwrap_or_default(),
@@ -406,6 +369,7 @@ mod tests {
             protocol: "h2".to_string(),
             ok: 1,
             fail: 0,
+            completed: 1,
             avg: 0.0,
             p50: 0.0,
             p90: 0.0,

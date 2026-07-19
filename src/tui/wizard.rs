@@ -131,8 +131,8 @@ impl SettingField {
             SettingField::TimeoutMs => args.timeout_ms.to_string(),
             SettingField::ConnectTimeoutMs => args.connect_timeout_ms.to_string(),
             SettingField::Top => args.top.to_string(),
-            SettingField::StabilityWeight => format!("{:.2}", args.stability_weight),
-            SettingField::LossWeight => format!("{:.2}", args.loss_weight),
+            SettingField::StabilityWeight => args.stability_weight.to_string(),
+            SettingField::LossWeight => args.loss_weight.to_string(),
         }
     }
 

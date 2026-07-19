@@ -43,10 +43,9 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    // The full 14-column table needs 152 (WIDTHS) + 13 column separators
-    // + 2 border columns = 167 columns to render without clipping, so only
-    // enter wide mode once the area is at least that wide.
-    if area.width < 168 {
+    // The full 14-column table needs 136 (WIDTHS) + 13 column separators
+    // + 2 border columns = 151 columns to render without clipping.
+    if area.width < 151 {
         render_compact(app, frame, area);
     } else {
         render_wide(app, frame, area);
@@ -183,7 +182,7 @@ fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
     let rows = page.enumerate().map(|(i, r)| {
         let index = app.scroll + i;
         let selected = index == app.result_cursor;
-        let reliability = format!("{}/{}", r.ok, r.ok + r.fail);
+        let reliability = format!("{}/{}", r.ok, r.completed);
         let status = if r.fail == 0 { "READY" } else { "DEGRADED" };
         Row::new(vec![
             Cell::from((index + 1).to_string()),
@@ -316,7 +315,7 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
                 Line::from(format!(
                     "Success     : {}/{} ({:.1}%)",
                     result.ok,
-                    result.ok + result.fail,
+                    result.completed,
                     result.success_rate * 100.0
                 )),
                 Line::from(format!("Average     : {}", fmt_ms(result.avg))),
@@ -330,7 +329,7 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect) {
                 Line::from(format!(
                     "Loss        : {}/{} ({:.1}%)",
                     result.loss,
-                    result.ok + result.fail,
+                    result.completed,
                     result.packet_loss * 100.0
                 )),
                 Line::from(format!(
@@ -606,7 +605,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
     let mut total_probes_done = 0;
     let mut total_probes_ok = 0;
     for r in &app.results {
-        total_probes_done += r.ok + r.fail;
+        total_probes_done += r.completed;
         total_probes_ok += r.ok;
     }
     let success_rate = if total_probes_done > 0 {
@@ -803,7 +802,7 @@ fn render_decision_panel(app: &App, frame: &mut Frame, area: Rect) {
         .iter()
         .filter(|r| result_status(r) == "FAILED")
         .count();
-    let total: usize = app.results.iter().map(|r| r.ok + r.fail).sum();
+    let total: usize = app.results.iter().map(|r| r.completed).sum();
     let ok: usize = app.results.iter().map(|r| r.ok).sum();
     let rate = if total > 0 {
         ok as f64 / total as f64 * 100.0
