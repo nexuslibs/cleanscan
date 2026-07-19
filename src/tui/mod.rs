@@ -312,6 +312,10 @@ pub struct App {
     pub last_watch_primary: Option<String>,
     pub last_watch_healthy: Option<bool>,
     pub alert_message: Option<String>,
+    pub watch_state: Option<crate::watch::WatchState>,
+    pub watch_policy: crate::watch::WatchPolicy,
+    pub watch_state_path: Option<String>,
+    pub watch_new_sample: bool,
     /// Animation lifecycle state for each modal layer, driven by `render`.
     pub help_overlay: OverlayState,
     pub quit_overlay: OverlayState,
@@ -576,6 +580,10 @@ impl App {
             last_watch_primary: None,
             last_watch_healthy: None,
             alert_message: None,
+            watch_state: None,
+            watch_policy: crate::watch::WatchPolicy::default(),
+            watch_state_path: None,
+            watch_new_sample: false,
             help_overlay: modal_state(),
             quit_overlay: modal_state(),
             speed_confirm_overlay: modal_state(),
@@ -1117,23 +1125,6 @@ fn ranked_export_results(results: &[ProbeResult], top: usize) -> Vec<&ProbeResul
     ranked
 }
 
-fn compute_watch_alerts(
-    cycle: u64,
-    previous_primary: Option<&str>,
-    previous_healthy: Option<bool>,
-    recommendation: Option<&str>,
-    healthy: bool,
-) -> Vec<String> {
-    let mut alerts = Vec::new();
-    if cycle > 1 && previous_primary != recommendation {
-        alerts.push("recommended target changed".to_string());
-    }
-    if cycle > 1 && !healthy && previous_healthy != Some(false) {
-        alerts.push("no healthy target".to_string());
-    }
-    alerts
-}
-
 fn build_current_manifest(app: &App) -> crate::Manifest {
     crate::build_manifest(
         &app.config,
@@ -1158,6 +1149,62 @@ fn queue_manifest_write(
     });
 }
 
+fn watch_profile_fingerprint(config: &AppConfig) -> u64 {
+    crate::watch::fingerprint(&(
+        config.host.clone(),
+        config.path.clone(),
+        config.expected_statuses.clone(),
+        config.required_body_markers.clone(),
+        config.required_headers.clone(),
+        config.follow_redirects,
+        config.health_checks.clone(),
+    ))
+}
+
+fn prepare_watch_targets(
+    app: &mut App,
+    mut targets: Vec<String>,
+    source_fingerprint: u64,
+) -> Vec<String> {
+    if app.watch_interval.is_none() {
+        return targets;
+    }
+    let profile_fingerprint = watch_profile_fingerprint(&app.config);
+    if let Some(state) = &app.watch_state {
+        if state.compatible(source_fingerprint, profile_fingerprint) {
+            return targets;
+        }
+        app.watch_state = None;
+        app.watch_state_path = None;
+    }
+    let path = app
+        .watch_state_path
+        .clone()
+        .map(std::path::PathBuf::from)
+        .or_else(|| crate::watch::default_state_path(&app.config.host, source_fingerprint));
+    let Some(path) = path else {
+        app.toast_warn("Unable to determine watch state path; continuing without persistence");
+        return targets;
+    };
+    app.watch_state_path = Some(path.to_string_lossy().into_owned());
+    if !app.watch_new_sample {
+        if let Some(saved) = crate::watch::load(&path)
+            .filter(|saved| saved.compatible(source_fingerprint, profile_fingerprint))
+        {
+            targets = saved.targets.clone();
+            app.watch_state = Some(saved);
+            return targets;
+        }
+    }
+    let state =
+        crate::watch::WatchState::new(source_fingerprint, profile_fingerprint, targets.clone());
+    if let Err(error) = crate::watch::save(&path, &state) {
+        app.toast_warn(format!("Watch state write failed: {error}"));
+    }
+    app.watch_state = Some(state);
+    targets
+}
+
 /// Run the full TUI loop.
 #[allow(clippy::too_many_arguments)]
 pub fn run_tui(
@@ -1171,6 +1218,9 @@ pub fn run_tui(
     max_p95_ms: Option<f64>,
     manifest_min_confidence: String,
     manifest_backups: usize,
+    watch_policy: crate::watch::WatchPolicy,
+    watch_state_path: Option<&str>,
+    watch_new_sample: bool,
 ) -> anyhow::Result<()> {
     let has_cli_targets = cli_ips.is_some() || !cli_cidr.is_empty();
 
@@ -1202,6 +1252,9 @@ pub fn run_tui(
     };
     app.manifest_min_confidence = manifest_min_confidence;
     app.manifest_backups = manifest_backups;
+    app.watch_policy = watch_policy;
+    app.watch_state_path = watch_state_path.map(str::to_string);
+    app.watch_new_sample = watch_new_sample;
     if has_cli_targets {
         app.set_explicit_target_source(cli_cidr.clone(), cli_ips.clone());
     }
@@ -1222,7 +1275,10 @@ pub fn run_tui(
                     return Err(format!("failed to create tokio runtime: {e}"));
                 }
             };
-            if scanner_config.two_phase && !selected_cidrs.is_empty() {
+            if scanner_config.two_phase
+                && !selected_cidrs.is_empty()
+                && scanner_config.health_checks.is_empty()
+            {
                 rt.block_on(crate::scanner::run_scan_two_phase(
                     selected_cidrs,
                     scanner_config,
@@ -1233,7 +1289,7 @@ pub fn run_tui(
                 ))
                 .map_err(|e| e.to_string())?;
             } else {
-                rt.block_on(crate::scanner::run_scan(
+                rt.block_on(crate::scanner::run_profile_scan(
                     targets,
                     scanner_config,
                     scanner_tx,
@@ -1280,6 +1336,13 @@ pub fn run_tui(
                 &cli_ips,
                 app.scan_seed,
             )?;
+            let source_fingerprint = crate::watch::fingerprint(&(
+                cli_cidr.clone(),
+                cli_ips.clone(),
+                config_arc.sample_per_cidr,
+                explicit_seed,
+            ));
+            let targets = prepare_watch_targets(&mut app, targets, source_fingerprint);
             let total = targets.len();
             app.set_scan_targets(targets.clone());
             let two_phase_cidrs: Vec<String> = if cli_ips.is_some() {
@@ -1329,6 +1392,12 @@ pub fn run_tui(
         };
         match targets {
             Ok(targets) => {
+                let source_fingerprint = crate::watch::fingerprint(&(
+                    cidrs.clone(),
+                    app.config.sample_per_cidr,
+                    explicit_seed,
+                ));
+                let targets = prepare_watch_targets(app, targets, source_fingerprint);
                 let total = targets.len();
                 let scan_config = Arc::new(app.config.clone());
                 app.set_scan_targets(targets.clone());
@@ -1373,20 +1442,106 @@ pub fn run_tui(
                         if !app.last_targets.is_empty() {
                             app.watch_cycle = app.watch_cycle.saturating_add(1);
                         }
-                        let manifest = build_current_manifest(&app);
+                        if app.watch_state.is_none() {
+                            let source_fingerprint = crate::watch::fingerprint(&app.last_targets);
+                            let profile_fingerprint = watch_profile_fingerprint(&app.config);
+                            app.watch_state = Some(crate::watch::WatchState::new(
+                                source_fingerprint,
+                                profile_fingerprint,
+                                app.last_targets.clone(),
+                            ));
+                        }
+                        let watch_thresholds = app.manifest_thresholds;
+                        let watch_min_confidence = app.manifest_min_confidence.clone();
+                        let transition = app
+                            .watch_state
+                            .as_mut()
+                            .expect("watch state initialized")
+                            .advance(&app.results, app.watch_policy, |result| {
+                                crate::healthy_result(
+                                    result,
+                                    watch_thresholds,
+                                    &watch_min_confidence,
+                                )
+                            });
+                        let mut manifest_results = app.results.clone();
+                        if let Some(stable) = transition.stable_primary.as_deref() {
+                            manifest_results.sort_by(|a, b| {
+                                (a.ip != stable)
+                                    .cmp(&(b.ip != stable))
+                                    .then_with(|| App::natural_cmp(a, b))
+                            });
+                        } else {
+                            manifest_results.sort_by(App::natural_cmp);
+                        }
+                        let mut manifest = build_current_manifest(&app);
+                        if let Some(stable) = transition.stable_primary.as_deref() {
+                            manifest.primary = manifest_results
+                                .iter()
+                                .find(|result| {
+                                    result.ip == stable
+                                        && crate::healthy_result(
+                                            result,
+                                            app.manifest_thresholds,
+                                            &app.manifest_min_confidence,
+                                        )
+                                })
+                                .cloned();
+                            manifest.backups = manifest_results
+                                .iter()
+                                .filter(|result| {
+                                    result.ip != stable
+                                        && crate::healthy_result(
+                                            result,
+                                            app.manifest_thresholds,
+                                            &app.manifest_min_confidence,
+                                        )
+                                })
+                                .take(app.manifest_backups)
+                                .cloned()
+                                .collect();
+                            manifest.failure = manifest
+                                .primary
+                                .is_none()
+                                .then(|| "stable primary is no longer available".to_string());
+                        } else {
+                            manifest.primary = None;
+                            manifest.backups = manifest_results
+                                .iter()
+                                .filter(|result| {
+                                    crate::healthy_result(
+                                        result,
+                                        app.manifest_thresholds,
+                                        &app.manifest_min_confidence,
+                                    )
+                                })
+                                .take(app.manifest_backups)
+                                .cloned()
+                                .collect();
+                            manifest.failure =
+                                Some("no stable target met the watch policy".to_string());
+                        }
                         if let Some(path) = &app.manifest_path {
                             queue_manifest_write(path, manifest.clone(), &manifest_tx);
                         }
                         let healthy = manifest.primary.is_some();
-                        let recommendation =
-                            manifest.primary.as_ref().map(|result| result.ip.clone());
-                        let alerts = compute_watch_alerts(
-                            app.watch_cycle,
-                            app.last_watch_primary.as_deref(),
-                            app.last_watch_healthy,
-                            recommendation.as_deref(),
-                            healthy,
-                        );
+                        let recommendation = transition.stable_primary.clone();
+                        let mut alerts = Vec::new();
+                        if transition.changed {
+                            alerts.push("recommended target changed".to_string());
+                        }
+                        if !healthy && app.last_watch_healthy != Some(false) {
+                            alerts.push("no healthy target".to_string());
+                        }
+                        if let Some(path) = &app.watch_state_path {
+                            if let Some(state) = &app.watch_state {
+                                if let Err(error) =
+                                    crate::watch::save(std::path::Path::new(path), state)
+                                {
+                                    app.toast_warn(format!("Watch state write failed: {error}"));
+                                }
+                            }
+                        }
                         app.alert_message = (!alerts.is_empty()).then(|| alerts.join("; "));
                         if let Some(message) = &app.alert_message {
                             app.toast_warn(format!("Watch alert: {message}"));
@@ -1406,7 +1561,7 @@ pub fn run_tui(
                         if let Err(error) = crate::config::append_history(&record) {
                             app.toast_warn(format!("History write failed: {error}"));
                         }
-                        app.last_watch_primary = recommendation;
+                        app.last_watch_primary = transition.stable_primary;
                         app.last_watch_healthy = Some(healthy);
                     }
                     if app.watch_interval.is_none() {
@@ -2663,28 +2818,15 @@ impl Drop for RestoreGuard {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_watch_alerts, ranked_export_results, Action, App, FocusTarget, ProbeResult, Screen,
-        WizardStep,
+        build_current_manifest, ranked_export_results, Action, App, FocusTarget, ProbeResult,
+        Screen, WizardStep,
     };
     use crate::config::AppConfig;
+    use crate::watch::{WatchPolicy, WatchState};
     use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::{backend::TestBackend, Terminal};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
-
-    #[test]
-    fn watch_alerts_only_trigger_on_relevant_state_changes() {
-        assert!(compute_watch_alerts(1, None, None, Some("a"), true).is_empty());
-        assert_eq!(
-            compute_watch_alerts(2, Some("a"), Some(true), Some("b"), true),
-            vec!["recommended target changed"]
-        );
-        assert_eq!(
-            compute_watch_alerts(2, Some("a"), Some(true), None, false),
-            vec!["recommended target changed", "no healthy target"]
-        );
-        assert!(compute_watch_alerts(3, None, Some(false), None, false).is_empty());
-    }
 
     fn result(ip: &str, fail: usize, p95: f64) -> ProbeResult {
         ProbeResult {
@@ -2717,6 +2859,8 @@ mod tests {
             success_rate_upper: 1.0,
             score_confidence: 0.95,
             decision: "competitive".to_string(),
+            checks: Vec::new(),
+            health_ok: true,
         }
     }
 
@@ -2746,12 +2890,63 @@ mod tests {
     fn export_excludes_ips_with_no_successful_probes() {
         let mut failed = result("failed", 1, 0.001);
         failed.ok = 0;
+        failed.health_ok = false;
         failed.samples.clear();
 
         let results = [failed, result("ok", 1, 0.1)];
         let ranked = ranked_export_results(&results, 50);
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].ip, "ok");
+    }
+
+    #[test]
+    fn watch_state_persists_and_covers_promotion_loss_recovery_and_identity() {
+        let path =
+            std::env::temp_dir().join(format!("cleanscan-tui-watch-{}.json", std::process::id()));
+        let mut state = WatchState::new(11, 22, vec!["192.0.2.1".to_string()]);
+        let policy = WatchPolicy::default();
+        assert!(
+            !state
+                .advance(&[result("192.0.2.1", 0, 0.02)], policy, |r| r.health_ok)
+                .changed
+        );
+        crate::watch::save(&path, &state).unwrap();
+        let mut state = crate::watch::load(&path).unwrap();
+        assert!(state.compatible(11, 22));
+        assert!(!state.compatible(12, 22));
+        assert!(
+            state
+                .advance(&[result("192.0.2.1", 0, 0.02)], policy, |r| r.health_ok)
+                .changed
+        );
+        assert!(!state.advance(&[], policy, |r| r.health_ok).changed);
+        assert!(state.advance(&[], policy, |r| r.health_ok).changed);
+        assert!(state
+            .advance(&[result("192.0.2.1", 0, 0.02)], policy, |r| r.health_ok)
+            .stable_primary
+            .is_none());
+        assert!(state
+            .advance(&[result("192.0.2.1", 0, 0.02)], policy, |r| r.health_ok)
+            .stable_primary
+            .is_some());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn current_manifest_keeps_only_healthy_primary_and_backups() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.last_targets = vec!["192.0.2.1".to_string(), "192.0.2.2".to_string()];
+        app.results = vec![result("192.0.2.1", 0, 0.02), result("192.0.2.2", 1, 0.03)];
+        let manifest = build_current_manifest(&app);
+        assert_eq!(
+            manifest.primary.as_ref().map(|r| r.ip.as_str()),
+            Some("192.0.2.1")
+        );
+        assert_eq!(manifest.backups.len(), 1);
     }
 
     #[test]
@@ -2796,6 +2991,7 @@ mod tests {
         app.add_result(sampled);
         let mut empty = result("10.0.0.2", 2, 0.2);
         empty.ok = 0;
+        empty.health_ok = false;
         empty.samples.clear();
         app.add_result(empty);
         app.scan_complete = true;
@@ -2977,6 +3173,7 @@ mod tests {
         );
         let mut failed = result("192.0.2.2", 1, 0.2);
         failed.ok = 0;
+        failed.health_ok = false;
         failed.samples.clear();
         app.results = vec![failed, result("192.0.2.1", 0, 0.03)];
         app.open_speed_selection();
@@ -3004,6 +3201,7 @@ mod tests {
         );
         let mut failed = result("192.0.2.2", 1, 0.2);
         failed.ok = 0;
+        failed.health_ok = false;
         failed.protocol = "h3".to_string();
         app.results = vec![result("192.0.2.1", 0, 0.03), failed];
         app.open_speed_selection();
