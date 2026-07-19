@@ -31,6 +31,13 @@ pub enum SettingField {
     Top,
     StabilityWeight,
     LossWeight,
+    EarlyStop,
+    EarlyStopLossStreak,
+    EarlyStopMinSamples,
+    EarlyStopPrune,
+    EarlyStopPruneMargin,
+    TwoPhase,
+    DiscoverFraction,
 }
 
 const MAX_SAMPLE_PER_CIDR: usize = 10_000;
@@ -39,6 +46,8 @@ const MAX_CONCURRENCY: usize = 10_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 const MAX_CONNECT_TIMEOUT_MS: u64 = 600_000;
 const MAX_TOP: usize = 10_000;
+const MAX_EARLY_STOP_LOSS_STREAK: usize = 1_000;
+const MAX_EARLY_STOP_MIN_SAMPLES: usize = 1_000;
 const MAX_SPEED_PAYLOAD_MB: u64 = 1_024;
 const MAX_SPEED_REPETITIONS: usize = 100;
 const MAX_SPEED_TIMEOUT_MS: u64 = 3_600_000;
@@ -46,7 +55,7 @@ const MAX_SPEED_TIMEOUT_MS: u64 = 3_600_000;
 impl SettingField {
     /// All settings fields in display order, grouped by concern. Group
     /// boundaries are described by [`SettingField::GROUPS`].
-    pub const ALL: [SettingField; 15] = [
+    pub const ALL: [SettingField; 22] = [
         // Target
         SettingField::Host,
         SettingField::Path,
@@ -60,6 +69,14 @@ impl SettingField {
         // Ranking quality
         SettingField::StabilityWeight,
         SettingField::LossWeight,
+        // Adaptive scan
+        SettingField::EarlyStop,
+        SettingField::EarlyStopLossStreak,
+        SettingField::EarlyStopMinSamples,
+        SettingField::EarlyStopPrune,
+        SettingField::EarlyStopPruneMargin,
+        SettingField::TwoPhase,
+        SettingField::DiscoverFraction,
         // Speed test
         SettingField::DownloadPath,
         SettingField::UploadPath,
@@ -70,10 +87,11 @@ impl SettingField {
 
     /// Section headers and the number of consecutive fields in each, in the
     /// same order as [`SettingField::ALL`].
-    pub const GROUPS: [(&'static str, usize); 4] = [
+    pub const GROUPS: [(&'static str, usize); 5] = [
         ("Target", 2),
         ("Latency scan", 6),
         ("Ranking quality", 2),
+        ("Adaptive scan", 7),
         ("Speed test", 5),
     ];
 
@@ -94,6 +112,13 @@ impl SettingField {
             SettingField::Top => "Top results",
             SettingField::StabilityWeight => "Stability weight",
             SettingField::LossWeight => "Loss weight",
+            SettingField::EarlyStop => "Early stop",
+            SettingField::EarlyStopLossStreak => "Stop loss streak",
+            SettingField::EarlyStopMinSamples => "Stop min samples",
+            SettingField::EarlyStopPrune => "Prune to top-N",
+            SettingField::EarlyStopPruneMargin => "Prune margin",
+            SettingField::TwoPhase => "Two-phase scan",
+            SettingField::DiscoverFraction => "Discover fraction",
         }
     }
 
@@ -114,6 +139,13 @@ impl SettingField {
             SettingField::Top => "Number of fastest, zero-fail IP addresses to show in the final dashboard results table and export to files.",
             SettingField::StabilityWeight => "Weight of latency jitter in the recommendation score. Higher values rank a variable-latency (jittery) IP lower relative to a steadier one with similar average latency.",
             SettingField::LossWeight => "Weight of packet loss in the recommendation score. Higher values rank a lossy IP lower even when its success rate still looks usable.",
+            SettingField::EarlyStop => "Stop probing a target before its full probe budget once it is clearly dead (consecutive dropped probes) or clearly worse than the current top candidates. Saves wall-clock time on dead/timeout IPs.",
+            SettingField::EarlyStopLossStreak => "Number of consecutive dropped probes (timeouts / connect failures) after which a target is declared dead and stopped. Only applies once enough probes have completed.",
+            SettingField::EarlyStopMinSamples => "Minimum number of measured probes before any early-stop rule may fire, so a single first-timeout does not abort an otherwise-good target.",
+            SettingField::EarlyStopPrune => "Once at least 'Top results' READY candidates exist, stop probing targets whose current best score cannot beat that set by the prune margin.",
+            SettingField::EarlyStopPruneMargin => "How much better (as a fraction) a target's score must be versus the worst current top-N candidate to keep probing it under the prune rule.",
+            SettingField::TwoPhase => "Run a sparse discovery pass first, then spend the rest of the probe budget focusing on the CIDRs that produced the best Cloudflare colos. Finds good edges faster and densifies there.",
+            SettingField::DiscoverFraction => "Fraction of sample_per_cidr used for the discovery pass when two-phase scanning is enabled; the remainder is spent on the focused CIDRs.",
         }
     }
 
@@ -135,6 +167,31 @@ impl SettingField {
             SettingField::Top => args.top.to_string(),
             SettingField::StabilityWeight => args.stability_weight.to_string(),
             SettingField::LossWeight => args.loss_weight.to_string(),
+            SettingField::EarlyStop => {
+                if args.early_stop {
+                    "On".to_string()
+                } else {
+                    "Off".to_string()
+                }
+            }
+            SettingField::EarlyStopLossStreak => args.early_stop_loss_streak.to_string(),
+            SettingField::EarlyStopMinSamples => args.early_stop_min_samples.to_string(),
+            SettingField::EarlyStopPrune => {
+                if args.early_stop_prune {
+                    "On".to_string()
+                } else {
+                    "Off".to_string()
+                }
+            }
+            SettingField::EarlyStopPruneMargin => args.early_stop_prune_margin.to_string(),
+            SettingField::TwoPhase => {
+                if args.two_phase {
+                    "On".to_string()
+                } else {
+                    "Off".to_string()
+                }
+            }
+            SettingField::DiscoverFraction => args.discover_fraction.to_string(),
         }
     }
 
@@ -145,6 +202,9 @@ impl SettingField {
                 | SettingField::Path
                 | SettingField::DownloadPath
                 | SettingField::UploadPath
+                | SettingField::EarlyStop
+                | SettingField::EarlyStopPrune
+                | SettingField::TwoPhase
         )
     }
 
@@ -155,6 +215,8 @@ impl SettingField {
             SettingField::SamplePerCidr => 10,
             SettingField::SpeedPayloadMb => 10,
             SettingField::SpeedTimeoutMs => 1_000,
+            SettingField::EarlyStopPruneMargin => 5,
+            SettingField::DiscoverFraction => 5,
             _ => 1,
         }
     }
@@ -170,10 +232,17 @@ impl SettingField {
             SettingField::SpeedPayloadMb => MAX_SPEED_PAYLOAD_MB as i64,
             SettingField::SpeedRepetitions => MAX_SPEED_REPETITIONS as i64,
             SettingField::SpeedTimeoutMs => MAX_SPEED_TIMEOUT_MS as i64,
+            SettingField::EarlyStopLossStreak => MAX_EARLY_STOP_LOSS_STREAK as i64,
+            SettingField::EarlyStopMinSamples => MAX_EARLY_STOP_MIN_SAMPLES as i64,
+            SettingField::EarlyStopPruneMargin => i64::MAX,
+            SettingField::DiscoverFraction => i64::MAX,
             SettingField::Host
             | SettingField::Path
             | SettingField::DownloadPath
             | SettingField::UploadPath
+            | SettingField::EarlyStop
+            | SettingField::EarlyStopPrune
+            | SettingField::TwoPhase
             | SettingField::StabilityWeight
             | SettingField::LossWeight => i64::MAX,
         }
@@ -198,6 +267,16 @@ impl SettingField {
                 args.loss_weight = (args.loss_weight + direction as f64 * 0.1).max(0.0);
                 return;
             }
+            SettingField::EarlyStopPruneMargin => {
+                args.early_stop_prune_margin =
+                    (args.early_stop_prune_margin + direction as f64 * 0.05).max(0.0);
+                return;
+            }
+            SettingField::DiscoverFraction => {
+                args.discover_fraction =
+                    (args.discover_fraction + direction as f64 * 0.05).max(0.0);
+                return;
+            }
             _ => {}
         }
         let value = self.value_string(args).parse::<i64>().unwrap_or(1);
@@ -209,6 +288,9 @@ impl SettingField {
             SettingField::TimeoutMs => args.timeout_ms = value as u64,
             SettingField::ConnectTimeoutMs => args.connect_timeout_ms = value as u64,
             SettingField::Top => args.top = value as usize,
+            SettingField::EarlyStopLossStreak => args.early_stop_loss_streak = value as usize,
+            SettingField::EarlyStopMinSamples => args.early_stop_min_samples = value as usize,
+            SettingField::DiscoverFraction => args.discover_fraction = value as f64 / 100.0,
             SettingField::SpeedPayloadMb => args.speed_payload_bytes = value as u64 * 1024 * 1024,
             SettingField::SpeedRepetitions => args.speed_repetitions = value as usize,
             SettingField::SpeedTimeoutMs => args.speed_timeout_ms = value as u64,
@@ -216,6 +298,10 @@ impl SettingField {
             | SettingField::Path
             | SettingField::DownloadPath
             | SettingField::UploadPath
+            | SettingField::EarlyStop
+            | SettingField::EarlyStopPrune
+            | SettingField::EarlyStopPruneMargin
+            | SettingField::TwoPhase
             | SettingField::StabilityWeight
             | SettingField::LossWeight => {}
         }
@@ -350,6 +436,70 @@ impl SettingField {
                     return Err("must be a non-negative number".to_string());
                 }
                 args.loss_weight = v;
+            }
+            SettingField::EarlyStop => {
+                let lowered = raw.to_lowercase();
+                args.early_stop = match lowered.as_str() {
+                    "on" | "true" | "1" | "yes" => true,
+                    "off" | "false" | "0" | "no" => false,
+                    _ => return Err("enter on or off".to_string()),
+                };
+            }
+            SettingField::EarlyStopLossStreak => {
+                let v = raw
+                    .parse::<usize>()
+                    .map_err(|_| "invalid number".to_string())?;
+                if !(1..=MAX_EARLY_STOP_LOSS_STREAK).contains(&v) {
+                    return Err(format!(
+                        "must be between 1 and {MAX_EARLY_STOP_LOSS_STREAK}"
+                    ));
+                }
+                args.early_stop_loss_streak = v;
+            }
+            SettingField::EarlyStopMinSamples => {
+                let v = raw
+                    .parse::<usize>()
+                    .map_err(|_| "invalid number".to_string())?;
+                if !(1..=MAX_EARLY_STOP_MIN_SAMPLES).contains(&v) {
+                    return Err(format!(
+                        "must be between 1 and {MAX_EARLY_STOP_MIN_SAMPLES}"
+                    ));
+                }
+                args.early_stop_min_samples = v;
+            }
+            SettingField::EarlyStopPrune => {
+                let lowered = raw.to_lowercase();
+                args.early_stop_prune = match lowered.as_str() {
+                    "on" | "true" | "1" | "yes" => true,
+                    "off" | "false" | "0" | "no" => false,
+                    _ => return Err("enter on or off".to_string()),
+                };
+            }
+            SettingField::EarlyStopPruneMargin => {
+                let v = raw
+                    .parse::<f64>()
+                    .map_err(|_| "invalid number".to_string())?;
+                if !v.is_finite() || v < 0.0 {
+                    return Err("must be a non-negative number".to_string());
+                }
+                args.early_stop_prune_margin = v;
+            }
+            SettingField::TwoPhase => {
+                let lowered = raw.to_lowercase();
+                args.two_phase = match lowered.as_str() {
+                    "on" | "true" | "1" | "yes" => true,
+                    "off" | "false" | "0" | "no" => false,
+                    _ => return Err("enter on or off".to_string()),
+                };
+            }
+            SettingField::DiscoverFraction => {
+                let v = raw
+                    .parse::<f64>()
+                    .map_err(|_| "invalid number".to_string())?;
+                if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                    return Err("must be a number between 0 and 1".to_string());
+                }
+                args.discover_fraction = v;
             }
         }
         Ok(())
@@ -735,6 +885,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
             .unwrap_or(1.0);
         let (min, max) = match current_field {
             SettingField::StabilityWeight | SettingField::LossWeight => (0.0, 10.0),
+            SettingField::EarlyStopPruneMargin | SettingField::DiscoverFraction => (0.0, 1.0),
             _ => (1.0, (current_field.max_value().min(1_000_000)) as f64),
         };
         let state = SliderState::new(value.clamp(min, max), min, max);
@@ -878,6 +1029,14 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
         Line::from(vec![
             Span::styled("Total Probes: ", theme::title_style()),
             Span::raw(total_probes.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Early Stop  : ", theme::title_style()),
+            Span::raw(if app.config.early_stop {
+                "enabled (upper bound)"
+            } else {
+                "disabled"
+            }),
         ]),
         Line::from(vec![
             Span::styled("Est Duration: ", theme::title_style()),
@@ -1239,6 +1398,13 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             app.config.timeout_ms = 2500;
             app.config.connect_timeout_ms = 1000;
             app.config.top = 50;
+            app.config.early_stop = true;
+            app.config.early_stop_loss_streak = 5;
+            app.config.early_stop_min_samples = 3;
+            app.config.early_stop_prune = true;
+            app.config.early_stop_prune_margin = 0.2;
+            app.config.two_phase = false;
+            app.config.discover_fraction = 0.25;
             app.invalidate_preview();
             app.toast_success("Preset Applied: Default");
             app.save_config();
@@ -1250,6 +1416,13 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             app.config.timeout_ms = 1500;
             app.config.connect_timeout_ms = 500;
             app.config.top = 25;
+            app.config.early_stop = true;
+            app.config.early_stop_loss_streak = 4;
+            app.config.early_stop_min_samples = 2;
+            app.config.early_stop_prune = true;
+            app.config.early_stop_prune_margin = 0.2;
+            app.config.two_phase = true;
+            app.config.discover_fraction = 0.25;
             app.invalidate_preview();
             app.toast_success("Preset Applied: Fast Scan");
             app.save_config();
@@ -1261,6 +1434,13 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             app.config.timeout_ms = 3500;
             app.config.connect_timeout_ms = 1500;
             app.config.top = 100;
+            app.config.early_stop = true;
+            app.config.early_stop_loss_streak = 8;
+            app.config.early_stop_min_samples = 5;
+            app.config.early_stop_prune = true;
+            app.config.early_stop_prune_margin = 0.1;
+            app.config.two_phase = false;
+            app.config.discover_fraction = 0.25;
             app.invalidate_preview();
             app.toast_success("Preset Applied: Thorough Scan");
             app.save_config();

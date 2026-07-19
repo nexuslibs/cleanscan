@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
@@ -104,6 +104,35 @@ fn percentile(sorted: &[f64], pct: f64) -> f64 {
     }
     let idx = ((sorted.len() as f64 * pct).ceil() as usize).saturating_sub(1);
     sorted[idx.min(sorted.len() - 1)]
+}
+
+/// Recommendation score blending reliability, latency, jitter, and packet loss.
+/// A fast but jittery/lossy target is penalized so a slightly slower, steadier
+/// one can outrank it. Mirrors the scoring in `TargetState::result` but takes
+/// the raw inputs so it can be used for in-scan decisions without building a
+/// full `ProbeResult`.
+fn score_from_samples(
+    samples: &[f64],
+    completed: usize,
+    loss: usize,
+    stability_weight: f64,
+    loss_weight: f64,
+) -> f64 {
+    let ok = samples.len();
+    if ok == 0 {
+        return 0.0;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p50 = percentile(&sorted, 0.50);
+    let p95 = percentile(&sorted, 0.95);
+    let max = sorted.last().copied().unwrap_or(0.0);
+    let jitter = (p95 - p50).max(0.0);
+    let total = completed.max(1);
+    let reliability = ok as f64 / total as f64;
+    let latency_penalty = max.max(0.001);
+    let loss_penalty = loss as f64 / total as f64;
+    reliability / (latency_penalty + stability_weight * jitter + loss_weight * loss_penalty)
 }
 
 fn random_ip_from_net(net: IpNet, rng: &mut impl Rng) -> Option<IpAddr> {
@@ -390,6 +419,11 @@ struct TargetState {
     warmup_discard_first: bool,
     stability_weight: f64,
     loss_weight: f64,
+    /// Number of consecutive dropped probes (timeouts / connect failures).
+    /// Reset on any successful probe; drives the early-stop loss-streak rule.
+    loss_streak: usize,
+    /// Whether this target was stopped before exhausting its probe budget.
+    stopped_early: bool,
 }
 
 impl TargetState {
@@ -426,11 +460,25 @@ impl TargetState {
             warmup_discard_first: false,
             stability_weight: args.stability_weight,
             loss_weight: args.loss_weight,
+            loss_streak: 0,
+            stopped_early: false,
         }
     }
 
     fn has_remaining_probe(&self, probe_count: usize) -> bool {
-        self.warmup_done && self.scheduled < probe_count && !self.in_flight
+        self.warmup_done && self.scheduled < probe_count && !self.in_flight && !self.stopped_early
+    }
+
+    /// Current best recommendation score from the samples gathered so far,
+    /// used by the early-stop prune rule to compare against the leaderboard.
+    fn current_score(&self) -> f64 {
+        score_from_samples(
+            &self.samples,
+            self.completed,
+            self.loss,
+            self.stability_weight,
+            self.loss_weight,
+        )
     }
 
     fn result(&mut self) -> ProbeResult {
@@ -458,21 +506,13 @@ impl TargetState {
         let total = self.completed.max(1);
         let success_rate = ok as f64 / total as f64;
         let packet_loss = self.loss as f64 / total as f64;
-        // Blend reliability, latency, jitter, and packet loss into a single
-        // recommendation score. A fast but jittery/lossy IP is penalized so a
-        // slightly slower, steadier one can outrank it.
-        let score = if ok > 0 {
-            let reliability = ok as f64 / total as f64;
-            let latency_penalty = max.max(0.001);
-            let jitter_penalty = jitter;
-            let loss_penalty = packet_loss.max(0.0);
-            reliability
-                / (latency_penalty
-                    + self.stability_weight * jitter_penalty
-                    + self.loss_weight * loss_penalty)
-        } else {
-            0.0
-        };
+        let score = score_from_samples(
+            &self.samples,
+            self.completed,
+            self.loss,
+            self.stability_weight,
+            self.loss_weight,
+        );
 
         ProbeResult {
             ip: self.ip.clone(),
@@ -577,6 +617,60 @@ fn select_next_target(states: &[TargetState], probe_count: usize) -> Option<usiz
         .map(|(index, _)| index)
 }
 
+/// Decide whether a target should stop being probed before its full probe
+/// budget is exhausted. Returns `true` when any early-stop rule applies:
+///  * loss streak: `early_stop_loss_streak` consecutive dropped probes;
+///  * low success: success rate below `early_stop_success_floor`;
+///  * prune: at least `top` READY candidates exist and this target's current
+///    best score cannot beat the worst of them by `early_stop_prune_margin`.
+///
+/// `best` is the running leaderboard of `(score, p95)` for completed targets,
+/// capped at `top` entries (see `record_best`).
+fn should_stop_early(state: &TargetState, cfg: &AppConfig, best: &[(f64, f64)]) -> bool {
+    if !cfg.early_stop {
+        return false;
+    }
+
+    if state.completed >= cfg.early_stop_min_samples
+        && state.loss_streak >= cfg.early_stop_loss_streak
+    {
+        return true;
+    }
+
+    if state.completed >= cfg.early_stop_min_samples {
+        let rate = state.samples.len() as f64 / state.completed.max(1) as f64;
+        if rate < cfg.early_stop_success_floor {
+            return true;
+        }
+    }
+
+    if cfg.early_stop_prune
+        && best.len() >= cfg.top
+        && state.samples.len() >= cfg.early_stop_min_samples
+    {
+        let current = state.current_score();
+        let worst_top = best[best.len() - 1].0;
+        if current < worst_top / (1.0 + cfg.early_stop_prune_margin) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Insert a completed result into the running top-`top` leaderboard, sorted by
+/// score descending. Targets with no successful samples are ignored.
+fn record_best(best: &mut Vec<(f64, f64)>, result: &ProbeResult, top: usize) {
+    if result.ok == 0 {
+        return;
+    }
+    best.push((result.score, result.p95));
+    best.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    if best.len() > top {
+        best.truncate(top);
+    }
+}
+
 /// Outcome of a single scheduled probe: a discarded connection-warmup probe
 /// or a counted steady-state latency probe.
 enum ProbeOutcome {
@@ -615,6 +709,10 @@ pub async fn run_scan(
             let _ = tx.send(state.result());
         }
     }
+
+    // Running leaderboard of the best READY results so far, used by the
+    // early-stop prune rule. Capped at `top` entries.
+    let mut best: Vec<(f64, f64)> = Vec::new();
 
     let mut cancellation = Box::pin(async {
         while !cancel.load(Ordering::Relaxed) {
@@ -755,6 +853,7 @@ pub async fn run_scan(
                                         state.colo = colo;
                                     }
                                 } else {
+                                    state.loss_streak = 0;
                                     state.samples.push(value);
                                     state.protocols.push(protocol);
                                     if state.colo.is_none() {
@@ -766,12 +865,24 @@ pub async fn run_scan(
                                 state.fail += 1;
                                 if is_loss_reason(&reason) {
                                     state.loss += 1;
+                                    state.loss_streak += 1;
                                 }
                                 state.failures.push(reason);
                             }
                         }
-                        if state.completed == probe_count {
-                            let _ = tx.send(state.result());
+                        if should_stop_early(state, &args, &best) {
+                            // Target is dead or cannot beat the current
+                            // leaderboard; stop probing it and emit a partial
+                            // result now rather than spending the full budget.
+                            state.stopped_early = true;
+                            state.completed = probe_count;
+                            let result = state.result();
+                            record_best(&mut best, &result, args.top);
+                            let _ = tx.send(result);
+                        } else if state.completed == probe_count {
+                            let result = state.result();
+                            record_best(&mut best, &result, args.top);
+                            let _ = tx.send(result);
                         }
                     }
                 }
@@ -780,11 +891,158 @@ pub async fn run_scan(
     }
 }
 
+/// Select which CIDRs to focus the second phase on, given the discovery-pass
+/// results. When `prefer_colo` is set, focus the CIDRs that produced that colo;
+/// otherwise focus the CIDRs whose best discovery score ranks in the top `top`.
+fn select_focus_cidrs(
+    phase1: &[ProbeResult],
+    selected_cidrs: &[String],
+    prefer_colo: Option<&str>,
+    top: usize,
+) -> Vec<String> {
+    let nets: Vec<(IpNet, String)> = selected_cidrs
+        .iter()
+        .filter_map(|c| IpNet::from_str(c).ok().map(|n| (n, c.clone())))
+        .collect();
+
+    if let Some(want) = prefer_colo {
+        let want = want.to_ascii_uppercase();
+        let mut focus = Vec::new();
+        for r in phase1 {
+            if r.ok == 0 {
+                continue;
+            }
+            let Some(colo) = r.colo.as_deref() else {
+                continue;
+            };
+            if !colo.eq_ignore_ascii_case(&want) {
+                continue;
+            }
+            if let Ok(ip) = IpAddr::from_str(&r.ip) {
+                if let Some((_, cidr)) = nets.iter().find(|(n, _)| n.contains(&ip)) {
+                    if !focus.contains(cidr) {
+                        focus.push(cidr.clone());
+                    }
+                }
+            }
+        }
+        return focus;
+    }
+
+    let mut best: BTreeMap<String, f64> = BTreeMap::new();
+    for r in phase1 {
+        if r.ok == 0 {
+            continue;
+        }
+        if let Ok(ip) = IpAddr::from_str(&r.ip) {
+            if let Some((_, cidr)) = nets.iter().find(|(n, _)| n.contains(&ip)) {
+                let entry = best.entry(cidr.clone()).or_insert(0.0);
+                if r.score > *entry {
+                    *entry = r.score;
+                }
+            }
+        }
+    }
+    let mut ranked: Vec<(f64, String)> = best.into_iter().map(|(c, s)| (s, c)).collect();
+    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.into_iter().take(top).map(|(_, c)| c).collect()
+}
+
+/// Run a two-phase, colo-aware scan. With `two_phase` disabled, or when no
+/// CIDRs are supplied, this delegates to `run_scan` over the full target set.
+/// Otherwise it runs a sparse discovery pass, then allocates the remaining
+/// probe budget to CIDRs that produced the best Cloudflare colos.
+pub async fn run_scan_two_phase(
+    selected_cidrs: Vec<String>,
+    config: Arc<AppConfig>,
+    prefer_colo: Option<String>,
+    tx: std::sync::mpsc::Sender<ProbeResult>,
+    cancel: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+) {
+    if !config.two_phase || selected_cidrs.is_empty() {
+        let targets = collect_from_cidrs_with_seed(
+            &selected_cidrs,
+            config.sample_per_cidr,
+            if config.seed == 0 {
+                rand::random()
+            } else {
+                config.seed
+            },
+        )
+        .expect("selected CIDRs must be valid for single-phase scan");
+        run_scan(targets, config, tx, cancel, paused).await;
+        return;
+    }
+
+    let discover_per = (config.sample_per_cidr as f64 * config.discover_fraction)
+        .max(1.0)
+        .round() as usize;
+    let focus_per = config.sample_per_cidr.saturating_sub(discover_per).max(1);
+    let base_seed = if config.seed == 0 {
+        rand::random()
+    } else {
+        config.seed
+    };
+
+    // Discovery pass.
+    let (p1_tx, p1_rx) = std::sync::mpsc::channel();
+    let targets1 = collect_from_cidrs_with_seed(&selected_cidrs, discover_per, base_seed)
+        .expect("selected CIDRs must be valid for discovery pass");
+    run_scan(
+        targets1,
+        config.clone(),
+        p1_tx,
+        cancel.clone(),
+        paused.clone(),
+    )
+    .await;
+    let phase1: Vec<ProbeResult> = p1_rx.iter().collect();
+    for result in &phase1 {
+        let _ = tx.send(result.clone());
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let focus = select_focus_cidrs(&phase1, &selected_cidrs, prefer_colo.as_deref(), config.top);
+    let focus_set: BTreeSet<String> = focus.iter().cloned().collect();
+
+    // Focus pass: oversample the CIDRs that produced good colos; keep a light
+    // top-up on the rest. A different seed avoids re-probing identical IPs.
+    let focus_seed = base_seed
+        .wrapping_mul(2)
+        .wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut targets2: BTreeSet<String> = BTreeSet::new();
+    let mut rng = StdRng::seed_from_u64(focus_seed);
+    for cidr in &selected_cidrs {
+        let net = match IpNet::from_str(cidr) {
+            Ok(net) => net,
+            Err(_) => continue,
+        };
+        let per = if focus_set.contains(cidr) {
+            focus_per
+        } else {
+            discover_per
+        };
+        for _ in 0..per {
+            if let Some(ip) = random_ip_from_net(net, &mut rng) {
+                targets2.insert(ip.to_string());
+            }
+        }
+    }
+
+    if !targets2.is_empty() {
+        run_scan(targets2.into_iter().collect(), config, tx, cancel, paused).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        cidr_valid, collect_from_cidrs_with_seed, parse_colo, result_confidence, result_status,
-        select_next_target, TargetState,
+        cidr_valid, collect_from_cidrs_with_seed, parse_colo, record_best, result_confidence,
+        result_status, select_focus_cidrs, select_next_target, should_stop_early, ProbeResult,
+        TargetState,
     };
     use crate::config::AppConfig;
 
@@ -814,6 +1072,8 @@ mod tests {
             warmup_discard_first: false,
             stability_weight: 1.0,
             loss_weight: 1.0,
+            loss_streak: 0,
+            stopped_early: false,
         }
     }
 
@@ -953,6 +1213,8 @@ mod tests {
             warmup_discard_first: false,
             stability_weight: 1.0,
             loss_weight: 1.0,
+            loss_streak: 0,
+            stopped_early: false,
         };
         let result = state.result();
         // Steady-state only: cold_ms is separate and samples exclude the warmup.
@@ -985,6 +1247,8 @@ mod tests {
             warmup_discard_first: false,
             stability_weight: 1.0,
             loss_weight: 1.0,
+            loss_streak: 0,
+            stopped_early: false,
         };
         let result = state.result();
         // sorted samples [0.10, 0.20, 0.30]: p50 = 0.20, p95 = 0.30.
@@ -1021,6 +1285,8 @@ mod tests {
             warmup_discard_first: false,
             stability_weight: 1.0,
             loss_weight: 0.0,
+            loss_streak: 0,
+            stopped_early: false,
         }
         .result();
         let jittery = TargetState {
@@ -1042,6 +1308,8 @@ mod tests {
             warmup_discard_first: false,
             stability_weight: 1.0,
             loss_weight: 0.0,
+            loss_streak: 0,
+            stopped_early: false,
         }
         .result();
         assert_eq!(steady.p95, jittery.p95);
@@ -1070,6 +1338,8 @@ mod tests {
             warmup_discard_first: false,
             stability_weight: 0.0,
             loss_weight: 1.0,
+            loss_streak: 0,
+            stopped_early: false,
         }
         .result();
         let lossy = TargetState {
@@ -1091,10 +1361,206 @@ mod tests {
             warmup_discard_first: false,
             stability_weight: 0.0,
             loss_weight: 1.0,
+            loss_streak: 0,
+            stopped_early: false,
         }
         .result();
         assert_eq!(reliable.success_rate, lossy.success_rate);
         assert!(reliable.packet_loss < lossy.packet_loss);
         assert!(reliable.score > lossy.score);
+    }
+
+    fn early_stop_config() -> AppConfig {
+        AppConfig {
+            early_stop: true,
+            early_stop_loss_streak: 5,
+            early_stop_min_samples: 3,
+            early_stop_success_floor: 0.5,
+            early_stop_prune: true,
+            early_stop_prune_margin: 0.2,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn score_from_samples_matches_result_score() {
+        // The shared scoring helper must agree with the full ProbeResult score.
+        let mut state = TargetState {
+            ip: "192.0.2.1".to_string(),
+            url: String::new(),
+            client: None,
+            samples: vec![0.10, 0.20, 0.30],
+            protocols: vec!["h2".to_string(); 3],
+            fail: 1,
+            loss: 1,
+            scheduled: 4,
+            completed: 4,
+            in_flight: false,
+            failures: vec!["request timeout".to_string()],
+            colo: None,
+            cold_ms: None,
+            warmup_done: true,
+            warmup_in_flight: false,
+            warmup_discard_first: false,
+            stability_weight: 1.0,
+            loss_weight: 1.0,
+            loss_streak: 0,
+            stopped_early: false,
+        };
+        let cfg = early_stop_config();
+        let expected = state.result().score;
+        assert!((state.current_score() - expected).abs() < 1e-12);
+        let _ = cfg;
+    }
+
+    #[test]
+    fn early_stop_fires_on_loss_streak_after_min_samples() {
+        // Isolate the loss-streak rule by disabling the low-success-rate rule.
+        let mut cfg = early_stop_config();
+        cfg.early_stop_success_floor = 0.0;
+        let mut s = state("192.0.2.1", 0, 0, &[], 0);
+        // Four losses, below the 5-streak threshold but at min_samples: rate is 0.
+        for _ in 0..4 {
+            s.completed += 1;
+            s.loss_streak += 1;
+        }
+        assert!(!should_stop_early(&s, &cfg, &[]));
+        // Fifth consecutive loss crosses the streak threshold.
+        s.completed += 1;
+        s.loss_streak += 1;
+        assert!(should_stop_early(&s, &cfg, &[]));
+    }
+
+    #[test]
+    fn early_stop_fires_on_low_success_rate() {
+        let cfg = early_stop_config();
+        let s = state("192.0.2.1", 3, 3, &[0.1], 2);
+        // 1 success out of 3 completed => 0.33 < 0.5 floor.
+        assert!(should_stop_early(&s, &cfg, &[]));
+    }
+
+    #[test]
+    fn early_stop_does_not_fire_before_min_samples() {
+        let cfg = early_stop_config();
+        let s = state("192.0.2.1", 1, 1, &[], 1);
+        // A single failure must not abort a target prematurely.
+        assert!(!should_stop_early(&s, &cfg, &[]));
+    }
+
+    #[test]
+    fn early_stop_prunes_clearly_worse_targets() {
+        let cfg = early_stop_config();
+        // Leaderboard already full of strong candidates (score ~ high).
+        let best: Vec<(f64, f64)> = vec![(10.0, 0.05); cfg.top];
+        let worse = state("192.0.2.9", 4, 4, &[0.9, 0.9, 0.9, 0.9], 0);
+        // 0.9s latency => far below the leaderboard's score; should be pruned.
+        assert!(should_stop_early(&worse, &cfg, &best));
+    }
+
+    #[test]
+    fn early_stop_disabled_by_config() {
+        let mut cfg = early_stop_config();
+        cfg.early_stop = false;
+        let mut s = state("192.0.2.1", 6, 6, &[], 6);
+        s.loss_streak = 6;
+        assert!(!should_stop_early(&s, &cfg, &[]));
+    }
+
+    #[test]
+    fn record_best_keeps_top_scores_sorted() {
+        let mut best: Vec<(f64, f64)> = Vec::new();
+        let make = |score: f64| ProbeResult {
+            ip: String::new(),
+            protocol: String::new(),
+            ok: 1,
+            fail: 0,
+            completed: 1,
+            avg: 0.0,
+            p50: 0.0,
+            p90: 0.0,
+            p95: 0.0,
+            max: 0.0,
+            jitter: 0.0,
+            stddev: 0.0,
+            loss: 0,
+            packet_loss: 0.0,
+            samples: vec![0.1],
+            failures: Vec::new(),
+            success_rate: 1.0,
+            score,
+            colo: None,
+            country: None,
+            cold_ms: None,
+        };
+        for s in [1.0, 5.0, 3.0, 9.0, 2.0] {
+            record_best(&mut best, &make(s), 3);
+        }
+        assert_eq!(best.len(), 3);
+        assert_eq!(best[0].0, 9.0);
+        assert_eq!(best[1].0, 5.0);
+        assert_eq!(best[2].0, 3.0);
+    }
+
+    fn focus_result(ip: &str, colo: Option<&str>, score: f64, ok: usize) -> ProbeResult {
+        ProbeResult {
+            ip: ip.to_string(),
+            protocol: String::new(),
+            ok,
+            fail: 0,
+            completed: ok,
+            avg: 0.0,
+            p50: 0.0,
+            p90: 0.0,
+            p95: 0.0,
+            max: 0.0,
+            jitter: 0.0,
+            stddev: 0.0,
+            loss: 0,
+            packet_loss: 0.0,
+            samples: vec![0.1; ok],
+            failures: Vec::new(),
+            success_rate: 1.0,
+            score,
+            colo: colo.map(|c| c.to_string()),
+            country: None,
+            cold_ms: None,
+        }
+    }
+
+    #[test]
+    fn select_focus_cidrs_prefers_named_colo() {
+        let cidrs = vec!["192.0.2.0/24".to_string(), "198.51.100.0/24".to_string()];
+        let phase1 = vec![
+            focus_result("192.0.2.5", Some("FRA"), 9.0, 4),
+            focus_result("198.51.100.5", Some("AMS"), 8.0, 4),
+        ];
+        let focus = select_focus_cidrs(&phase1, &cidrs, Some("FRA"), 50);
+        assert_eq!(focus, vec!["192.0.2.0/24".to_string()]);
+    }
+
+    #[test]
+    fn select_focus_cidrs_ranks_by_score() {
+        let cidrs = vec!["192.0.2.0/24".to_string(), "198.51.100.0/24".to_string()];
+        let phase1 = vec![
+            focus_result("192.0.2.5", Some("FRA"), 9.0, 4),
+            focus_result("198.51.100.5", Some("AMS"), 8.0, 4),
+        ];
+        // top=1 keeps only the highest-scoring CIDR.
+        let focus = select_focus_cidrs(&phase1, &cidrs, None, 1);
+        assert_eq!(focus, vec!["192.0.2.0/24".to_string()]);
+        // top=2 keeps both.
+        let focus2 = select_focus_cidrs(&phase1, &cidrs, None, 2);
+        assert_eq!(focus2.len(), 2);
+    }
+
+    #[test]
+    fn select_focus_cidrs_ignores_failed_targets() {
+        let cidrs = vec!["192.0.2.0/24".to_string(), "198.51.100.0/24".to_string()];
+        let phase1 = vec![
+            focus_result("192.0.2.5", Some("FRA"), 9.0, 0),
+            focus_result("198.51.100.5", Some("AMS"), 8.0, 4),
+        ];
+        let focus = select_focus_cidrs(&phase1, &cidrs, None, 1);
+        assert_eq!(focus, vec!["198.51.100.0/24".to_string()]);
     }
 }
