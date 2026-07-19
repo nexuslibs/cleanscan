@@ -847,7 +847,7 @@ fn render_decision_panel(app: &App, frame: &mut Frame, area: Rect) {
         )));
     }
     lines.push(Line::from(Span::styled(
-        "Ranking: recommendation score first, then p95, jitter, and packet loss • f: show failures",
+        "Ranking: recommendation score first, then success rate, p95, jitter, packet loss, and average latency • f: show failures",
         theme::hint_style(),
     )));
     frame.render_widget(

@@ -1413,7 +1413,8 @@ impl App {
                     self.column_picker_cursor = self.column_picker_cursor.saturating_sub(1)
                 }
                 KeyCode::Down => {
-                    self.column_picker_cursor = (self.column_picker_cursor + 1).min(11)
+                    self.column_picker_cursor = (self.column_picker_cursor + 1)
+                        .min(dashboard::RESULT_COLUMNS.len().saturating_sub(1))
                 }
                 KeyCode::Char(' ') | KeyCode::Enter => self.toggle_column(),
                 _ => {}
@@ -1603,7 +1604,9 @@ impl App {
             Action::ConfigureColumns => {
                 if self.screen == Screen::Scanning {
                     self.show_column_picker = true;
-                    self.column_picker_cursor = self.column_picker_cursor.min(11);
+                    self.column_picker_cursor = self
+                        .column_picker_cursor
+                        .min(dashboard::RESULT_COLUMNS.len().saturating_sub(1));
                 }
             }
             Action::Confirm => {

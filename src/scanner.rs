@@ -464,7 +464,7 @@ impl TargetState {
         let score = if ok > 0 {
             let reliability = ok as f64 / total as f64;
             let latency_penalty = max.max(0.001);
-            let jitter_penalty = jitter.max(0.0001);
+            let jitter_penalty = jitter;
             let loss_penalty = packet_loss.max(0.0);
             reliability
                 / (latency_penalty

@@ -142,7 +142,8 @@ The following parameters are editable, with the same meaning as their CLI
 counterparts: `Host` (`--host`), `Path` (`--path`), `Sample per CIDR`
 (`--sample-per-cidr`), `Probes` (`--probes`), `Concurrency` (`--concurrency`),
 `Timeout (ms)` (`--timeout-ms`), `Connect timeout (ms)` (`--connect-timeout-ms`),
-and `Top results` (`--top`). Speed-test settings are also editable: download
+`Top results` (`--top`), `Stability weight` (`--stability-weight`, default `1.0`),
+and `Loss weight` (`--loss-weight`, default `1.0`). Speed-test settings are also editable: download
 path, upload path, payload size in MB, repetition count, and speed timeout (ms).
 Target-source flags such as `--cidr` and `--ips` are selected before launching
 the TUI and are not edited in this screen.
