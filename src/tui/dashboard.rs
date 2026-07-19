@@ -898,6 +898,12 @@ fn render_decision_panel(app: &App, frame: &mut Frame, area: Rect) {
             theme::warn_style(),
         )));
     }
+    if let Some(alert) = &app.alert_message {
+        lines.push(Line::from(Span::styled(
+            format!("Alert: {alert}"),
+            theme::bad_style(),
+        )));
+    }
     lines.push(Line::from(Span::styled(
         "Ranking: recommendation score first, then success rate, p95, jitter, packet loss, and average latency • f: show failures",
         theme::hint_style(),

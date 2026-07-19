@@ -305,6 +305,13 @@ pub struct App {
     pub watch_interval: Option<Duration>,
     pub watch_cycle: u64,
     pub watch_due: Option<Instant>,
+    pub manifest_path: Option<String>,
+    pub manifest_thresholds: crate::HealthThresholds,
+    pub manifest_min_confidence: String,
+    pub manifest_backups: usize,
+    pub last_watch_primary: Option<String>,
+    pub last_watch_healthy: Option<bool>,
+    pub alert_message: Option<String>,
     /// Animation lifecycle state for each modal layer, driven by `render`.
     pub help_overlay: OverlayState,
     pub quit_overlay: OverlayState,
@@ -559,6 +566,16 @@ impl App {
             watch_interval: None,
             watch_cycle: 0,
             watch_due: None,
+            manifest_path: None,
+            manifest_thresholds: crate::HealthThresholds {
+                min_success_rate: None,
+                max_p95_ms: None,
+            },
+            manifest_min_confidence: "UNKNOWN".to_string(),
+            manifest_backups: 3,
+            last_watch_primary: None,
+            last_watch_healthy: None,
+            alert_message: None,
             help_overlay: modal_state(),
             quit_overlay: modal_state(),
             speed_confirm_overlay: modal_state(),
@@ -1100,13 +1117,60 @@ fn ranked_export_results(results: &[ProbeResult], top: usize) -> Vec<&ProbeResul
     ranked
 }
 
+fn compute_watch_alerts(
+    cycle: u64,
+    previous_primary: Option<&str>,
+    previous_healthy: Option<bool>,
+    recommendation: Option<&str>,
+    healthy: bool,
+) -> Vec<String> {
+    let mut alerts = Vec::new();
+    if cycle > 1 && previous_primary != recommendation {
+        alerts.push("recommended target changed".to_string());
+    }
+    if cycle > 1 && !healthy && previous_healthy != Some(false) {
+        alerts.push("no healthy target".to_string());
+    }
+    alerts
+}
+
+fn build_current_manifest(app: &App) -> crate::Manifest {
+    crate::build_manifest(
+        &app.config,
+        app.last_targets.clone(),
+        &app.results,
+        app.manifest_thresholds,
+        &app.manifest_min_confidence,
+        app.manifest_backups,
+    )
+}
+
+fn queue_manifest_write(
+    path: &str,
+    manifest: crate::Manifest,
+    result_tx: &std::sync::mpsc::Sender<Result<(), String>>,
+) {
+    let path = path.to_string();
+    let result_tx = result_tx.clone();
+    std::thread::spawn(move || {
+        let result = crate::write_manifest(&path, &manifest).map_err(|error| error.to_string());
+        let _ = result_tx.send(result);
+    });
+}
+
 /// Run the full TUI loop.
+#[allow(clippy::too_many_arguments)]
 pub fn run_tui(
     config: AppConfig,
     cli_cidr: Vec<String>,
     cli_ips: Option<String>,
     explicit_seed: Option<u64>,
     watch_interval: Option<u64>,
+    manifest_path: Option<String>,
+    min_success_rate: Option<f64>,
+    max_p95_ms: Option<f64>,
+    manifest_min_confidence: String,
+    manifest_backups: usize,
 ) -> anyhow::Result<()> {
     let has_cli_targets = cli_ips.is_some() || !cli_cidr.is_empty();
 
@@ -1121,6 +1185,7 @@ pub fn run_tui(
     let config_arc = Arc::new(config);
     let (tx, rx) = std::sync::mpsc::channel::<ProbeResult>();
     let (speed_tx, speed_rx) = std::sync::mpsc::channel::<SpeedResult>();
+    let (manifest_tx, manifest_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let paused = Arc::new(AtomicBool::new(false));
     let cancel = Arc::new(AtomicBool::new(false));
 
@@ -1130,6 +1195,13 @@ pub fn run_tui(
     let _guard = RestoreGuard;
     let mut app = App::new((*config_arc).clone(), has_cli_targets, paused.clone());
     app.watch_interval = watch_interval.map(|seconds| Duration::from_secs(seconds.max(1)));
+    app.manifest_path = manifest_path;
+    app.manifest_thresholds = crate::HealthThresholds {
+        min_success_rate,
+        max_p95_ms,
+    };
+    app.manifest_min_confidence = manifest_min_confidence;
+    app.manifest_backups = manifest_backups;
     if has_cli_targets {
         app.set_explicit_target_source(cli_cidr.clone(), cli_ips.clone());
     }
@@ -1269,6 +1341,11 @@ pub fn run_tui(
 
     let mut run = || -> anyhow::Result<()> {
         loop {
+            while let Ok(result) = manifest_rx.try_recv() {
+                if let Err(error) = result {
+                    app.toast_warn(format!("Manifest write failed: {error}"));
+                }
+            }
             while let Ok(r) = rx.try_recv() {
                 app.add_result(r);
             }
@@ -1296,9 +1373,24 @@ pub fn run_tui(
                         if !app.last_targets.is_empty() {
                             app.watch_cycle = app.watch_cycle.saturating_add(1);
                         }
-                        let healthy = app.results.iter().any(|r| r.ok > 0);
+                        let manifest = build_current_manifest(&app);
+                        if let Some(path) = &app.manifest_path {
+                            queue_manifest_write(path, manifest.clone(), &manifest_tx);
+                        }
+                        let healthy = manifest.primary.is_some();
                         let recommendation =
-                            app.sorted_results().first().map(|result| result.ip.clone());
+                            manifest.primary.as_ref().map(|result| result.ip.clone());
+                        let alerts = compute_watch_alerts(
+                            app.watch_cycle,
+                            app.last_watch_primary.as_deref(),
+                            app.last_watch_healthy,
+                            recommendation.as_deref(),
+                            healthy,
+                        );
+                        app.alert_message = (!alerts.is_empty()).then(|| alerts.join("; "));
+                        if let Some(message) = &app.alert_message {
+                            app.toast_warn(format!("Watch alert: {message}"));
+                        }
                         let record = serde_json::json!({
                             "schema_version": 1,
                             "cycle": app.watch_cycle,
@@ -1307,10 +1399,19 @@ pub fn run_tui(
                             "targets": app.last_targets,
                             "healthy": healthy,
                             "recommendation": recommendation,
+                            "alerts": alerts,
+                            "manifest": manifest,
                             "results": app.results,
                         });
                         if let Err(error) = crate::config::append_history(&record) {
                             app.toast_warn(format!("History write failed: {error}"));
+                        }
+                        app.last_watch_primary = recommendation;
+                        app.last_watch_healthy = Some(healthy);
+                    }
+                    if app.watch_interval.is_none() {
+                        if let Some(path) = &app.manifest_path {
+                            queue_manifest_write(path, build_current_manifest(&app), &manifest_tx);
                         }
                     }
                     if let Some(interval) = app.watch_interval {
@@ -2561,12 +2662,29 @@ impl Drop for RestoreGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{ranked_export_results, Action, App, FocusTarget, ProbeResult, Screen, WizardStep};
+    use super::{
+        compute_watch_alerts, ranked_export_results, Action, App, FocusTarget, ProbeResult, Screen,
+        WizardStep,
+    };
     use crate::config::AppConfig;
     use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::{backend::TestBackend, Terminal};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+
+    #[test]
+    fn watch_alerts_only_trigger_on_relevant_state_changes() {
+        assert!(compute_watch_alerts(1, None, None, Some("a"), true).is_empty());
+        assert_eq!(
+            compute_watch_alerts(2, Some("a"), Some(true), Some("b"), true),
+            vec!["recommended target changed"]
+        );
+        assert_eq!(
+            compute_watch_alerts(2, Some("a"), Some(true), None, false),
+            vec!["recommended target changed", "no healthy target"]
+        );
+        assert!(compute_watch_alerts(3, None, Some(false), None, false).is_empty());
+    }
 
     fn result(ip: &str, fail: usize, p95: f64) -> ProbeResult {
         ProbeResult {

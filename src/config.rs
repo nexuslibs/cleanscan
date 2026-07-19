@@ -7,6 +7,18 @@ use std::{fs, io::Write};
 pub struct AppConfig {
     pub host: String,
     pub path: String,
+    /// Expected HTTP statuses. An empty list accepts any 2xx response.
+    #[serde(default)]
+    pub expected_statuses: Vec<u16>,
+    /// Required literal substrings that must occur in the response body.
+    #[serde(default)]
+    pub required_body_markers: Vec<String>,
+    /// Required exact header expressions in `name=value` form.
+    #[serde(default)]
+    pub required_headers: Vec<String>,
+    /// Follow redirects during validation. Disabled by default for compatibility.
+    #[serde(default)]
+    pub follow_redirects: bool,
     pub sample_per_cidr: usize,
     pub probes: usize,
     pub concurrency: usize,
@@ -166,6 +178,10 @@ impl Default for AppConfig {
         Self {
             host: String::new(),
             path: "/cdn-cgi/trace".to_string(),
+            expected_statuses: Vec::new(),
+            required_body_markers: Vec::new(),
+            required_headers: Vec::new(),
+            follow_redirects: false,
             sample_per_cidr: 100,
             probes: 8,
             concurrency: 120,

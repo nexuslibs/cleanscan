@@ -26,6 +26,8 @@ pub enum DiagnosticCategory {
     Timeout,
     HttpStatus,
     Redirect,
+    ValidationBody,
+    ValidationHeader,
     BodyRead,
     Cancelled,
     Unknown,
@@ -404,7 +406,11 @@ fn client_for_ip(host: &str, ip: &str, args: &AppConfig) -> Result<Client> {
         .http2_adaptive_window(true)
         .no_proxy()
         .resolve_to_addrs(host, &[socket])
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(if args.follow_redirects {
+            reqwest::redirect::Policy::limited(10)
+        } else {
+            reqwest::redirect::Policy::none()
+        })
         .connect_timeout(Duration::from_millis(args.connect_timeout_ms))
         .timeout(Duration::from_millis(args.timeout_ms))
         .build()?;
@@ -415,6 +421,7 @@ fn client_for_ip(host: &str, ip: &str, args: &AppConfig) -> Result<Client> {
 async fn probe_once(
     client: &Client,
     url: &str,
+    args: &AppConfig,
 ) -> Result<(f64, String, Option<String>), ProbeDiagnostic> {
     let start = Instant::now();
 
@@ -452,28 +459,6 @@ async fn probe_once(
             }
         })?;
 
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let location = resp
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        let category = if location.is_some() {
-            DiagnosticCategory::Redirect
-        } else {
-            DiagnosticCategory::HttpStatus
-        };
-        return Err(ProbeDiagnostic {
-            category,
-            phase: DiagnosticPhase::ResponseHeaders,
-            message: format!("HTTP {}", resp.status()),
-            status: Some(status),
-            location,
-            elapsed_ms: Some(start.elapsed().as_secs_f64() * 1000.0),
-        });
-    }
-
     let protocol = match resp.version() {
         reqwest::Version::HTTP_09 => "http/0.9",
         reqwest::Version::HTTP_10 => "http/1.0",
@@ -488,6 +473,13 @@ async fn probe_once(
 
     // Read the full body so keep-alive connections can be reused, and to
     // extract the Cloudflare datacenter code from `/cdn-cgi/trace`.
+    let status = resp.status().as_u16();
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let headers = resp.headers().clone();
     let body = resp.text().await.map_err(|error| ProbeDiagnostic {
         category: DiagnosticCategory::BodyRead,
         phase: DiagnosticPhase::ResponseBody,
@@ -496,9 +488,82 @@ async fn probe_once(
         location: None,
         elapsed_ms: Some(start.elapsed().as_secs_f64() * 1000.0),
     })?;
+
+    if let Some(diagnostic) = validate_response(status, &headers, &body, location.as_deref(), args)
+    {
+        return Err(ProbeDiagnostic {
+            elapsed_ms: Some(start.elapsed().as_secs_f64() * 1000.0),
+            ..diagnostic
+        });
+    }
     let colo = parse_colo(&body);
 
     Ok((latency, protocol.to_string(), colo))
+}
+
+fn validate_response(
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+    location: Option<&str>,
+    args: &AppConfig,
+) -> Option<ProbeDiagnostic> {
+    let status_ok = if args.expected_statuses.is_empty() {
+        (200..300).contains(&status)
+    } else {
+        args.expected_statuses.contains(&status)
+    };
+    if !status_ok {
+        return Some(ProbeDiagnostic {
+            category: if location.is_some() {
+                DiagnosticCategory::Redirect
+            } else {
+                DiagnosticCategory::HttpStatus
+            },
+            phase: DiagnosticPhase::ResponseBody,
+            message: format!("HTTP {}", status),
+            status: Some(status),
+            location: location.map(str::to_string),
+            elapsed_ms: None,
+        });
+    }
+    for marker in &args.required_body_markers {
+        if !body.contains(marker) {
+            return Some(ProbeDiagnostic {
+                category: DiagnosticCategory::ValidationBody,
+                phase: DiagnosticPhase::ResponseBody,
+                message: format!("required body marker missing: {marker}"),
+                status: Some(status),
+                location: location.map(str::to_string),
+                elapsed_ms: None,
+            });
+        }
+    }
+    for expression in &args.required_headers {
+        let Some((name, expected)) = expression.split_once('=') else {
+            return Some(ProbeDiagnostic {
+                category: DiagnosticCategory::ValidationHeader,
+                phase: DiagnosticPhase::ResponseHeaders,
+                message: format!("invalid required header expression: {expression}"),
+                status: Some(status),
+                location: location.map(str::to_string),
+                elapsed_ms: None,
+            });
+        };
+        let name = name.trim();
+        let expected = expected.trim();
+        if headers.get(name).and_then(|value| value.to_str().ok()) != Some(expected) {
+            return Some(ProbeDiagnostic {
+                category: DiagnosticCategory::ValidationHeader,
+                phase: DiagnosticPhase::ResponseHeaders,
+                message: format!("required header mismatch: {name}"),
+                status: Some(status),
+                location: location.map(str::to_string),
+                elapsed_ms: None,
+            });
+        }
+    }
+    None
 }
 
 /// Extract the Cloudflare `colo=` code from a `/cdn-cgi/trace` response body.
@@ -981,6 +1046,7 @@ pub async fn run_scan(
                         .expect("targets without clients are completed during initialization")
                         .clone();
                     let url = state.url.clone();
+                    let probe_args = args.clone();
                     state.warmup_in_flight = true;
                     let sem = sem.clone();
                     let cancel = cancel.clone();
@@ -995,7 +1061,7 @@ pub async fn run_scan(
                             } => None,
                         };
                         let sample = match permit {
-                            Some(_permit) => probe_once(&client, &url).await,
+                            Some(_permit) => probe_once(&client, &url, &probe_args).await,
                             None => Err(ProbeDiagnostic {
                                 category: DiagnosticCategory::Cancelled,
                                 phase: DiagnosticPhase::Cancellation,
@@ -1025,6 +1091,7 @@ pub async fn run_scan(
                 .expect("targets without clients are completed during initialization")
                 .clone();
             let url = state.url.clone();
+            let probe_args = args.clone();
             state.scheduled += 1;
             state.in_flight = true;
             let sem = sem.clone();
@@ -1041,7 +1108,7 @@ pub async fn run_scan(
                     } => None,
                 };
                 let sample = match permit {
-                    Some(_permit) => probe_once(&client, &url).await,
+                    Some(_permit) => probe_once(&client, &url, &probe_args).await,
                     None => Err(ProbeDiagnostic {
                         category: DiagnosticCategory::Cancelled,
                         phase: DiagnosticPhase::Cancellation,
@@ -1306,7 +1373,8 @@ mod tests {
     use super::{
         bootstrap_score_interval, cidr_valid, collect_from_cidrs_with_seed, parse_colo,
         record_best, result_confidence, result_status, select_focus_cidrs, select_next_target,
-        should_stop_early, wilson_interval, ProbeResult, TargetState,
+        should_stop_early, validate_response, wilson_interval, DiagnosticCategory, ProbeResult,
+        TargetState,
     };
     use crate::config::AppConfig;
 
@@ -1349,6 +1417,55 @@ mod tests {
         assert_eq!(cidr_valid("2001:db8::1").unwrap().prefix_len(), 128);
         assert!(cidr_valid("192.0.2.0/24").is_ok());
         assert!(cidr_valid("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn validation_accepts_default_2xx_and_required_content() {
+        let config = AppConfig {
+            required_body_markers: vec!["colo=FRA".to_string()],
+            required_headers: vec![" content-type = text/plain ".to_string()],
+            ..AppConfig::default()
+        };
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("content-type", "text/plain".parse().unwrap());
+        assert!(validate_response(200, &headers, "colo=FRA", None, &config).is_none());
+    }
+
+    #[test]
+    fn validation_reports_status_body_and_header_failures() {
+        let config = AppConfig {
+            expected_statuses: vec![204],
+            ..AppConfig::default()
+        };
+        let headers = reqwest::header::HeaderMap::new();
+        assert_eq!(
+            validate_response(200, &headers, "", None, &config)
+                .unwrap()
+                .category,
+            DiagnosticCategory::HttpStatus
+        );
+
+        let config = AppConfig {
+            required_body_markers: vec!["healthy".to_string()],
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            validate_response(200, &headers, "not-ready", None, &config)
+                .unwrap()
+                .category,
+            DiagnosticCategory::ValidationBody
+        );
+
+        let config = AppConfig {
+            required_headers: vec!["x-health=ok".to_string()],
+            ..AppConfig::default()
+        };
+        assert_eq!(
+            validate_response(200, &headers, "", None, &config)
+                .unwrap()
+                .category,
+            DiagnosticCategory::ValidationHeader
+        );
     }
 
     #[test]
