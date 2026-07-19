@@ -1,7 +1,5 @@
 use crate::scanner::ProbeResult;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -169,10 +167,14 @@ impl WatchState {
     }
 }
 
-pub fn fingerprint<T: Hash>(value: &T) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
+pub fn fingerprint<T: Serialize>(value: &T) -> u64 {
+    let bytes = serde_json::to_vec(value).expect("fingerprint input must serialize");
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 pub fn default_state_path(host: &str, source_fingerprint: u64) -> Option<PathBuf> {

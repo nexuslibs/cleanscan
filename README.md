@@ -303,10 +303,11 @@ in the details view and machine-readable output. The recommendation `score`
 reliability with latency, jitter, and packet loss, so a slightly slower but
 steadier, loss-free IP outranks a fast-but-jittery or lossy one.
 
-With multiple checks, each path is probed against the same IP and connection
-pool. Required checks gate manifest eligibility, while the aggregate score is
-the weighted mean of the check scores. Warmup is performed once per target and
-`cold_ms` remains the target-level connection-establishment measurement.
+With multiple checks, each path is probed against the same IP, but each check
+currently uses its own HTTP client and warmup request. Required checks gate
+manifest eligibility, while the aggregate score is the weighted mean of the
+check scores. Each check therefore has independent connection-establishment
+cost; its result summary reports the check's steady-state measurements.
 
 Watch mode freezes its exact sampled target list on the first cycle and reuses
 it after restart when the source and health profile are unchanged. Use

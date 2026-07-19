@@ -25,7 +25,12 @@ pub struct CheckResult {
     pub weight: f64,
     pub score: f64,
     pub healthy: bool,
-    pub result: Box<ProbeResult>,
+    pub ok: usize,
+    pub fail: usize,
+    pub completed: usize,
+    pub avg: f64,
+    pub p95: f64,
+    pub colo: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -134,15 +139,8 @@ pub struct ProbeResult {
     pub success_rate_upper: f64,
     pub score_confidence: f64,
     pub decision: String,
-    #[serde(default)]
     pub checks: Vec<CheckResult>,
-    #[serde(default = "default_health_ok")]
     pub health_ok: bool,
-}
-
-#[allow(dead_code)]
-fn default_health_ok() -> bool {
-    true
 }
 
 pub fn effective_health_checks(config: &AppConfig) -> Vec<HealthCheck> {
@@ -1259,8 +1257,9 @@ pub async fn run_scan(
 }
 
 /// Run every configured health check and merge the per-path results into one
-/// target result. Checks share the same target set and validation policy; the
-/// first check remains the compatibility/primary result.
+/// target result. Checks share the same target set and validation policy, but
+/// currently use independent clients and warmup requests; the first check
+/// remains the compatibility/primary result.
 pub async fn run_profile_scan(
     targets: Vec<String>,
     args: Arc<AppConfig>,
@@ -1327,12 +1326,18 @@ pub async fn run_profile_scan(
                 weight: check.weight,
                 score: result.score,
                 healthy: result.ok > 0,
-                result: Box::new(result.clone()),
+                ok: result.ok,
+                fail: result.fail,
+                completed: result.completed,
+                avg: result.avg,
+                p95: result.p95,
+                colo: result.colo.clone(),
             })
             .collect();
+        let aggregate_healthy = entries.iter().any(|(_, result)| result.ok > 0);
         merged.decision = if !required_ok {
             "required_check_failed".to_string()
-        } else if merged.ok == 0 {
+        } else if !aggregate_healthy {
             "discarded".to_string()
         } else {
             "competitive".to_string()

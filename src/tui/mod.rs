@@ -1119,24 +1119,6 @@ fn ranked_export_results(results: &[ProbeResult], top: usize) -> Vec<&ProbeResul
     ranked
 }
 
-#[allow(dead_code)]
-fn compute_watch_alerts(
-    cycle: u64,
-    previous_primary: Option<&str>,
-    previous_healthy: Option<bool>,
-    recommendation: Option<&str>,
-    healthy: bool,
-) -> Vec<String> {
-    let mut alerts = Vec::new();
-    if cycle > 1 && previous_primary != recommendation {
-        alerts.push("recommended target changed".to_string());
-    }
-    if cycle > 1 && !healthy && previous_healthy != Some(false) {
-        alerts.push("no healthy target".to_string());
-    }
-    alerts
-}
-
 fn build_current_manifest(app: &App) -> crate::Manifest {
     crate::build_manifest(
         &app.config,
@@ -2699,29 +2681,12 @@ impl Drop for RestoreGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        compute_watch_alerts, ranked_export_results, Action, App, FocusTarget, ProbeResult, Screen,
-        WizardStep,
-    };
+    use super::{ranked_export_results, Action, App, FocusTarget, ProbeResult, Screen, WizardStep};
     use crate::config::AppConfig;
     use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::{backend::TestBackend, Terminal};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
-
-    #[test]
-    fn watch_alerts_only_trigger_on_relevant_state_changes() {
-        assert!(compute_watch_alerts(1, None, None, Some("a"), true).is_empty());
-        assert_eq!(
-            compute_watch_alerts(2, Some("a"), Some(true), Some("b"), true),
-            vec!["recommended target changed"]
-        );
-        assert_eq!(
-            compute_watch_alerts(2, Some("a"), Some(true), None, false),
-            vec!["recommended target changed", "no healthy target"]
-        );
-        assert!(compute_watch_alerts(3, None, Some(false), None, false).is_empty());
-    }
 
     fn result(ip: &str, fail: usize, p95: f64) -> ProbeResult {
         ProbeResult {

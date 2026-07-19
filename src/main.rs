@@ -238,15 +238,15 @@ fn main() -> Result<()> {
         config.host = host;
     }
     let explicit_path = args.path.is_some();
+    if explicit_path && (!args.checks.is_empty() || !config.health_checks.is_empty()) {
+        anyhow::bail!(
+            "--check/health checks cannot be combined with --path; put the primary path in --check"
+        );
+    }
     if let Some(path) = args.path {
         config.path = path;
     }
     if !args.checks.is_empty() {
-        if explicit_path {
-            anyhow::bail!(
-                "--check cannot be combined with --path; put the primary path in --check"
-            );
-        }
         config.health_checks = args
             .checks
             .iter()
@@ -996,7 +996,12 @@ fn cli_watch(
                 .then(|| "stable primary is no longer available".to_string());
         } else {
             manifest.primary = None;
-            manifest.backups.clear();
+            manifest.backups = manifest_results
+                .iter()
+                .filter(|r| healthy_result(r, thresholds, &manifest_min_confidence))
+                .take(manifest_backups)
+                .cloned()
+                .collect();
             manifest.failure = Some("no stable target met the watch policy".to_string());
         }
         if let Some(path) = &manifest_path {
