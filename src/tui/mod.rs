@@ -302,6 +302,9 @@ pub struct App {
     /// Full statistics drawer for the currently selected latency result.
     pub show_result_details: bool,
     pub detail_tab: usize,
+    pub watch_interval: Option<Duration>,
+    pub watch_cycle: u64,
+    pub watch_due: Option<Instant>,
     /// Animation lifecycle state for each modal layer, driven by `render`.
     pub help_overlay: OverlayState,
     pub quit_overlay: OverlayState,
@@ -553,6 +556,9 @@ impl App {
             column_picker_list_state: ListState::default(),
             show_result_details: false,
             detail_tab: 0,
+            watch_interval: None,
+            watch_cycle: 0,
+            watch_due: None,
             help_overlay: modal_state(),
             quit_overlay: modal_state(),
             speed_confirm_overlay: modal_state(),
@@ -1100,6 +1106,7 @@ pub fn run_tui(
     cli_cidr: Vec<String>,
     cli_ips: Option<String>,
     explicit_seed: Option<u64>,
+    watch_interval: Option<u64>,
 ) -> anyhow::Result<()> {
     let has_cli_targets = cli_ips.is_some() || !cli_cidr.is_empty();
 
@@ -1122,6 +1129,7 @@ pub fn run_tui(
     let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
     let _guard = RestoreGuard;
     let mut app = App::new((*config_arc).clone(), has_cli_targets, paused.clone());
+    app.watch_interval = watch_interval.map(Duration::from_secs);
     if has_cli_targets {
         app.set_explicit_target_source(cli_cidr.clone(), cli_ips.clone());
     }
@@ -1284,6 +1292,46 @@ pub fn run_tui(
                             app.toast_error("Scan worker panicked");
                         }
                     }
+                    if app.watch_interval.is_some() && app.scan_complete {
+                        let healthy = app.results.iter().any(|r| r.ok > 0);
+                        let recommendation =
+                            app.sorted_results().first().map(|result| result.ip.clone());
+                        let record = serde_json::json!({
+                            "schema_version": 1,
+                            "cycle": app.watch_cycle,
+                            "host": app.config.host,
+                            "path": app.config.path,
+                            "targets": app.last_targets,
+                            "healthy": healthy,
+                            "recommendation": recommendation,
+                            "results": app.results,
+                        });
+                        if let Err(error) = crate::config::append_history(&record) {
+                            app.toast_warn(format!("History write failed: {error}"));
+                        }
+                    }
+                    if let Some(interval) = app.watch_interval {
+                        if !app.last_targets.is_empty() {
+                            app.watch_cycle = app.watch_cycle.saturating_add(1);
+                            app.watch_due = Some(Instant::now() + interval);
+                            app.toast_info(format!(
+                                "Watch cycle {} complete; next scan in {}s",
+                                app.watch_cycle,
+                                interval.as_secs()
+                            ));
+                        }
+                    }
+                }
+
+                if app.scan_complete
+                    && scanner.is_none()
+                    && app.watch_due.is_some_and(|due| Instant::now() >= due)
+                {
+                    app.results.clear();
+                    app.scan_complete = false;
+                    app.watch_due = None;
+                    app.rescan_targets = Some(app.last_targets.clone());
+                    app.pending_start = true;
                 }
             }
 
@@ -2539,12 +2587,19 @@ mod tests {
             packet_loss: 0.0,
             samples: vec![p95],
             failures: Vec::new(),
+            diagnostics: Vec::new(),
             success_rate: 1.0 / (1 + fail) as f64,
             score: 1.0 / p95.max(0.001),
             colo: None,
             country: None,
             cold_ms: None,
             stopped_early: false,
+            min_score: 0.0,
+            max_score: 0.0,
+            success_rate_lower: 0.0,
+            success_rate_upper: 1.0,
+            score_confidence: 0.95,
+            decision: "competitive".to_string(),
         }
     }
 
