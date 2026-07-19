@@ -374,7 +374,7 @@ impl App {
             },
             Screen::Scanning => {
                 if self.scan_complete {
-                    5
+                    4
                 } else {
                     3
                 }
@@ -1035,25 +1035,15 @@ impl App {
                 Err(e) => return Err(e),
             }
         };
-        writeln!(f, "rank\tip\tprotocol\tok\tfail\tavg\tp50\tp90\tp95\tmax")?;
+        writeln!(
+            f,
+            "rank\tip\tcolo\tcountry\tprotocol\tok\tfail\tavg\tp50\tp90\tp95\tmax"
+        )?;
         for (i, r) in ranked_export_results(&self.results, self.config.top)
             .into_iter()
             .enumerate()
         {
-            writeln!(
-                f,
-                "{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}",
-                i + 1,
-                r.ip,
-                r.protocol,
-                r.ok,
-                r.fail,
-                r.avg,
-                r.p50,
-                r.p90,
-                r.p95,
-                r.max
-            )?;
+            writeln!(f, "{}", export_tsv_line(i + 1, r))?;
         }
         Ok(filename)
     }
@@ -1123,6 +1113,24 @@ fn ranked_export_results(results: &[ProbeResult], top: usize) -> Vec<&ProbeResul
     ranked.sort_by(|a, b| App::natural_cmp(a, b));
     ranked.truncate(top);
     ranked
+}
+
+fn export_tsv_line(rank: usize, result: &ProbeResult) -> String {
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}",
+        rank,
+        result.ip,
+        result.colo.as_deref().unwrap_or(""),
+        result.country.as_deref().unwrap_or(""),
+        result.protocol,
+        result.ok,
+        result.fail,
+        result.avg,
+        result.p50,
+        result.p90,
+        result.p95,
+        result.max,
+    )
 }
 
 fn build_current_manifest(app: &App) -> crate::Manifest {
@@ -1262,7 +1270,7 @@ pub fn run_tui(
     let spawn_scanner = |targets: Vec<String>,
                          selected_cidrs: Vec<String>,
                          scan_config: Arc<AppConfig>|
-     -> std::thread::JoinHandle<Result<(), String>> {
+     -> std::thread::JoinHandle<Result<Vec<String>, String>> {
         let scanner_config = scan_config;
         let scanner_paused = paused.clone();
         let scanner_cancel = cancel.clone();
@@ -1287,17 +1295,17 @@ pub fn run_tui(
                     scanner_cancel,
                     scanner_paused,
                 ))
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())
             } else {
                 rt.block_on(crate::scanner::run_profile_scan(
-                    targets,
+                    targets.clone(),
                     scanner_config,
                     scanner_tx,
                     scanner_cancel,
                     scanner_paused,
                 ));
+                Ok(targets)
             }
-            Ok(())
         })
     };
 
@@ -1322,7 +1330,7 @@ pub fn run_tui(
         })
     };
 
-    let mut scanner: Option<std::thread::JoinHandle<Result<(), String>>> = None;
+    let mut scanner: Option<std::thread::JoinHandle<Result<Vec<String>, String>>> = None;
     let mut speed_runner: Option<std::thread::JoinHandle<Result<(), String>>> = None;
 
     // CLI-provided targets start scanning immediately (legacy behavior).
@@ -1341,6 +1349,7 @@ pub fn run_tui(
                 cli_ips.clone(),
                 config_arc.sample_per_cidr,
                 explicit_seed,
+                app.scan_seed,
             ));
             let targets = prepare_watch_targets(&mut app, targets, source_fingerprint);
             let total = targets.len();
@@ -1357,56 +1366,68 @@ pub fn run_tui(
         }
     }
 
-    type SpawnScanner<'a> = dyn Fn(Vec<String>, Vec<String>, Arc<AppConfig>) -> std::thread::JoinHandle<Result<(), String>>
+    type SpawnScanner<'a> = dyn Fn(
+            Vec<String>,
+            Vec<String>,
+            Arc<AppConfig>,
+        ) -> std::thread::JoinHandle<Result<Vec<String>, String>>
         + 'a;
 
     // Launch a scan from the wizard's (possibly edited) configuration.
-    let start_wizard_scan = |app: &mut App,
-                             scanner: &mut Option<std::thread::JoinHandle<Result<(), String>>>,
-                             spawn_scanner: &SpawnScanner<'_>| {
-        let exact_targets = app.rescan_targets.take();
-        let cidrs: Vec<String> = app
-            .cidr_candidates
-            .iter()
-            .filter(|e| e.selected)
-            .map(|e| e.cidr.clone())
-            .collect();
-        if exact_targets.is_none() && cidrs.is_empty() {
-            app.toast_warn("Select at least one CIDR (space) before starting");
-            return;
-        }
-        if app.config.host.is_empty() {
-            app.toast_warn("Set a Host before starting the scan");
-            return;
-        }
-        let targets = if let Some(targets) = exact_targets {
-            Ok(targets)
-        } else if app.preview_targets.is_empty() {
-            crate::scanner::collect_from_cidrs_with_seed(
-                &cidrs,
-                app.config.sample_per_cidr,
-                app.scan_seed,
-            )
-        } else {
-            Ok(app.preview_targets.clone())
-        };
-        match targets {
-            Ok(targets) => {
-                let source_fingerprint = crate::watch::fingerprint(&(
-                    cidrs.clone(),
-                    app.config.sample_per_cidr,
-                    explicit_seed,
-                ));
-                let targets = prepare_watch_targets(app, targets, source_fingerprint);
-                let total = targets.len();
-                let scan_config = Arc::new(app.config.clone());
-                app.set_scan_targets(targets.clone());
-                *scanner = Some(spawn_scanner(targets, cidrs.clone(), scan_config));
-                app.begin_scan(total);
+    let start_wizard_scan =
+        |app: &mut App,
+         scanner: &mut Option<std::thread::JoinHandle<Result<Vec<String>, String>>>,
+         spawn_scanner: &SpawnScanner<'_>| {
+            let exact_targets = app.rescan_targets.take();
+            let use_exact_targets = exact_targets.is_some();
+            let cidrs: Vec<String> = app
+                .cidr_candidates
+                .iter()
+                .filter(|e| e.selected)
+                .map(|e| e.cidr.clone())
+                .collect();
+            if exact_targets.is_none() && cidrs.is_empty() {
+                app.toast_warn("Select at least one CIDR (space) before starting");
+                return;
             }
-            Err(e) => app.toast_error(format!("Error: {e}")),
-        }
-    };
+            if app.config.host.is_empty() {
+                app.toast_warn("Set a Host before starting the scan");
+                return;
+            }
+            let targets = if let Some(targets) = exact_targets {
+                Ok(targets)
+            } else if app.preview_targets.is_empty() {
+                crate::scanner::collect_from_cidrs_with_seed(
+                    &cidrs,
+                    app.config.sample_per_cidr,
+                    app.scan_seed,
+                )
+            } else {
+                Ok(app.preview_targets.clone())
+            };
+            match targets {
+                Ok(targets) => {
+                    let source_fingerprint = crate::watch::fingerprint(&(
+                        cidrs.clone(),
+                        app.config.sample_per_cidr,
+                        explicit_seed,
+                        app.scan_seed,
+                    ));
+                    let targets = prepare_watch_targets(app, targets, source_fingerprint);
+                    let total = targets.len();
+                    let scan_config = Arc::new(app.config.clone());
+                    app.set_scan_targets(targets.clone());
+                    let scan_cidrs = if use_exact_targets {
+                        Vec::new()
+                    } else {
+                        cidrs.clone()
+                    };
+                    *scanner = Some(spawn_scanner(targets, scan_cidrs, scan_config));
+                    app.begin_scan(total);
+                }
+                Err(e) => app.toast_error(format!("Error: {e}")),
+            }
+        };
 
     let mut run = || -> anyhow::Result<()> {
         loop {
@@ -1428,7 +1449,13 @@ pub fn run_tui(
                 }
                 if let Some(handle) = scanner.take() {
                     match handle.join() {
-                        Ok(Ok(())) => app.scan_complete = true,
+                        Ok(Ok(actual_targets)) => {
+                            app.last_targets = actual_targets.clone();
+                            if let Some(state) = app.watch_state.as_mut() {
+                                state.targets = actual_targets;
+                            }
+                            app.scan_complete = true;
+                        }
                         Ok(Err(e)) => {
                             app.scan_complete = true;
                             app.toast_error(format!("Scan failed: {e}"));
@@ -1889,7 +1916,8 @@ impl App {
                     1 if self.scan_complete => self.activate_action(Action::Export),
                     1 => self.activate_action(Action::PauseResume),
                     2 if self.scan_complete => self.activate_action(Action::SpeedTest),
-                    4 => self.activate_action(Action::Quit),
+                    2 => self.activate_action(Action::Quit),
+                    3 if self.scan_complete => self.activate_action(Action::Quit),
                     _ => {}
                 }
                 return;
@@ -2818,8 +2846,8 @@ impl Drop for RestoreGuard {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_current_manifest, ranked_export_results, Action, App, FocusTarget, ProbeResult,
-        Screen, WizardStep,
+        build_current_manifest, export_tsv_line, ranked_export_results, Action, App, FocusTarget,
+        ProbeResult, Screen, WizardStep,
     };
     use crate::config::AppConfig;
     use crate::watch::{WatchPolicy, WatchState};
@@ -2897,6 +2925,61 @@ mod tests {
         let ranked = ranked_export_results(&results, 50);
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].ip, "ok");
+    }
+
+    #[test]
+    fn export_tsv_includes_location_columns() {
+        let mut edge = result("192.0.2.1", 0, 0.02);
+        edge.colo = Some("FRA".to_string());
+        edge.country = Some("Germany".to_string());
+        assert_eq!(
+            export_tsv_line(1, &edge),
+            "1\t192.0.2.1\tFRA\tGermany\th2\t1\t0\t0.020\t0.020\t0.020\t0.020\t0.020"
+        );
+    }
+
+    #[test]
+    fn scanning_focus_map_keeps_quit_reachable() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(1);
+        assert_eq!(app.focus_count(), 3);
+        app.focus_index = 2;
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.confirm_quit);
+
+        app.confirm_quit = false;
+        app.scan_complete = true;
+        assert_eq!(app.focus_count(), 4);
+        app.focus_index = 3;
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn watch_fingerprint_changes_when_scan_seed_changes() {
+        let cidrs = vec!["192.0.2.0/24".to_string()];
+        let first = crate::watch::fingerprint(&(cidrs.clone(), 20usize, None::<u64>, 11u64));
+        let second = crate::watch::fingerprint(&(cidrs, 20usize, None::<u64>, 12u64));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn dashboard_sorting_tolerates_nan_latency() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut edge = result("192.0.2.1", 0, 0.02);
+        edge.avg = f64::NAN;
+        edge.p50 = f64::NAN;
+        app.begin_scan(1);
+        app.add_result(edge);
+        draw(&mut app, 120, 36);
     }
 
     #[test]

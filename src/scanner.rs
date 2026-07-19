@@ -1312,8 +1312,9 @@ pub async fn run_scan(
 
 /// Run every configured health check and merge the per-path results into one
 /// target result. Checks share the same target set and validation policy, but
-/// currently use independent clients and warmup requests; the first check
-/// remains the compatibility/primary result.
+/// currently use independent clients and warmup requests; top-level latency
+/// fields use the required check with the worst p95 as the summary, while
+/// reliability and score fields aggregate across checks.
 pub async fn run_profile_scan(
     targets: Vec<String>,
     args: Arc<AppConfig>,
@@ -1360,102 +1361,158 @@ pub async fn run_profile_scan(
     }
 
     for (_, entries) in by_ip {
-        let Some((_, mut merged)) = entries.first().cloned() else {
-            continue;
-        };
-        let summary = entries
-            .iter()
-            .filter(|(check, _)| check.required)
-            .map(|(_, result)| result)
-            .max_by(|left, right| {
-                left.p95
-                    .partial_cmp(&right.p95)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| {
-                        right
-                            .success_rate
-                            .partial_cmp(&left.success_rate)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-            })
-            .unwrap_or(&entries[0].1);
-        merged.protocol = summary.protocol.clone();
-        merged.ok = summary.ok;
-        merged.fail = summary.fail;
-        merged.completed = summary.completed;
-        merged.avg = summary.avg;
-        merged.p50 = summary.p50;
-        merged.p90 = summary.p90;
-        merged.p95 = summary.p95;
-        merged.max = summary.max;
-        merged.jitter = summary.jitter;
-        merged.stddev = summary.stddev;
-        merged.loss = summary.loss;
-        merged.packet_loss = summary.packet_loss;
-        merged.samples = summary.samples.clone();
-        merged.colo = summary.colo.clone();
-        merged.country = summary.country.clone();
-        merged.cold_ms = summary.cold_ms;
-        merged.success_rate = summary.success_rate;
-        merged.min_score = summary.min_score;
-        merged.max_score = summary.max_score;
-        merged.success_rate_lower = summary.success_rate_lower;
-        merged.success_rate_upper = summary.success_rate_upper;
-        merged.score_confidence = summary.score_confidence;
-        let total_weight: f64 = entries.iter().map(|(check, _)| check.weight.max(0.0)).sum();
-        let weighted_score = entries
-            .iter()
-            .map(|(check, result)| check.weight.max(0.0) * result.score)
-            .sum::<f64>();
-        let required_ok = expected_checks
-            .iter()
-            .filter(|check| check.required)
-            .all(|check| {
-                entries
-                    .iter()
-                    .any(|(entry, result)| entry.name == check.name && result.ok > 0)
-            });
-        merged.score = if total_weight > 0.0 {
-            weighted_score / total_weight
+        if let Some(merged) = merge_profile_results(&entries, &expected_checks) {
+            let _ = tx.send(merged);
+        }
+    }
+}
+
+fn merge_profile_results(
+    entries: &[(HealthCheck, ProbeResult)],
+    expected_checks: &[HealthCheck],
+) -> Option<ProbeResult> {
+    let (_, mut merged) = entries.first().cloned()?;
+    let summary = entries
+        .iter()
+        .filter(|(check, _)| check.required)
+        .map(|(_, result)| result)
+        .max_by(|left, right| {
+            left.p95
+                .partial_cmp(&right.p95)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    right
+                        .success_rate
+                        .partial_cmp(&left.success_rate)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        })
+        .unwrap_or(&entries[0].1);
+    let aggregate_entries: Vec<&ProbeResult> = entries
+        .iter()
+        .filter(|(check, _)| check.required)
+        .map(|(_, result)| result)
+        .collect();
+    let aggregate_entries = if aggregate_entries.is_empty() {
+        entries.iter().map(|(_, result)| result).collect()
+    } else {
+        aggregate_entries
+    };
+    let ok = aggregate_entries.iter().map(|result| result.ok).sum();
+    let fail = aggregate_entries.iter().map(|result| result.fail).sum();
+    let completed = aggregate_entries
+        .iter()
+        .map(|result| result.completed)
+        .sum();
+    let loss = aggregate_entries.iter().map(|result| result.loss).sum();
+    let success_rate = if completed > 0 {
+        ok as f64 / completed as f64
+    } else {
+        0.0
+    };
+    let packet_loss = if completed > 0 {
+        loss as f64 / completed as f64
+    } else {
+        0.0
+    };
+    let (success_rate_lower, success_rate_upper) =
+        wilson_interval(ok, completed, summary.score_confidence);
+    let total_weight: f64 = entries.iter().map(|(check, _)| check.weight.max(0.0)).sum();
+    let weighted_score = entries
+        .iter()
+        .map(|(check, result)| check.weight.max(0.0) * result.score)
+        .sum::<f64>();
+    let weighted_min_score = entries
+        .iter()
+        .map(|(check, result)| check.weight.max(0.0) * result.min_score)
+        .sum::<f64>();
+    let weighted_max_score = entries
+        .iter()
+        .map(|(check, result)| check.weight.max(0.0) * result.max_score)
+        .sum::<f64>();
+    let normalize = |value: f64| {
+        if total_weight > 0.0 {
+            value / total_weight
         } else {
             0.0
-        };
-        let aggregate_healthy = entries.iter().any(|(_, result)| result.ok > 0);
-        merged.health_ok = required_ok && aggregate_healthy;
-        merged.checks = entries
-            .iter()
-            .map(|(check, result)| CheckResult {
-                name: check.name.clone(),
-                path: check.path.clone(),
-                required: check.required,
-                weight: check.weight,
-                score: result.score,
-                healthy: result.ok > 0,
-                ok: result.ok,
-                fail: result.fail,
-                completed: result.completed,
-                success_rate: result.success_rate,
-                avg: result.avg,
-                p50: result.p50,
-                p90: result.p90,
-                p95: result.p95,
-                max: result.max,
-                jitter: result.jitter,
-                stddev: result.stddev,
-                packet_loss: result.packet_loss,
-                cold_ms: result.cold_ms,
-                colo: result.colo.clone(),
-            })
-            .collect();
-        merged.decision = if !required_ok {
-            "required_check_failed".to_string()
-        } else if !aggregate_healthy {
-            "discarded".to_string()
-        } else {
-            "competitive".to_string()
-        };
-        let _ = tx.send(merged);
-    }
+        }
+    };
+    let required_ok = expected_checks
+        .iter()
+        .filter(|check| check.required)
+        .all(|check| {
+            entries
+                .iter()
+                .any(|(entry, result)| entry.name == check.name && result.ok > 0)
+        });
+    let aggregate_healthy = entries.iter().any(|(_, result)| result.ok > 0);
+
+    merged.protocol = summary.protocol.clone();
+    merged.ok = ok;
+    merged.fail = fail;
+    merged.completed = completed;
+    merged.avg = summary.avg;
+    merged.p50 = summary.p50;
+    merged.p90 = summary.p90;
+    merged.p95 = summary.p95;
+    merged.max = summary.max;
+    merged.jitter = summary.jitter;
+    merged.stddev = summary.stddev;
+    merged.loss = loss;
+    merged.packet_loss = packet_loss;
+    merged.samples = summary.samples.clone();
+    merged.failures = entries
+        .iter()
+        .flat_map(|(_, result)| result.failures.iter().cloned())
+        .collect();
+    merged.diagnostics = entries
+        .iter()
+        .flat_map(|(_, result)| result.diagnostics.iter().cloned())
+        .collect();
+    merged.colo = summary.colo.clone();
+    merged.country = summary.country.clone();
+    merged.cold_ms = summary.cold_ms;
+    merged.success_rate = success_rate;
+    merged.min_score = normalize(weighted_min_score);
+    merged.max_score = normalize(weighted_max_score);
+    merged.success_rate_lower = success_rate_lower;
+    merged.success_rate_upper = success_rate_upper;
+    merged.score_confidence = summary.score_confidence;
+    merged.score = normalize(weighted_score);
+    merged.health_ok = required_ok && aggregate_healthy;
+    merged.checks = entries
+        .iter()
+        .map(|(check, result)| CheckResult {
+            name: check.name.clone(),
+            path: check.path.clone(),
+            required: check.required,
+            weight: check.weight,
+            score: result.score,
+            healthy: result.ok > 0,
+            ok: result.ok,
+            fail: result.fail,
+            completed: result.completed,
+            success_rate: result.success_rate,
+            avg: result.avg,
+            p50: result.p50,
+            p90: result.p90,
+            p95: result.p95,
+            max: result.max,
+            jitter: result.jitter,
+            stddev: result.stddev,
+            packet_loss: result.packet_loss,
+            cold_ms: result.cold_ms,
+            colo: result.colo.clone(),
+        })
+        .collect();
+    merged.decision = if !required_ok {
+        "required_check_failed".to_string()
+    } else if !aggregate_healthy {
+        "discarded".to_string()
+    } else {
+        "competitive".to_string()
+    };
+    Some(merged)
 }
 
 /// Select which CIDRs to focus the second phase on, given the discovery-pass
@@ -1619,12 +1676,12 @@ pub async fn run_scan_two_phase(
 #[cfg(test)]
 mod tests {
     use super::{
-        bootstrap_score_interval, cidr_valid, collect_from_cidrs_with_seed, parse_colo,
-        record_best, result_confidence, result_status, score_from_samples, select_focus_cidrs,
-        select_next_target, should_stop_early, validate_response, wilson_interval,
-        DiagnosticCategory, ProbeResult, TargetState,
+        bootstrap_score_interval, cidr_valid, collect_from_cidrs_with_seed, merge_profile_results,
+        parse_colo, record_best, result_confidence, result_status, score_from_samples,
+        select_focus_cidrs, select_next_target, should_stop_early, validate_response,
+        wilson_interval, DiagnosticCategory, ProbeResult, TargetState,
     };
-    use crate::config::AppConfig;
+    use crate::config::{AppConfig, HealthCheck};
 
     fn state(
         ip: &str,
@@ -2322,5 +2379,43 @@ mod tests {
         ];
         let focus = select_focus_cidrs(&phase1, &cidrs, None, 1);
         assert_eq!(focus, vec!["198.51.100.0/24".to_string()]);
+    }
+
+    #[test]
+    fn profile_merge_aggregates_required_check_counts() {
+        let mut passing = focus_result("192.0.2.1", Some("FRA"), 8.0, 2);
+        passing.failures = vec!["optional detail".to_string()];
+        let mut failing = focus_result("192.0.2.1", Some("AMS"), 2.0, 0);
+        failing.fail = 2;
+        failing.completed = 2;
+        failing.success_rate = 0.0;
+        failing.samples.clear();
+        failing.failures = vec!["required failure".to_string()];
+        let checks = vec![
+            HealthCheck {
+                name: "primary".to_string(),
+                path: "/".to_string(),
+                required: true,
+                weight: 1.0,
+            },
+            HealthCheck {
+                name: "fallback".to_string(),
+                path: "/health".to_string(),
+                required: true,
+                weight: 1.0,
+            },
+        ];
+        let merged = merge_profile_results(
+            &[(checks[0].clone(), passing), (checks[1].clone(), failing)],
+            &checks,
+        )
+        .unwrap();
+        assert_eq!(merged.ok, 2);
+        assert_eq!(merged.fail, 2);
+        assert_eq!(merged.completed, 4);
+        assert_eq!(merged.success_rate, 0.5);
+        assert_eq!(merged.failures.len(), 2);
+        assert_eq!(merged.checks.len(), 2);
+        assert!(!merged.health_ok);
     }
 }

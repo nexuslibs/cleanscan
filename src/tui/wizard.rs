@@ -257,6 +257,46 @@ impl SettingField {
         }
     }
 
+    fn is_fractional(&self) -> bool {
+        matches!(
+            self,
+            SettingField::StabilityWeight
+                | SettingField::LossWeight
+                | SettingField::EarlyStopPruneMargin
+                | SettingField::DiscoverFraction
+        )
+    }
+
+    fn fractional_step(&self) -> f64 {
+        match self {
+            SettingField::StabilityWeight | SettingField::LossWeight => 0.1,
+            SettingField::EarlyStopPruneMargin | SettingField::DiscoverFraction => 0.05,
+            _ => unreachable!("fractional_step called for an integer field"),
+        }
+    }
+
+    fn nudged_fractional_value(&self, value: f64, direction: i64) -> f64 {
+        let upper = if matches!(self, SettingField::DiscoverFraction) {
+            1.0
+        } else {
+            f64::MAX
+        };
+        (value + direction as f64 * self.fractional_step()).clamp(0.0, upper)
+    }
+
+    fn nudged_text(&self, value: &str, direction: i64) -> Option<String> {
+        if self.is_fractional() {
+            let value = value.parse::<f64>().ok()?;
+            let value = self.nudged_fractional_value(value, direction);
+            Some(format!("{value:.2}"))
+        } else {
+            value
+                .parse::<i64>()
+                .ok()
+                .map(|value| self.nudged_value(value, direction).to_string())
+        }
+    }
+
     fn max_value(&self) -> i64 {
         match self {
             SettingField::SamplePerCidr => MAX_SAMPLE_PER_CIDR as i64,
@@ -1430,9 +1470,8 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             KeyCode::End => app.edit_caret = app.edit_buffer.len(),
             KeyCode::Up | KeyCode::Down if field.is_numeric() => {
                 let delta = if code == KeyCode::Up { 1 } else { -1 };
-                if let Ok(v) = app.edit_buffer.parse::<i64>() {
-                    let nv = field.nudged_value(v, delta);
-                    app.edit_buffer = nv.to_string();
+                if let Some(value) = field.nudged_text(&app.edit_buffer, delta) {
+                    app.edit_buffer = value;
                     app.edit_caret = app.edit_buffer.len();
                 }
             }
@@ -1766,5 +1805,25 @@ mod tests {
         assert!(!app.commit_edit());
         assert_eq!(app.edit_field, Some(1));
         assert_eq!(app.config.path, "/cdn-cgi/trace");
+    }
+
+    #[test]
+    fn fractional_fields_nudge_without_integer_clamping() {
+        assert_eq!(
+            SettingField::StabilityWeight.nudged_text("1.0", -1),
+            Some("0.90".to_string())
+        );
+        assert_eq!(
+            SettingField::DiscoverFraction.nudged_text("0.25", -1),
+            Some("0.20".to_string())
+        );
+        assert_eq!(
+            SettingField::DiscoverFraction.nudged_text("0.0", -1),
+            Some("0.00".to_string())
+        );
+        assert_eq!(
+            SettingField::DiscoverFraction.nudged_text("1.0", 1),
+            Some("1.00".to_string())
+        );
     }
 }
