@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.13.0](https://github.com/nexuslibs/cleanscan/compare/v0.12.0...v0.13.0) (2026-07-19)
+
+
+### Features
+
+* add watch mode with adaptive primary endpoint selection ([1f2c411](https://github.com/nexuslibs/cleanscan/commit/1f2c411e96d1049401fa04c81773e5cbf5e226d7))
+* add watch mode with adaptive primary endpoint selection ([d6d540f](https://github.com/nexuslibs/cleanscan/commit/d6d540f672f5f7ab0f619e389f03f0df9cfd91f7))
+* enhance health check handling and update manifest backup logic ([4e5c8a9](https://github.com/nexuslibs/cleanscan/commit/4e5c8a940465a8a3088cab5f44844e150ae3d1e7))
+* enhance health check logic in profile scan to include aggregate health status ([30e1271](https://github.com/nexuslibs/cleanscan/commit/30e1271972a02712e2a161cd782ba5b40a4eedd9))
+* improve health check handling in profile scan and add tests for watch state persistence ([99ebe01](https://github.com/nexuslibs/cleanscan/commit/99ebe01179c0765ce644c705d67843a968daac6f))
+* integrate watch policy and state management into TUI application ([c6dc3c9](https://github.com/nexuslibs/cleanscan/commit/c6dc3c951746601e12edf515b116efe8fec7f7fa))
+* refactor health check and watch state management for improved stability and error handling ([2481831](https://github.com/nexuslibs/cleanscan/commit/2481831b5dba458a3e8648b8eb2281506b2e538b))
+* refactor watch policy handling in main and improve watch state management in TUI ([e76fa01](https://github.com/nexuslibs/cleanscan/commit/e76fa013d4fe96fcd06b1e50a65689fcdeceeb5d))
+
 ## [0.12.0](https://github.com/nexuslibs/cleanscan/compare/v0.11.0...v0.12.0) (2026-07-19)
 
 
