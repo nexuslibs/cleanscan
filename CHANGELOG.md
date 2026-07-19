@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.9.0](https://github.com/nexuslibs/cleanscan/compare/v0.8.0...v0.9.0) (2026-07-19)
+
+
+### Features
+
+* adopt tui-overlay, tui-checkbox and tui-slider for modal and wi… ([28618db](https://github.com/nexuslibs/cleanscan/commit/28618db1c19257f9c4cd59599923a440d6f5c3ab))
+* adopt tui-overlay, tui-checkbox and tui-slider for modal and wizard UI ([a171a52](https://github.com/nexuslibs/cleanscan/commit/a171a52f92365e4e1a5760aa7b2fc3bbbd6b311c))
+* enhance overlay lifecycle management for result details and quit confirmation ([539f92c](https://github.com/nexuslibs/cleanscan/commit/539f92c0a5f4a088716c34ab68ef8530121baf8d))
+
 ## [0.8.0](https://github.com/nexuslibs/cleanscan/compare/v0.7.0...v0.8.0) (2026-07-19)
 
 
