@@ -1,4 +1,5 @@
 use anyhow::Result;
+use reqwest::header::HeaderName;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::{fs, io::Write};
@@ -18,6 +19,26 @@ fn default_health_check_required() -> bool {
 }
 fn default_health_check_weight() -> f64 {
     1.0
+}
+
+/// Parse and validate a required response-header expression.
+///
+/// The first `=` separates the header name from its expected value; additional
+/// equals signs belong to the value (for example, a base64 token).
+pub fn parse_required_header(expression: &str) -> Result<(String, String), String> {
+    let Some((name, expected)) = expression.split_once('=') else {
+        return Err("headers must use name=value form".to_string());
+    };
+    let name = name.trim();
+    let expected = expected.trim();
+    if name.is_empty() {
+        return Err("header name must not be empty".to_string());
+    }
+    HeaderName::from_bytes(name.as_bytes()).map_err(|_| format!("invalid header name: {name}"))?;
+    if expected.is_empty() {
+        return Err("header value must not be empty".to_string());
+    }
+    Ok((name.to_string(), expected.to_string()))
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -346,7 +367,23 @@ pub fn save_config(config: &AppConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_config, AppConfig};
+    use super::{parse_config, parse_required_header, AppConfig};
+
+    #[test]
+    fn required_header_parser_validates_names_and_values() {
+        assert_eq!(
+            parse_required_header(" content-type = text/plain ").unwrap(),
+            ("content-type".to_string(), "text/plain".to_string())
+        );
+        assert_eq!(
+            parse_required_header("x-token=a=b=c").unwrap(),
+            ("x-token".to_string(), "a=b=c".to_string())
+        );
+        assert!(parse_required_header("=value").is_err());
+        assert!(parse_required_header("name=").is_err());
+        assert!(parse_required_header("=").is_err());
+        assert!(parse_required_header("bad header=value").is_err());
+    }
 
     #[test]
     fn selected_cidrs_distinguishes_missing_from_explicit_empty() {

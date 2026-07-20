@@ -518,10 +518,7 @@ fn render_latency_map(frame: &mut Frame, area: Rect, app: &App) {
         .enumerate()
         .map(|(index, result)| (index as f64 + 1.0, result.avg * 1000.0))
         .collect::<Vec<_>>();
-    let selected = selected_ip
-        .as_deref()
-        .and_then(|ip| results.iter().position(|result| result.ip == ip))
-        .unwrap_or(0);
+    let selected = selected_latency_index(selected_ip.as_deref(), &results);
     let max_y = points
         .iter()
         .map(|(_, value)| *value)
@@ -530,10 +527,10 @@ fn render_latency_map(frame: &mut Frame, area: Rect, app: &App) {
     let regular = points
         .iter()
         .enumerate()
-        .filter(|(index, _)| *index != selected)
+        .filter(|(index, _)| Some(*index) != selected)
         .map(|(_, point)| *point)
         .collect::<Vec<_>>();
-    let selected_point = [points[selected]];
+    let selected_point = selected.map(|index| [points[index]]);
     let canvas = Canvas::default()
         .block(widgets::panel_block(
             "Latency map — rank vs average ms",
@@ -549,10 +546,12 @@ fn render_latency_map(frame: &mut Frame, area: Rect, app: &App) {
                     color: palette.info,
                 });
             }
-            ctx.draw(&Points {
-                coords: &selected_point,
-                color: palette.highlight,
-            });
+            if let Some(selected_point) = &selected_point {
+                ctx.draw(&Points {
+                    coords: selected_point,
+                    color: palette.highlight,
+                });
+            }
         });
     frame.render_widget(canvas, area);
 }
@@ -737,17 +736,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
         "None".to_string()
     };
 
-    let avg_latency = if !ok_results.is_empty() {
-        ok_results.iter().map(|r| r.avg).sum::<f64>() / ok_results.len() as f64
-    } else {
-        0.0
-    };
-
-    let median_latency = if !ok_results.is_empty() {
-        median(ok_results.iter().map(|r| r.p50).collect())
-    } else {
-        0.0
-    };
+    let (avg_latency, median_latency) = latency_summary(&ok_results);
 
     let latency_lines = vec![
         Line::from(vec![
@@ -961,12 +950,8 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
     let sorted = app.sorted_results();
     let display: Vec<&ProbeResult> = sorted.iter().take(display_len).copied().collect();
 
-    // The fastest successful edge by average latency, starred wherever it appears.
-    let best_ip: Option<String> = {
-        let mut v: Vec<&ProbeResult> = app.results.iter().filter(|r| r.ok > 0).collect();
-        v.sort_by(|a, b| a.avg.total_cmp(&b.avg));
-        v.first().map(|r| r.ip.clone())
-    };
+    // The composite-score recommendation, starred wherever it appears.
+    let best_ip = recommendation_ip(&app.results.iter().filter(|r| r.ok > 0).collect::<Vec<_>>());
 
     let start = app.scroll;
     let end = (start + visible).min(display.len());
@@ -1007,7 +992,7 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
             let rank = start + i + 1;
             let is_selected = start + i == app.result_cursor;
 
-            // Star the fastest average-latency edge wherever it lands in the sort.
+            // Star the composite-score recommendation wherever it lands in the sort.
             let is_first = best_ip.as_deref() == Some(r.ip.as_str());
             let (ip_text, rank_text) = if is_first {
                 (format!("★ {}", r.ip), format!(" {rank}"))
@@ -1151,6 +1136,32 @@ fn median(mut values: Vec<f64>) -> f64 {
     }
 }
 
+fn latency_summary(results: &[&ProbeResult]) -> (f64, f64) {
+    let samples = results
+        .iter()
+        .flat_map(|result| result.samples.iter().copied())
+        .collect::<Vec<_>>();
+    if samples.is_empty() {
+        (0.0, 0.0)
+    } else {
+        (
+            samples.iter().sum::<f64>() / samples.len() as f64,
+            median(samples),
+        )
+    }
+}
+
+fn recommendation_ip(results: &[&ProbeResult]) -> Option<String> {
+    results
+        .iter()
+        .min_by(|a, b| App::natural_cmp(a, b))
+        .map(|result| result.ip.clone())
+}
+
+fn selected_latency_index(selected_ip: Option<&str>, results: &[&ProbeResult]) -> Option<usize> {
+    selected_ip.and_then(|ip| results.iter().position(|result| result.ip == ip))
+}
+
 fn latency_bucket(ms: f64) -> usize {
     if ms < theme::LATENCY_GOOD_MS {
         0
@@ -1250,7 +1261,46 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
 
 #[cfg(test)]
 mod tests {
-    use super::{latency_bucket, median};
+    use super::{
+        latency_bucket, latency_summary, median, recommendation_ip, selected_latency_index,
+    };
+    use crate::scanner::ProbeResult;
+
+    fn result(ip: &str, score: f64, samples: &[f64]) -> ProbeResult {
+        ProbeResult {
+            ip: ip.to_string(),
+            protocol: "h2".to_string(),
+            ok: samples.len(),
+            fail: 0,
+            completed: samples.len(),
+            avg: samples.iter().sum::<f64>() / samples.len().max(1) as f64,
+            p50: 0.0,
+            p90: 0.0,
+            p95: 0.0,
+            max: 0.0,
+            jitter: 0.0,
+            stddev: 0.0,
+            loss: 0,
+            packet_loss: 0.0,
+            samples: samples.to_vec(),
+            failures: Vec::new(),
+            diagnostics: Vec::new(),
+            success_rate: 1.0,
+            score,
+            colo: None,
+            country: None,
+            cold_ms: None,
+            stopped_early: false,
+            min_score: score,
+            max_score: score,
+            success_rate_lower: 1.0,
+            success_rate_upper: 1.0,
+            score_confidence: 0.95,
+            decision: "competitive".to_string(),
+            checks: Vec::new(),
+            health_ok: true,
+        }
+    }
 
     #[test]
     fn median_averages_even_central_values() {
@@ -1263,5 +1313,29 @@ mod tests {
         assert_eq!(latency_bucket(199.9), 1);
         assert_eq!(latency_bucket(200.0), 2);
         assert_eq!(latency_bucket(249.9), 2);
+    }
+
+    #[test]
+    fn latency_summary_uses_all_raw_samples() {
+        let first = result("192.0.2.1", 1.0, &[1.0]);
+        let second = result("192.0.2.2", 0.5, &[3.0, 5.0, 7.0]);
+        let refs = vec![&first, &second];
+        assert_eq!(latency_summary(&refs), (4.0, 4.0));
+    }
+
+    #[test]
+    fn recommendation_ip_uses_composite_score() {
+        let fast = result("192.0.2.1", 1.0, &[1.0]);
+        let recommended = result("192.0.2.2", 2.0, &[2.0]);
+        let refs = vec![&fast, &recommended];
+        assert_eq!(recommendation_ip(&refs).as_deref(), Some("192.0.2.2"));
+    }
+
+    #[test]
+    fn filtered_selected_ip_does_not_fall_back_to_first_point() {
+        let first = result("192.0.2.1", 1.0, &[1.0]);
+        let second = result("192.0.2.2", 0.5, &[2.0]);
+        let refs = vec![&first, &second];
+        assert_eq!(selected_latency_index(Some("192.0.2.9"), &refs), None);
     }
 }

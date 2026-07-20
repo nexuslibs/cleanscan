@@ -561,24 +561,28 @@ fn healthy_result(
     thresholds: HealthThresholds,
     min_confidence: &str,
 ) -> bool {
-    let mut required_checks = result.checks.iter().filter(|check| check.required);
-    let success_rate_ok = if result.checks.is_empty() {
+    let required_checks = result
+        .checks
+        .iter()
+        .filter(|check| check.required)
+        .collect::<Vec<_>>();
+    let success_rate_ok = if required_checks.is_empty() {
         thresholds
             .min_success_rate
             .is_none_or(|min| result.success_rate >= min)
     } else {
-        required_checks.clone().all(|check| {
+        required_checks.iter().all(|check| {
             thresholds
                 .min_success_rate
                 .is_none_or(|min| check.success_rate >= min)
         })
     };
-    let p95_ok = if result.checks.is_empty() {
+    let p95_ok = if required_checks.is_empty() {
         thresholds
             .max_p95_ms
             .is_none_or(|max| result.p95 * 1000.0 <= max)
     } else {
-        required_checks.all(|check| {
+        required_checks.iter().all(|check| {
             thresholds
                 .max_p95_ms
                 .is_none_or(|max| check.p95 * 1000.0 <= max)
@@ -1244,6 +1248,20 @@ mod tests {
 
         result.checks[1].p95 = 0.05;
         assert!(healthy_result(
+            &result,
+            HealthThresholds {
+                min_success_rate: Some(1.0),
+                max_p95_ms: Some(100.0),
+            },
+            "UNKNOWN"
+        ));
+
+        for check in &mut result.checks {
+            check.required = false;
+        }
+        result.success_rate = 0.0;
+        result.p95 = 0.20;
+        assert!(!healthy_result(
             &result,
             HealthThresholds {
                 min_success_rate: Some(1.0),

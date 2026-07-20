@@ -312,7 +312,6 @@ pub struct App {
     pub manifest_thresholds: crate::HealthThresholds,
     pub manifest_min_confidence: String,
     pub manifest_backups: usize,
-    pub last_watch_primary: Option<String>,
     pub last_watch_healthy: Option<bool>,
     pub alert_message: Option<String>,
     pub watch_state: Option<crate::watch::WatchState>,
@@ -581,7 +580,6 @@ impl App {
             },
             manifest_min_confidence: "UNKNOWN".to_string(),
             manifest_backups: 3,
-            last_watch_primary: None,
             last_watch_healthy: None,
             alert_message: None,
             watch_state: None,
@@ -1612,7 +1610,6 @@ pub fn run_tui(
                         if let Err(error) = crate::config::append_history(&record) {
                             app.toast_warn(format!("History write failed: {error}"));
                         }
-                        app.last_watch_primary = transition.stable_primary;
                         app.last_watch_healthy = Some(healthy);
                     }
                     if app.watch_interval.is_none() {

@@ -55,7 +55,6 @@ fn client_for_ip(host: &str, ip: &str, args: &AppConfig) -> Result<Client> {
     let socket = SocketAddr::new(ip_addr, 443);
     Ok(reqwest::Client::builder()
         .http2_adaptive_window(true)
-        .pool_max_idle_per_host(0)
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .resolve_to_addrs(resolve_host_for_ip(host), &[socket])
@@ -77,10 +76,11 @@ async fn download_once(
 
     let mut response = response;
     let mut bytes = 0u64;
+    let mut seconds = None;
     while let Some(chunk) = response.chunk().await? {
         bytes = bytes.saturating_add(chunk.len() as u64);
-        if bytes >= expected_bytes {
-            break;
+        if seconds.is_none() && bytes >= expected_bytes {
+            seconds = Some(start.elapsed().as_secs_f64().max(f64::EPSILON));
         }
     }
     if bytes < expected_bytes {
@@ -90,7 +90,7 @@ async fn download_once(
             expected_bytes
         ));
     }
-    let seconds = start.elapsed().as_secs_f64().max(f64::EPSILON);
+    let seconds = seconds.unwrap_or_else(|| start.elapsed().as_secs_f64().max(f64::EPSILON));
     Ok(SpeedMeasurement {
         bytes: expected_bytes,
         seconds,
@@ -123,6 +123,7 @@ async fn upload_once(client: &Client, url: &str, payload_bytes: u64) -> Result<S
     }
 
     let seconds = start.elapsed().as_secs_f64().max(f64::EPSILON);
+    response.bytes().await?;
     Ok(SpeedMeasurement {
         bytes: payload_bytes,
         seconds,
@@ -185,6 +186,17 @@ async fn test_target(ip: String, args: Arc<AppConfig>, direction: SpeedDirection
     let mut downloads = Vec::new();
     let mut uploads = Vec::new();
     let mut errors = Vec::new();
+
+    if direction.includes_download() {
+        if let Err(error) = download_once(&client, &download_url, args.speed_payload_bytes).await {
+            errors.push(format!("download warmup: {error}"));
+        }
+    }
+    if direction.includes_upload() {
+        if let Err(error) = upload_once(&client, &upload_url, args.speed_payload_bytes).await {
+            errors.push(format!("upload warmup: {error}"));
+        }
+    }
 
     for _ in 0..repetitions {
         if direction.includes_download() {

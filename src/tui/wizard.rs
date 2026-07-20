@@ -6,6 +6,7 @@ use ratatui::{
     widgets::{List, ListItem, Paragraph, Wrap},
     Frame,
 };
+use std::collections::HashSet;
 
 use crate::config::{AppConfig, HealthCheck};
 use crate::tui::theme;
@@ -335,6 +336,11 @@ impl SettingField {
     }
 
     fn nudged_fractional_value(&self, value: f64, direction: i64) -> f64 {
+        let lower = if matches!(self, SettingField::Confidence) {
+            0.01
+        } else {
+            0.0
+        };
         let upper = if matches!(
             self,
             SettingField::DiscoverFraction | SettingField::Confidence
@@ -343,7 +349,7 @@ impl SettingField {
         } else {
             f64::MAX
         };
-        (value + direction as f64 * self.fractional_step()).clamp(0.0, upper)
+        (value + direction as f64 * self.fractional_step()).clamp(lower, upper)
     }
 
     fn nudged_text(&self, value: &str, direction: i64) -> Option<String> {
@@ -458,8 +464,8 @@ impl SettingField {
                         .map(|value| value.trim().to_string())
                         .collect()
                 };
-                if headers.iter().any(|value| !value.contains('=')) {
-                    return Err("headers must use name=value form".to_string());
+                for value in &headers {
+                    crate::config::parse_required_header(value)?;
                 }
                 args.required_headers = headers;
             }
@@ -475,6 +481,7 @@ impl SettingField {
                     args.health_checks.clear();
                 } else {
                     let mut checks = Vec::new();
+                    let mut names = HashSet::new();
                     for encoded in raw.split(';') {
                         let fields: Vec<&str> = encoded.split('|').collect();
                         if fields.len() != 4
@@ -484,6 +491,10 @@ impl SettingField {
                             return Err(
                                 "checks must use name|/path|required|weight format".to_string()
                             );
+                        }
+                        let name = fields[0].trim().to_string();
+                        if !names.insert(name.clone()) {
+                            return Err(format!("duplicate health check name: {name}"));
                         }
                         let required = match fields[2].trim().to_lowercase().as_str() {
                             "true" | "on" | "yes" | "1" => true,
@@ -498,7 +509,7 @@ impl SettingField {
                             return Err("check weight must be non-negative".to_string());
                         }
                         checks.push(HealthCheck {
-                            name: fields[0].trim().to_string(),
+                            name,
                             path: fields[1].trim().to_string(),
                             required,
                             weight,
@@ -1856,8 +1867,48 @@ mod tests {
     }
 
     #[test]
+    fn health_checks_reject_duplicate_names() {
+        let mut config = AppConfig::default();
+        let error = SettingField::HealthChecks
+            .apply(
+                "primary|/health|true|1; primary |/ready|false|1",
+                &mut config,
+            )
+            .unwrap_err();
+        assert_eq!(error, "duplicate health check name: primary");
+        assert!(config.health_checks.is_empty());
+    }
+
+    #[test]
     fn confidence_slider_uses_fractional_bounds() {
         assert_eq!(numeric_slider_bounds(SettingField::Confidence), (0.0, 1.0));
+    }
+
+    #[test]
+    fn confidence_nudge_never_reaches_uncommittable_zero() {
+        assert_eq!(
+            SettingField::Confidence.nudged_fractional_value(0.05, -1),
+            0.01
+        );
+        let mut config = AppConfig::default();
+        assert!(SettingField::Confidence.apply("0.01", &mut config).is_ok());
+    }
+
+    #[test]
+    fn required_headers_reject_empty_parts_and_accept_equals_in_values() {
+        let mut config = AppConfig::default();
+        assert!(SettingField::RequiredHeaders
+            .apply("x-token=a=b", &mut config)
+            .is_ok());
+        assert!(SettingField::RequiredHeaders
+            .apply("=value", &mut config)
+            .is_err());
+        assert!(SettingField::RequiredHeaders
+            .apply("name=", &mut config)
+            .is_err());
+        assert!(SettingField::RequiredHeaders
+            .apply("bad header=value", &mut config)
+            .is_err());
     }
 
     #[test]

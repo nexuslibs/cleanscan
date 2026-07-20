@@ -614,19 +614,24 @@ fn validate_response(
         }
     }
     for expression in &args.required_headers {
-        let Some((name, expected)) = expression.split_once('=') else {
-            return Some(ProbeDiagnostic {
-                category: DiagnosticCategory::ValidationHeader,
-                phase: DiagnosticPhase::ResponseHeaders,
-                message: format!("invalid required header expression: {expression}"),
-                status: Some(status),
-                location: location.map(str::to_string),
-                elapsed_ms: None,
-            });
+        let (name, expected) = match crate::config::parse_required_header(expression) {
+            Ok(value) => value,
+            Err(error) => {
+                return Some(ProbeDiagnostic {
+                    category: DiagnosticCategory::ValidationHeader,
+                    phase: DiagnosticPhase::ResponseHeaders,
+                    message: format!("invalid required header expression: {error}"),
+                    status: Some(status),
+                    location: location.map(str::to_string),
+                    elapsed_ms: None,
+                });
+            }
         };
-        let name = name.trim();
-        let expected = expected.trim();
-        if headers.get(name).and_then(|value| value.to_str().ok()) != Some(expected) {
+        if headers
+            .get(name.as_str())
+            .and_then(|value| value.to_str().ok())
+            != Some(expected.as_str())
+        {
             return Some(ProbeDiagnostic {
                 category: DiagnosticCategory::ValidationHeader,
                 phase: DiagnosticPhase::ResponseHeaders,
@@ -1362,7 +1367,9 @@ pub async fn run_scan(
 /// target result. Checks share the same target set and validation policy, but
 /// currently use independent clients and warmup requests; top-level latency
 /// fields use the required check with the worst p95 as the summary, while
-/// reliability and score fields aggregate across checks.
+/// reliability and score fields are based on required checks. Optional checks
+/// remain available in the per-check details but do not affect recommendation
+/// scoring or required-health accounting.
 pub async fn run_profile_scan(
     targets: Vec<String>,
     args: Arc<AppConfig>,
@@ -1465,16 +1472,26 @@ fn merge_profile_results(
     };
     let (success_rate_lower, success_rate_upper) =
         wilson_interval(ok, completed, summary.score_confidence);
-    let total_weight: f64 = entries.iter().map(|(check, _)| check.weight.max(0.0)).sum();
-    let weighted_score = entries
+    let score_entries: Vec<&(HealthCheck, ProbeResult)> =
+        entries.iter().filter(|(check, _)| check.required).collect();
+    let score_entries = if score_entries.is_empty() {
+        entries.iter().collect()
+    } else {
+        score_entries
+    };
+    let total_weight: f64 = score_entries
+        .iter()
+        .map(|(check, _)| check.weight.max(0.0))
+        .sum();
+    let weighted_score = score_entries
         .iter()
         .map(|(check, result)| check.weight.max(0.0) * result.score)
         .sum::<f64>();
-    let weighted_min_score = entries
+    let weighted_min_score = score_entries
         .iter()
         .map(|(check, result)| check.weight.max(0.0) * result.min_score)
         .sum::<f64>();
-    let weighted_max_score = entries
+    let weighted_max_score = score_entries
         .iter()
         .map(|(check, result)| check.weight.max(0.0) * result.max_score)
         .sum::<f64>();
@@ -2512,5 +2529,46 @@ mod tests {
         assert_eq!(merged.failures.len(), 2);
         assert_eq!(merged.checks.len(), 2);
         assert!(!merged.health_ok);
+    }
+
+    #[test]
+    fn profile_merge_optional_checks_do_not_dilute_recommendation_score() {
+        let required = focus_result("192.0.2.1", Some("FRA"), 5.0, 2);
+        let optional = focus_result("192.0.2.1", Some("AMS"), 100.0, 2);
+        let checks = vec![
+            HealthCheck {
+                name: "primary".to_string(),
+                path: "/".to_string(),
+                required: true,
+                weight: 1.0,
+            },
+            HealthCheck {
+                name: "optional".to_string(),
+                path: "/ready".to_string(),
+                required: false,
+                weight: 100.0,
+            },
+        ];
+        let merged = merge_profile_results(
+            &[(checks[0].clone(), required), (checks[1].clone(), optional)],
+            &checks,
+        )
+        .unwrap();
+        assert_eq!(merged.score, 5.0);
+        assert_eq!(merged.min_score, 5.0);
+        assert_eq!(merged.max_score, 5.0);
+    }
+
+    #[test]
+    fn profile_merge_falls_back_to_all_checks_without_required_checks() {
+        let optional = focus_result("192.0.2.1", Some("AMS"), 7.0, 2);
+        let checks = vec![HealthCheck {
+            name: "optional".to_string(),
+            path: "/ready".to_string(),
+            required: false,
+            weight: 1.0,
+        }];
+        let merged = merge_profile_results(&[(checks[0].clone(), optional)], &checks).unwrap();
+        assert_eq!(merged.score, 7.0);
     }
 }
