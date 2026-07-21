@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.15.0](https://github.com/nexuslibs/cleanscan/compare/v0.14.0...v0.15.0) (2026-07-21)
+
+
+### Features
+
+* Enhance ProbeResult to include port details and support multiple ports ([412b371](https://github.com/nexuslibs/cleanscan/commit/412b371e27ac96878b8f23dbef851d8f34969185))
+* enhanced TUI wizard visual feedback for ranges ([c98a776](https://github.com/nexuslibs/cleanscan/commit/c98a7761485f1b8bffa41d76741c02cc15c883ee))
+* enhanced TUI wizard visual feedback for ranges ([aa98c98](https://github.com/nexuslibs/cleanscan/commit/aa98c987c8156f6a7e6a1ea18304efca533e7a1a))
+
+
+### Bug Fixes
+
+* stop scans promptly on cancellation and align TUI columns ([00eb0d1](https://github.com/nexuslibs/cleanscan/commit/00eb0d1e378184e4adcbf8f21a18114b91ecd9cd))
+
 ## [0.14.0](https://github.com/nexuslibs/cleanscan/compare/v0.13.0...v0.14.0) (2026-07-21)
 
 
