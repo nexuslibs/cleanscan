@@ -847,7 +847,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
     if !app.scan_complete && total > 0 && app.scan_progress.probes_completed > 0 {
         let elapsed = app.start_time.elapsed().as_secs_f64();
         let rate = app.scan_progress.probes_completed as f64 / elapsed.max(0.001);
-        let remaining = total - passed;
+        let remaining = total.saturating_sub(passed);
         let target_rate = passed as f64 / elapsed.max(0.001);
         let eta = if target_rate > 0.0 {
             (remaining as f64 / target_rate).max(0.0)

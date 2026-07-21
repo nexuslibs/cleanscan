@@ -1261,7 +1261,8 @@ async fn run_scan_port(
     paused: Arc<AtomicBool>,
     port: u16,
     include_port_details: bool,
-) {
+    progress_offsets: (usize, usize, usize),
+) -> (usize, usize, usize) {
     let sem = Arc::new(Semaphore::new(args.concurrency.max(1)));
 
     let probe_count = if args.adaptive_probing {
@@ -1275,9 +1276,7 @@ async fn run_scan_port(
         .map(|ip| TargetState::new(ip, &args, probe_count, port))
         .collect();
     let mut futs = FuturesUnordered::new();
-    let mut probes_started = 0usize;
-    let mut probes_completed = 0usize;
-    let mut targets_completed = 0usize;
+    let (mut probes_started, mut probes_completed, mut targets_completed) = progress_offsets;
 
     send_progress(
         progress.as_ref(),
@@ -1519,6 +1518,7 @@ async fn run_scan_port(
                         let _ = state;
                         let adaptive_stop =
                             args.adaptive_probing && adaptive_should_stop(index, &mut states, &args);
+                        let mut completed_target = None;
                         if adaptive_stop || legacy_stop {
                             // Target is dead or cannot beat the current
                             // leaderboard; stop probing it and emit a partial
@@ -1532,15 +1532,7 @@ async fn run_scan_port(
                             record_best(&mut best, &result, args.top);
                             let _ = tx.send(result);
                             targets_completed += 1;
-                            send_progress(
-                                progress.as_ref(),
-                                ScanPhase::Probing,
-                                probes_started,
-                                probes_completed,
-                                futs.len(),
-                                targets_completed,
-                                Some(state.ip.clone()),
-                            );
+                            completed_target = Some(state.ip.clone());
                         } else if completed == probe_count {
                             let state = &mut states[index];
                             let mut result = state.result_with_mode(args.adaptive_probing);
@@ -1550,15 +1542,7 @@ async fn run_scan_port(
                             record_best(&mut best, &result, args.top);
                             let _ = tx.send(result);
                             targets_completed += 1;
-                            send_progress(
-                                progress.as_ref(),
-                                ScanPhase::Probing,
-                                probes_started,
-                                probes_completed,
-                                futs.len(),
-                                targets_completed,
-                                Some(state.ip.clone()),
-                            );
+                            completed_target = Some(state.ip.clone());
                         }
                         send_progress(
                             progress.as_ref(),
@@ -1567,13 +1551,14 @@ async fn run_scan_port(
                             probes_completed,
                             futs.len(),
                             targets_completed,
-                            None,
+                            completed_target,
                         );
                     }
                 }
             }
         }
     }
+    (probes_started, probes_completed, targets_completed)
 }
 
 pub async fn run_scan_with_progress(
@@ -1584,14 +1569,37 @@ pub async fn run_scan_with_progress(
     paused: Arc<AtomicBool>,
     progress: Option<std::sync::mpsc::Sender<ScanProgress>>,
 ) {
+    run_scan_with_progress_from_offsets(targets, args, tx, cancel, paused, progress, (0, 0, 0))
+        .await;
+}
+
+async fn run_scan_with_progress_from_offsets(
+    targets: Vec<String>,
+    args: Arc<AppConfig>,
+    tx: std::sync::mpsc::Sender<ProbeResult>,
+    cancel: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    progress: Option<std::sync::mpsc::Sender<ScanProgress>>,
+    mut progress_offsets: (usize, usize, usize),
+) -> (usize, usize, usize) {
     let ports = if args.ports.is_empty() {
         vec![443]
     } else {
         args.ports.clone()
     };
     if ports.len() == 1 {
-        run_scan_port(targets, args, tx, progress, cancel, paused, ports[0], true).await;
-        return;
+        return run_scan_port(
+            targets,
+            args,
+            tx,
+            progress,
+            cancel,
+            paused,
+            ports[0],
+            true,
+            progress_offsets,
+        )
+        .await;
     }
 
     let mut by_ip: BTreeMap<String, Vec<ProbeResult>> = BTreeMap::new();
@@ -1602,7 +1610,7 @@ pub async fn run_scan_with_progress(
         let mut port_args = (*args).clone();
         port_args.ports = vec![port];
         let (port_tx, port_rx) = std::sync::mpsc::channel();
-        run_scan_port(
+        progress_offsets = run_scan_port(
             targets.clone(),
             Arc::new(port_args),
             port_tx,
@@ -1611,18 +1619,29 @@ pub async fn run_scan_with_progress(
             paused.clone(),
             port,
             false,
+            progress_offsets,
         )
         .await;
         for result in port_rx {
+            let _ = tx.send(result.clone());
             by_ip.entry(result.ip.clone()).or_default().push(result);
         }
     }
-    send_progress(progress.as_ref(), ScanPhase::Finalizing, 0, 0, 0, 0, None);
+    send_progress(
+        progress.as_ref(),
+        ScanPhase::Finalizing,
+        progress_offsets.0,
+        progress_offsets.1,
+        0,
+        progress_offsets.2,
+        None,
+    );
     for (_, results) in by_ip {
         if let Some(result) = merge_port_results(&results) {
             let _ = tx.send(result);
         }
     }
+    progress_offsets
 }
 
 fn merge_port_results(results: &[ProbeResult]) -> Option<ProbeResult> {
@@ -1673,21 +1692,31 @@ pub async fn run_profile_scan(
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
 ) {
-    run_profile_scan_with_progress(targets, args, tx, cancel, paused, None).await;
+    run_profile_scan_with_progress_from_offsets(targets, args, tx, cancel, paused, None, (0, 0, 0))
+        .await;
 }
 
-pub async fn run_profile_scan_with_progress(
+async fn run_profile_scan_with_progress_from_offsets(
     targets: Vec<String>,
     args: Arc<AppConfig>,
     tx: std::sync::mpsc::Sender<ProbeResult>,
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     progress: Option<std::sync::mpsc::Sender<ScanProgress>>,
-) {
+    mut progress_offsets: (usize, usize, usize),
+) -> (usize, usize, usize) {
     let checks = effective_health_checks(&args);
     if args.health_checks.is_empty() {
-        run_scan_with_progress(targets, args, tx, cancel, paused, progress).await;
-        return;
+        return run_scan_with_progress_from_offsets(
+            targets,
+            args,
+            tx,
+            cancel,
+            paused,
+            progress,
+            progress_offsets,
+        )
+        .await;
     }
 
     let expected_checks = checks.clone();
@@ -1710,7 +1739,7 @@ pub async fn run_profile_scan_with_progress(
             check_args.health_checks.clear();
             check_args.ports = vec![port];
             let (check_tx, check_rx) = std::sync::mpsc::channel();
-            run_scan_port(
+            progress_offsets = run_scan_port(
                 targets.clone(),
                 Arc::new(check_args),
                 check_tx,
@@ -1719,9 +1748,11 @@ pub async fn run_profile_scan_with_progress(
                 paused.clone(),
                 port,
                 false,
+                progress_offsets,
             )
             .await;
             for result in check_rx {
+                let _ = tx.send(result.clone());
                 by_ip
                     .entry(result.ip.clone())
                     .or_default()
@@ -1746,6 +1777,36 @@ pub async fn run_profile_scan_with_progress(
             let _ = tx.send(result);
         }
     }
+    send_progress(
+        progress.as_ref(),
+        ScanPhase::Finalizing,
+        progress_offsets.0,
+        progress_offsets.1,
+        0,
+        progress_offsets.2,
+        None,
+    );
+    progress_offsets
+}
+
+pub async fn run_profile_scan_with_progress(
+    targets: Vec<String>,
+    args: Arc<AppConfig>,
+    tx: std::sync::mpsc::Sender<ProbeResult>,
+    cancel: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    progress: Option<std::sync::mpsc::Sender<ScanProgress>>,
+) {
+    run_profile_scan_with_progress_from_offsets(
+        targets,
+        args,
+        tx,
+        cancel,
+        paused,
+        progress,
+        (0, 0, 0),
+    )
+    .await;
 }
 
 fn merge_profile_results(
@@ -2026,13 +2087,14 @@ pub async fn run_scan_two_phase_with_progress(
     let (p1_tx, p1_rx) = std::sync::mpsc::channel();
     let targets1 = collect_from_cidrs_with_seed(&selected_cidrs, discover_per, base_seed)?;
     let mut actual_targets: BTreeSet<String> = targets1.iter().cloned().collect();
-    run_scan_with_progress(
+    let progress_offsets = run_scan_with_progress_from_offsets(
         targets1,
         config.clone(),
         p1_tx,
         cancel.clone(),
         paused.clone(),
         progress.clone(),
+        (0, 0, 0),
     )
     .await;
     let phase1: Vec<ProbeResult> = p1_rx.iter().collect();
@@ -2083,13 +2145,14 @@ pub async fn run_scan_two_phase_with_progress(
     if !targets2.is_empty() {
         actual_targets.extend(targets2.iter().cloned());
         send_progress(progress.as_ref(), ScanPhase::Focus, 0, 0, 0, 0, None);
-        run_scan_with_progress(
+        run_scan_with_progress_from_offsets(
             targets2.into_iter().collect(),
             config,
             tx,
             cancel,
             paused,
             progress,
+            progress_offsets,
         )
         .await;
     }
