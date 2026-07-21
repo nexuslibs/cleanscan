@@ -787,6 +787,9 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
         &[
             widgets::HeaderSegment::new("Host", app.config.host.clone()),
             widgets::HeaderSegment::new("Path", app.config.path.clone()),
+            widgets::HeaderSegment::new("IP", app.system_network.public_ip_display()),
+            widgets::HeaderSegment::new("ASN", app.system_network.asn_display()),
+            widgets::HeaderSegment::new("ISP", app.system_network.isp_display()),
             widgets::HeaderSegment::new("Elapsed", elapsed_str),
         ],
     );

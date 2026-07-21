@@ -265,6 +265,7 @@ pub struct CidrEntry {
 pub struct App {
     /// Editable scan parameters; drive the scan when launched from the wizard.
     pub config: AppConfig,
+    pub system_network: crate::system_info::SystemNetworkInfo,
     pub screen: Screen,
     pub wizard_step: WizardStep,
     pub cidr_candidates: Vec<CidrEntry>,
@@ -661,6 +662,7 @@ impl App {
 
         Self {
             config,
+            system_network: crate::system_info::SystemNetworkInfo::default(),
             screen: if has_cli_targets {
                 Screen::Scanning
             } else {
@@ -1472,6 +1474,7 @@ pub fn run_tui(
     watch_policy: crate::watch::WatchPolicy,
     watch_state_path: Option<&str>,
     watch_new_sample: bool,
+    system_network: crate::system_info::SystemNetworkInfo,
 ) -> anyhow::Result<()> {
     let has_cli_targets = cli_ips.is_some() || !cli_cidr.is_empty();
 
@@ -1497,6 +1500,7 @@ pub fn run_tui(
     let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
     let _guard = RestoreGuard;
     let mut app = App::new((*config_arc).clone(), has_cli_targets, paused.clone());
+    app.system_network = system_network;
     app.set_cancel_token(cancel.clone());
     app.watch_interval = watch_interval.map(|seconds| Duration::from_secs(seconds.max(1)));
     app.manifest_path = manifest_path;

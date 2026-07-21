@@ -8,7 +8,8 @@
 # Options (environment variables):
 #   CLEANSCAN_VERSION     tag to install, e.g. v1.0.0 (default: latest)
 #   CLEANASCAN_VERSION    deprecated alias for CLEANSCAN_VERSION
-#   INSTALL_DIR          where to install (default: /usr/local/bin or ~/.local/bin)
+#   INSTALL_DIR          where to install (default: $PREFIX/bin in Termux,
+#                         otherwise /usr/local/bin or ~/.local/bin)
 #   BIN_DIR              alias for INSTALL_DIR
 
 set -euo pipefail
@@ -29,25 +30,47 @@ command -v tar  >/dev/null 2>&1 || err "tar is required but not found"
 # ---------------------------------------------------------------------------
 # Platform detection
 # ---------------------------------------------------------------------------
-OS="$(uname -s)"
-ARCH="$(uname -m)"
+OS="${CLEANSCAN_TEST_OS:-$(uname -s)}"
+ARCH="${CLEANSCAN_TEST_ARCH:-$(uname -m)}"
+
+IS_TERMUX=0
+if [ -n "${CLEANSCAN_TEST_TERMUX:-}" ]; then
+  IS_TERMUX=1
+elif [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == */com.termux/* ]]; then
+  IS_TERMUX=1
+fi
 
 case "$OS" in
   Linux)  OS_KIND=linux ;;
   Darwin) OS_KIND=darwin ;;
-  *) err "unsupported OS: $OS (only Linux and macOS are supported)" ;;
+  *) err "unsupported OS: $OS (only Linux, macOS, and Termux are supported)" ;;
 esac
 
 case "$ARCH" in
   x86_64|amd64)  ARCH_KIND=x86_64 ;;
   aarch64|arm64) ARCH_KIND=aarch64 ;;
-  *) err "unsupported architecture: $ARCH (only x86_64 and aarch64 are supported)" ;;
+  armv7l|armv7)  ARCH_KIND=armv7 ;;
+  i686|i386|x86) ARCH_KIND=i686 ;;
+  *) err "unsupported architecture: $ARCH (supported: x86_64, aarch64, armv7, i686)" ;;
 esac
 
-if [ "$OS_KIND" = "darwin" ]; then
-  TARGET="${ARCH_KIND}-apple-darwin"
+if [ "$IS_TERMUX" -eq 1 ]; then
+  [ "$OS_KIND" = "linux" ] || err "Termux must run on Linux"
+  case "$ARCH_KIND" in
+    armv7) TARGET="armv7-unknown-linux-musleabihf" ;;
+    i686) TARGET="i686-unknown-linux-musl" ;;
+    *) TARGET="${ARCH_KIND}-unknown-linux-musl" ;;
+  esac
+elif [ "$OS_KIND" = "darwin" ]; then
+  case "$ARCH_KIND" in
+    x86_64|aarch64) TARGET="${ARCH_KIND}-apple-darwin" ;;
+    *) err "unsupported macOS architecture: $ARCH" ;;
+  esac
 else
-  TARGET="${ARCH_KIND}-unknown-linux-musl"
+  case "$ARCH_KIND" in
+    armv7) TARGET="armv7-unknown-linux-musleabihf" ;;
+    *) TARGET="${ARCH_KIND}-unknown-linux-musl" ;;
+  esac
 fi
 
 # ---------------------------------------------------------------------------
@@ -72,6 +95,10 @@ if [ -n "${INSTALL_DIR:-}" ]; then
   : # use as-is
 elif [ -n "${BIN_DIR:-}" ]; then
   INSTALL_DIR="$BIN_DIR"
+elif [ "$IS_TERMUX" -eq 1 ]; then
+  PREFIX_VALUE="${CLEANSCAN_TEST_PREFIX:-${PREFIX:-}}"
+  [ -n "$PREFIX_VALUE" ] || err "Termux prefix is unavailable; set PREFIX or INSTALL_DIR"
+  INSTALL_DIR="$PREFIX_VALUE/bin"
 elif [ -w /usr/local/bin ]; then
   INSTALL_DIR="/usr/local/bin"
 elif [ -n "${HOME:-}" ] && [ -w "${HOME}/.local/bin" ]; then
@@ -84,6 +111,11 @@ else
 fi
 
 mkdir -p "$INSTALL_DIR"
+
+if [ "${CLEANSCAN_INSTALLER_DRY_RUN:-0}" = "1" ]; then
+  printf 'target=%s\ninstall_dir=%s\n' "$TARGET" "$INSTALL_DIR"
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Download
