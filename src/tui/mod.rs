@@ -204,6 +204,7 @@ pub struct App {
     pub wizard_step: WizardStep,
     pub cidr_candidates: Vec<CidrEntry>,
     pub cursor: usize,
+    pub port_cursor: usize,
     /// When true, the user is typing a custom CIDR in the ranges step.
     pub custom_input_mode: bool,
     pub input_buffer: String,
@@ -494,6 +495,7 @@ impl App {
             wizard_step: WizardStep::Ranges,
             cidr_candidates,
             cursor: 0,
+            port_cursor: 0,
             custom_input_mode: false,
             input_buffer: String::new(),
             edit_field: None,
@@ -1039,7 +1041,7 @@ impl App {
         };
         writeln!(
             f,
-            "rank\tip\tcolo\tcountry\tprotocol\tok\tfail\tavg\tp50\tp90\tp95\tmax\tjitter\tpacket_loss"
+            "rank\tip\tport\tcolo\tcountry\tprotocol\tok\tfail\tavg\tp50\tp90\tp95\tmax\tjitter\tpacket_loss"
         )?;
         for (i, r) in ranked_export_results(&self.results, self.config.top)
             .into_iter()
@@ -1119,9 +1121,10 @@ fn ranked_export_results(results: &[ProbeResult], top: usize) -> Vec<&ProbeResul
 
 fn export_tsv_line(rank: usize, result: &ProbeResult) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}%",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}%",
         rank,
         result.ip,
+        result.port,
         result.colo.as_deref().unwrap_or(""),
         result.country.as_deref().unwrap_or(""),
         result.protocol,
@@ -1165,6 +1168,7 @@ fn watch_profile_fingerprint(config: &AppConfig) -> u64 {
     crate::watch::fingerprint(&(
         config.host.clone(),
         config.path.clone(),
+        config.ports.clone(),
         config.expected_statuses.clone(),
         config.required_body_markers.clone(),
         config.required_headers.clone(),
@@ -1313,7 +1317,7 @@ pub fn run_tui(
         })
     };
 
-    let spawn_speed = |targets: Vec<String>,
+    let spawn_speed = |targets: Vec<(String, u16)>,
                        scan_config: Arc<AppConfig>,
                        direction: SpeedDirection|
      -> std::thread::JoinHandle<Result<(), String>> {
@@ -1722,11 +1726,16 @@ pub fn run_tui(
                 && speed_runner.is_none()
             {
                 app.pending_speed_start = false;
-                let targets: Vec<String> = app
+                let targets: Vec<(String, u16)> = app
                     .speed_targets
                     .iter()
                     .filter(|ip| app.speed_selected.contains(*ip))
-                    .cloned()
+                    .filter_map(|ip| {
+                        app.results
+                            .iter()
+                            .find(|result| result.ip == *ip)
+                            .map(|result| (ip.clone(), result.port))
+                    })
                     .collect();
                 app.speed_results.clear();
                 app.speed_complete = false;
@@ -2884,6 +2893,7 @@ mod tests {
     fn result(ip: &str, fail: usize, p95: f64) -> ProbeResult {
         ProbeResult {
             ip: ip.to_string(),
+            port: 443,
             protocol: "h2".to_string(),
             ok: 1,
             fail,
@@ -2914,6 +2924,7 @@ mod tests {
             decision: "competitive".to_string(),
             checks: Vec::new(),
             health_ok: true,
+            port_results: Vec::new(),
         }
     }
 
@@ -2959,7 +2970,7 @@ mod tests {
         edge.country = Some("Germany".to_string());
         assert_eq!(
             export_tsv_line(1, &edge),
-            "1\t192.0.2.1\tFRA\tGermany\th2\t1\t0\t0.020\t0.020\t0.020\t0.020\t0.020\t0.000\t0.000%"
+            "1\t192.0.2.1\t443\tFRA\tGermany\th2\t1\t0\t0.020\t0.020\t0.020\t0.020\t0.020\t0.000\t0.000%"
         );
     }
 
@@ -3143,6 +3154,36 @@ mod tests {
         app.column_picker_cursor = 11;
         draw(&mut app, 120, 36);
         assert_eq!(app.column_picker_list_state.selected(), Some(11));
+    }
+
+    #[test]
+    fn wizard_ranges_render_distinct_checkbox_states() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.cursor = 2;
+        app.cidr_candidates[0].selected = true;
+        app.cidr_candidates[1].selected = false;
+
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("[✓]"));
+        assert!(rendered.contains("[ ]"));
+
+        assert!(terminal.backend().buffer().content().iter().any(|cell| {
+            cell.symbol() == "✓" && cell.modifier.contains(ratatui::style::Modifier::BOLD)
+        }));
     }
 
     #[test]

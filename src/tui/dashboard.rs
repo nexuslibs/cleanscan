@@ -17,8 +17,20 @@ use crate::tui::{modal_overlay, widgets, App, ButtonAction, ButtonKind};
 use std::time::Duration;
 
 pub const RESULT_COLUMNS: [&str; 14] = [
-    "#", "IP", "Proto", "OK", "Fail", "Avg", "P50", "P90", "P95", "Max", "Colo", "Country",
-    "Jitter", "Loss",
+    "#",
+    "IP",
+    "Proto/port",
+    "OK",
+    "Fail",
+    "Avg",
+    "P50",
+    "P90",
+    "P95",
+    "Max",
+    "Colo",
+    "Country",
+    "Jitter",
+    "Loss",
 ];
 const WIDTHS: [Constraint; 14] = [
     Constraint::Length(5),
@@ -316,7 +328,10 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect, elapsed: 
         0 => {
             let lines = vec![
                 Line::from(format!("Status      : {}", result_status(result))),
-                Line::from(format!("Protocol    : {}", result.protocol)),
+                Line::from(format!(
+                    "Protocol    : {} (port {})",
+                    result.protocol, result.port
+                )),
                 Line::from(format!(
                     "Colo        : {}",
                     result.colo.clone().unwrap_or_else(|| "unknown".to_string())
@@ -1020,7 +1035,7 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
             let cells = vec![
                 Cell::from(rank_text).style(base_style),
                 Cell::from(ip_text).style(base_style),
-                Cell::from(r.protocol.clone()).style(base_style),
+                Cell::from(format!("{}@{}", r.protocol, r.port)).style(base_style),
                 Cell::from(r.ok.to_string()).style(base_style),
                 Cell::from(r.fail.to_string()).style(if is_selected {
                     base_style
@@ -1269,6 +1284,7 @@ mod tests {
     fn result(ip: &str, score: f64, samples: &[f64]) -> ProbeResult {
         ProbeResult {
             ip: ip.to_string(),
+            port: 443,
             protocol: "h2".to_string(),
             ok: samples.len(),
             fail: 0,
@@ -1299,6 +1315,7 @@ mod tests {
             decision: "competitive".to_string(),
             checks: Vec::new(),
             health_ok: true,
+            port_results: Vec::new(),
         }
     }
 

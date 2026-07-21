@@ -83,7 +83,7 @@ fn render_selection(app: &mut App, frame: &mut Frame, area: Rect) {
         1,
     ));
     app.speed_table_col_bounds.clear();
-    let widths = [5u16, 25, 11, 13, 13, 8];
+    let widths = [5u16, 25, 7, 11, 13, 13, 8];
     let mut x = table_inner.x;
     for (column, width) in widths.into_iter().enumerate() {
         let end = if column == widths.len() - 1 {
@@ -162,6 +162,7 @@ fn render_selection(app: &mut App, frame: &mut Frame, area: Rect) {
                         " - "
                     }),
                     Cell::from(result.ip.clone()),
+                    Cell::from(result.port.to_string()),
                     Cell::from(App::speed_status(result)),
                     Cell::from(format_latency(result.ok > 0, result.avg)),
                     Cell::from(format_latency(result.ok > 0, result.p95)),
@@ -183,6 +184,7 @@ fn render_selection(app: &mut App, frame: &mut Frame, area: Rect) {
         let header = Row::new(vec![
             "Sel".to_string(),
             format!("IP{}", sort_marker(0)),
+            "Port".to_string(),
             format!("Status{}", sort_marker(1)),
             format!("Avg{}", sort_marker(2)),
             format!("P95{}", sort_marker(3)),
@@ -195,10 +197,11 @@ fn render_selection(app: &mut App, frame: &mut Frame, area: Rect) {
                 [
                     Constraint::Length(5),
                     Constraint::Length(25),
+                    Constraint::Length(7),
                     Constraint::Length(11),
                     Constraint::Length(13),
                     Constraint::Length(13),
-                    Constraint::Min(8),
+                    Constraint::Length(8),
                 ],
             )
             .header(header),
@@ -435,6 +438,7 @@ fn render_results(app: &mut App, frame: &mut Frame, area: Rect) {
         .min(max_scroll);
     let header = Row::new(vec![
         Cell::from("IP"),
+        Cell::from("Port"),
         Cell::from("Download"),
         Cell::from("Upload"),
         Cell::from("Status"),
@@ -451,6 +455,7 @@ fn render_results(app: &mut App, frame: &mut Frame, area: Rect) {
             let status = result.error.as_deref().unwrap_or("OK");
             let mut row = Row::new(vec![
                 Cell::from(result.ip.clone()),
+                Cell::from(result.port.to_string()),
                 Cell::from(format_measurement(result.download.as_ref())),
                 Cell::from(format_measurement(result.upload.as_ref())),
                 Cell::from(status.to_string()).style(if result.error.is_some() {
@@ -470,6 +475,7 @@ fn render_results(app: &mut App, frame: &mut Frame, area: Rect) {
         rows,
         [
             Constraint::Length(25),
+            Constraint::Length(7),
             Constraint::Length(16),
             Constraint::Length(16),
             Constraint::Min(20),

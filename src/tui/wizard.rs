@@ -8,7 +8,7 @@ use ratatui::{
 };
 use std::collections::HashSet;
 
-use crate::config::{AppConfig, HealthCheck};
+use crate::config::{validate_ports, AppConfig, HealthCheck, CLOUDFLARE_HTTPS_PORTS};
 use crate::tui::theme;
 use crate::tui::{widgets, App, ButtonAction, ButtonKind, WizardStep};
 use tui_checkbox::Checkbox;
@@ -19,6 +19,7 @@ use tui_slider::{Slider, SliderState};
 pub enum SettingField {
     Host,
     Path,
+    Ports,
     ExpectedStatuses,
     RequiredBodyMarkers,
     RequiredHeaders,
@@ -66,10 +67,11 @@ const MAX_SPEED_TIMEOUT_MS: u64 = 3_600_000;
 impl SettingField {
     /// All settings fields in display order, grouped by concern. Group
     /// boundaries are described by [`SettingField::GROUPS`].
-    pub const ALL: [SettingField; 32] = [
+    pub const ALL: [SettingField; 33] = [
         // Target
         SettingField::Host,
         SettingField::Path,
+        SettingField::Ports,
         SettingField::ExpectedStatuses,
         SettingField::RequiredBodyMarkers,
         SettingField::RequiredHeaders,
@@ -109,7 +111,7 @@ impl SettingField {
     /// Section headers and the number of consecutive fields in each, in the
     /// same order as [`SettingField::ALL`].
     pub const GROUPS: [(&'static str, usize); 6] = [
-        ("Target", 2),
+        ("Target", 3),
         ("Validation", 6),
         ("Latency scan", 6),
         ("Ranking quality", 2),
@@ -121,6 +123,7 @@ impl SettingField {
         match self {
             SettingField::Host => "Host",
             SettingField::Path => "Path",
+            SettingField::Ports => "HTTPS ports",
             SettingField::ExpectedStatuses => "Expected statuses",
             SettingField::RequiredBodyMarkers => "Required body markers",
             SettingField::RequiredHeaders => "Required headers",
@@ -158,6 +161,7 @@ impl SettingField {
         match self {
             SettingField::Host => "The hostname used in SNI and the Host header for HTTP probes (e.g. app.iplat.ir). Cleanscan resolves this host to the tested edge IPs directly.",
             SettingField::Path => "The HTTP request path to probe (e.g. /cdn-cgi/trace). Typically points to a lightweight text file or endpoint to minimize bandwidth usage.",
+            SettingField::Ports => "Cloudflare HTTPS ports to probe. Enter edit mode, then use ↑/↓ to choose a port, Space to toggle it, A to select all, and N to clear all. At least one port is required.",
             SettingField::ExpectedStatuses => "Comma-separated HTTP statuses accepted by the endpoint. Empty means any 2xx response.",
             SettingField::RequiredBodyMarkers => "Comma-separated literal substrings that must occur in the response body.",
             SettingField::RequiredHeaders => "Comma-separated exact header checks in name=value form.",
@@ -196,6 +200,12 @@ impl SettingField {
         match self {
             SettingField::Host => args.host.clone(),
             SettingField::Path => args.path.clone(),
+            SettingField::Ports => args
+                .ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
             SettingField::ExpectedStatuses => args
                 .expected_statuses
                 .iter()
@@ -288,6 +298,7 @@ impl SettingField {
             self,
             SettingField::Host
                 | SettingField::Path
+                | SettingField::Ports
                 | SettingField::ExpectedStatuses
                 | SettingField::RequiredBodyMarkers
                 | SettingField::RequiredHeaders
@@ -383,6 +394,7 @@ impl SettingField {
             SettingField::MinProbes | SettingField::MaxProbes => MAX_PROBES as i64,
             SettingField::Host
             | SettingField::Path
+            | SettingField::Ports
             | SettingField::ExpectedStatuses
             | SettingField::RequiredBodyMarkers
             | SettingField::RequiredHeaders
@@ -427,6 +439,21 @@ impl SettingField {
                     return Err("path must be non-empty and begin with /".to_string());
                 }
                 args.path = raw.to_string();
+            }
+            SettingField::Ports => {
+                let ports = if raw.is_empty() {
+                    Vec::new()
+                } else {
+                    raw.split(',')
+                        .map(|value| {
+                            value
+                                .trim()
+                                .parse::<u16>()
+                                .map_err(|_| "ports must be comma-separated numbers".to_string())
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                args.ports = validate_ports(&ports)?;
             }
             SettingField::ExpectedStatuses => {
                 if raw.is_empty() {
@@ -829,6 +856,17 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
         }
         let e = &app.cidr_candidates[idx];
         let y = inner.y + i as u16;
+        if idx == app.cursor || e.selected {
+            frame.render_widget(
+                Paragraph::new("").style(theme::row_selected_style()),
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+        }
         // Cursor marker gutter (mirrors the list highlight symbol).
         if idx == app.cursor {
             frame.render_widget(
@@ -842,15 +880,22 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
             );
         }
         let checkbox = Checkbox::new(e.cidr.clone(), e.selected)
-            .label_style(if idx == app.cursor {
+            .checked_symbol("[✓]")
+            .unchecked_symbol("[ ]")
+            .style(if idx == app.cursor || e.selected {
                 theme::row_selected_style()
-            } else if e.selected {
-                Style::default().fg(theme::palette().info)
+            } else {
+                theme::hint_style()
+            })
+            .label_style(if idx == app.cursor || e.selected {
+                theme::row_selected_style()
             } else {
                 theme::hint_style()
             })
             .checkbox_style(if e.selected {
-                Style::default().fg(theme::palette().success)
+                Style::default()
+                    .fg(theme::palette().success)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme::palette().subtitle)
             });
@@ -875,7 +920,9 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
     // Right Side Info Panel
     let selected_count = app.cidr_candidates.iter().filter(|e| e.selected).count();
     let total_ips = selected_count.saturating_mul(app.config.sample_per_cidr);
-    let total_requests = total_ips.saturating_mul(app.config.probes);
+    let total_requests = total_ips
+        .saturating_mul(app.config.probes)
+        .saturating_mul(app.config.ports.len().max(1));
 
     let info_text = vec![
         Line::from(vec![Span::styled(" RANGE SUMMARY ", theme::header_style())]),
@@ -1036,7 +1083,26 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
             } else {
                 Style::default().fg(theme::palette().subtitle)
             };
-            let value = if app.edit_field == Some(i) {
+            let value = if app.edit_field == Some(i) && f == SettingField::Ports {
+                CLOUDFLARE_HTTPS_PORTS
+                    .iter()
+                    .enumerate()
+                    .map(|(index, port)| {
+                        let selected = app
+                            .edit_buffer
+                            .split(',')
+                            .filter_map(|v| v.trim().parse::<u16>().ok())
+                            .any(|value| value == *port);
+                        format!(
+                            "{}{}{}",
+                            if index == app.port_cursor { "▸" } else { " " },
+                            port,
+                            if selected { "✓" } else { "·" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else if app.edit_field == Some(i) {
                 let (before, after) = app
                     .edit_buffer
                     .split_at(app.edit_caret.min(app.edit_buffer.len()));
@@ -1178,7 +1244,9 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
     } else {
         app.preview_targets.len()
     };
-    let total_probes = total_ips.saturating_mul(app.config.probes);
+    let total_probes = total_ips
+        .saturating_mul(app.config.probes)
+        .saturating_mul(app.config.ports.len().max(1));
 
     // Ideal scan duration estimate
     let ideal_seconds =
@@ -1553,6 +1621,32 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
     if app.edit_field.is_some() {
         let i = app.edit_field.expect("edit_field checked above");
         let field = SettingField::ALL[i];
+        if field == SettingField::Ports {
+            match code {
+                KeyCode::Enter => {
+                    app.commit_edit();
+                }
+                KeyCode::Esc => {
+                    app.edit_field = None;
+                    app.edit_buffer.clear();
+                }
+                KeyCode::Up if app.port_cursor > 0 => app.port_cursor -= 1,
+                KeyCode::Down if app.port_cursor + 1 < CLOUDFLARE_HTTPS_PORTS.len() => {
+                    app.port_cursor += 1
+                }
+                KeyCode::Char(' ') => toggle_port_buffer(app),
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    app.edit_buffer = CLOUDFLARE_HTTPS_PORTS
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') => app.edit_buffer.clear(),
+                _ => {}
+            }
+            return;
+        }
         match code {
             KeyCode::Enter => {
                 app.commit_edit();
@@ -1692,6 +1786,26 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
     app.ensure_settings_visible();
 }
 
+fn toggle_port_buffer(app: &mut App) {
+    let port = CLOUDFLARE_HTTPS_PORTS[app.port_cursor];
+    let mut ports = app
+        .edit_buffer
+        .split(',')
+        .filter_map(|value| value.trim().parse::<u16>().ok())
+        .collect::<Vec<_>>();
+    if let Some(index) = ports.iter().position(|value| *value == port) {
+        ports.remove(index);
+    } else {
+        ports.push(port);
+    }
+    ports.sort_unstable();
+    app.edit_buffer = ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+}
+
 fn handle_review_key(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Char('s') => app.regenerate_preview(),
@@ -1770,6 +1884,9 @@ impl App {
             self.edit_field = Some(idx);
             self.edit_buffer = field.value_string(&self.config);
             self.edit_caret = self.edit_buffer.len();
+            if field == SettingField::Ports {
+                self.port_cursor = 0;
+            }
         }
     }
 }
@@ -1836,6 +1953,17 @@ mod tests {
             .is_err());
         assert!(SettingField::Path.apply("/trace", &mut config).is_ok());
         assert!(SettingField::Path.apply("trace", &mut config).is_err());
+    }
+
+    #[test]
+    fn ports_setting_accepts_supported_values_and_rejects_empty() {
+        let mut config = AppConfig::default();
+        SettingField::Ports
+            .apply("8443,443,443", &mut config)
+            .unwrap();
+        assert_eq!(config.ports, vec![443, 8443]);
+        assert!(SettingField::Ports.apply("", &mut config).is_err());
+        assert!(SettingField::Ports.apply("22", &mut config).is_err());
     }
 
     #[test]

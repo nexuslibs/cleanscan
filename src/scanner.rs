@@ -101,6 +101,7 @@ pub const DEFAULT_CLOUDFLARE_CIDRS: &[&str] = &[
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ProbeResult {
     pub ip: String,
+    pub port: u16,
     pub protocol: String,
     pub ok: usize,
     pub fail: usize,
@@ -149,6 +150,79 @@ pub struct ProbeResult {
     pub decision: String,
     pub checks: Vec<CheckResult>,
     pub health_ok: bool,
+    #[serde(default)]
+    pub port_results: Vec<PortResult>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortResult {
+    pub port: u16,
+    pub protocol: String,
+    pub ok: usize,
+    pub fail: usize,
+    pub completed: usize,
+    pub avg: f64,
+    pub p50: f64,
+    pub p90: f64,
+    pub p95: f64,
+    pub max: f64,
+    pub jitter: f64,
+    pub stddev: f64,
+    pub loss: usize,
+    pub packet_loss: f64,
+    pub samples: Vec<f64>,
+    pub failures: Vec<String>,
+    pub diagnostics: Vec<ProbeDiagnostic>,
+    pub success_rate: f64,
+    pub score: f64,
+    pub colo: Option<String>,
+    pub country: Option<String>,
+    pub cold_ms: Option<f64>,
+    pub stopped_early: bool,
+    pub min_score: f64,
+    pub max_score: f64,
+    pub success_rate_lower: f64,
+    pub success_rate_upper: f64,
+    pub score_confidence: f64,
+    pub decision: String,
+    pub checks: Vec<CheckResult>,
+    pub health_ok: bool,
+}
+
+fn port_result(result: &ProbeResult) -> PortResult {
+    PortResult {
+        port: result.port,
+        protocol: result.protocol.clone(),
+        ok: result.ok,
+        fail: result.fail,
+        completed: result.completed,
+        avg: result.avg,
+        p50: result.p50,
+        p90: result.p90,
+        p95: result.p95,
+        max: result.max,
+        jitter: result.jitter,
+        stddev: result.stddev,
+        loss: result.loss,
+        packet_loss: result.packet_loss,
+        samples: result.samples.clone(),
+        failures: result.failures.clone(),
+        diagnostics: result.diagnostics.clone(),
+        success_rate: result.success_rate,
+        score: result.score,
+        colo: result.colo.clone(),
+        country: result.country.clone(),
+        cold_ms: result.cold_ms,
+        stopped_early: result.stopped_early,
+        min_score: result.min_score,
+        max_score: result.max_score,
+        success_rate_lower: result.success_rate_lower,
+        success_rate_upper: result.success_rate_upper,
+        score_confidence: result.score_confidence,
+        decision: result.decision.clone(),
+        checks: result.checks.clone(),
+        health_ok: result.health_ok,
+    }
 }
 
 pub fn effective_health_checks(config: &AppConfig) -> Vec<HealthCheck> {
@@ -472,9 +546,21 @@ pub(crate) fn resolve_host_for_ip(host: &str) -> &str {
         .unwrap_or(host)
 }
 
-fn client_for_ip(host: &str, ip: &str, args: &AppConfig) -> Result<Client> {
+pub(crate) fn https_authority(host: &str, port: u16) -> String {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.split_once(']').map(|(name, _)| name))
+        .unwrap_or_else(|| resolve_host_for_ip(host));
+    if host.parse::<Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn client_for_ip(host: &str, ip: &str, args: &AppConfig, port: u16) -> Result<Client> {
     let ip_addr = IpAddr::from_str(ip)?;
-    let socket = SocketAddr::new(ip_addr, 443);
+    let socket = SocketAddr::new(ip_addr, port);
 
     let client = reqwest::Client::builder()
         .http2_adaptive_window(true)
@@ -676,6 +762,7 @@ fn is_loss_reason(reason: &ProbeDiagnostic) -> bool {
 
 struct TargetState {
     ip: String,
+    port: u16,
     url: String,
     client: Option<Client>,
     samples: Vec<f64>,
@@ -713,9 +800,9 @@ struct TargetState {
 }
 
 impl TargetState {
-    fn new(ip: String, args: &AppConfig, probe_count: usize) -> Self {
-        let url = format!("https://{}{}", args.host, args.path);
-        let client = client_for_ip(&args.host, &ip, args).ok();
+    fn new(ip: String, args: &AppConfig, probe_count: usize, port: u16) -> Self {
+        let url = format!("https://{}{}", https_authority(&args.host, port), args.path);
+        let client = client_for_ip(&args.host, &ip, args, port).ok();
         let client_ok = client.is_some();
         let (fail, loss, scheduled, completed) = if client_ok {
             (0, 0, 0, 0)
@@ -725,6 +812,7 @@ impl TargetState {
 
         Self {
             ip,
+            port,
             url,
             client,
             samples: Vec::new(),
@@ -861,6 +949,7 @@ impl TargetState {
 
         ProbeResult {
             ip: self.ip.clone(),
+            port: self.port,
             protocol: summarize_protocols(&self.protocols),
             ok: self.ok,
             fail: self.fail,
@@ -901,6 +990,7 @@ impl TargetState {
             .to_string(),
             checks: Vec::new(),
             health_ok: self.ok > 0,
+            port_results: Vec::new(),
         }
     }
 }
@@ -1120,12 +1210,14 @@ enum ProbeOutcome {
 /// Run the full scan over `targets`, sending each result through `tx`.
 /// `cancel` stops scheduling new probes/targets, and `paused` halts probe
 /// scheduling until cleared.
-pub async fn run_scan(
+async fn run_scan_port(
     targets: Vec<String>,
     args: Arc<AppConfig>,
     tx: std::sync::mpsc::Sender<ProbeResult>,
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    port: u16,
+    include_port_details: bool,
 ) {
     let sem = Arc::new(Semaphore::new(args.concurrency.max(1)));
 
@@ -1137,13 +1229,17 @@ pub async fn run_scan(
     let workers = args.concurrency.max(1);
     let mut states: Vec<TargetState> = targets
         .into_iter()
-        .map(|ip| TargetState::new(ip, &args, probe_count))
+        .map(|ip| TargetState::new(ip, &args, probe_count, port))
         .collect();
     let mut futs = FuturesUnordered::new();
 
     for state in &mut states {
         if state.completed == probe_count {
-            let _ = tx.send(state.result_with_mode(args.adaptive_probing));
+            let mut result = state.result_with_mode(args.adaptive_probing);
+            if include_port_details {
+                result.port_results = vec![port_result(&result)];
+            }
+            let _ = tx.send(result);
         }
     }
 
@@ -1347,12 +1443,18 @@ pub async fn run_scan(
                             // result now rather than spending the full budget.
                             let state = &mut states[index];
                             state.stopped_early = true;
-                            let result = state.result_with_mode(args.adaptive_probing);
+                            let mut result = state.result_with_mode(args.adaptive_probing);
+                            if include_port_details {
+                                result.port_results = vec![port_result(&result)];
+                            }
                             record_best(&mut best, &result, args.top);
                             let _ = tx.send(result);
                         } else if completed == probe_count {
                             let state = &mut states[index];
-                            let result = state.result_with_mode(args.adaptive_probing);
+                            let mut result = state.result_with_mode(args.adaptive_probing);
+                            if include_port_details {
+                                result.port_results = vec![port_result(&result)];
+                            }
                             record_best(&mut best, &result, args.top);
                             let _ = tx.send(result);
                         }
@@ -1361,6 +1463,86 @@ pub async fn run_scan(
             }
         }
     }
+}
+
+pub async fn run_scan(
+    targets: Vec<String>,
+    args: Arc<AppConfig>,
+    tx: std::sync::mpsc::Sender<ProbeResult>,
+    cancel: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+) {
+    let ports = if args.ports.is_empty() {
+        vec![443]
+    } else {
+        args.ports.clone()
+    };
+    if ports.len() == 1 {
+        run_scan_port(targets, args, tx, cancel, paused, ports[0], true).await;
+        return;
+    }
+
+    let mut by_ip: BTreeMap<String, Vec<ProbeResult>> = BTreeMap::new();
+    'ports: for port in ports {
+        if cancel.load(Ordering::Relaxed) {
+            break 'ports;
+        }
+        let mut port_args = (*args).clone();
+        port_args.ports = vec![port];
+        let (port_tx, port_rx) = std::sync::mpsc::channel();
+        run_scan_port(
+            targets.clone(),
+            Arc::new(port_args),
+            port_tx,
+            cancel.clone(),
+            paused.clone(),
+            port,
+            false,
+        )
+        .await;
+        for result in port_rx {
+            by_ip.entry(result.ip.clone()).or_default().push(result);
+        }
+    }
+    for (_, results) in by_ip {
+        if let Some(result) = merge_port_results(&results) {
+            let _ = tx.send(result);
+        }
+    }
+}
+
+fn merge_port_results(results: &[ProbeResult]) -> Option<ProbeResult> {
+    let best = results
+        .iter()
+        .filter(|result| result.health_ok)
+        .max_by(|left, right| {
+            left.score
+                .partial_cmp(&right.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    right
+                        .p95
+                        .partial_cmp(&left.p95)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        })
+        .or_else(|| {
+            results.iter().max_by(|left, right| {
+                left.score
+                    .partial_cmp(&right.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| {
+                        right
+                            .success_rate
+                            .partial_cmp(&left.success_rate)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+            })
+        })?;
+    let mut merged = best.clone();
+    merged.port_results = results.iter().map(port_result).collect();
+    merged.health_ok = results.iter().any(|result| result.health_ok);
+    Some(merged)
 }
 
 /// Run every configured health check and merge the per-path results into one
@@ -1384,40 +1566,58 @@ pub async fn run_profile_scan(
     }
 
     let expected_checks = checks.clone();
-    let mut by_ip: BTreeMap<String, Vec<(HealthCheck, ProbeResult)>> = BTreeMap::new();
-    let mut cancelled = false;
-    for check in checks {
-        if cancel.load(Ordering::Relaxed) {
-            cancelled = true;
-            break;
+    let mut all_by_ip: BTreeMap<String, Vec<ProbeResult>> = BTreeMap::new();
+    let ports = if args.ports.is_empty() {
+        vec![443]
+    } else {
+        args.ports.clone()
+    };
+    'ports: for port in ports {
+        let mut stop_after_port = false;
+        let mut by_ip: BTreeMap<String, Vec<(HealthCheck, ProbeResult)>> = BTreeMap::new();
+        for check in &checks {
+            if cancel.load(Ordering::Relaxed) {
+                stop_after_port = true;
+                break;
+            }
+            let mut check_args = (*args).clone();
+            check_args.path = check.path.clone();
+            check_args.health_checks.clear();
+            check_args.ports = vec![port];
+            let (check_tx, check_rx) = std::sync::mpsc::channel();
+            run_scan_port(
+                targets.clone(),
+                Arc::new(check_args),
+                check_tx,
+                cancel.clone(),
+                paused.clone(),
+                port,
+                false,
+            )
+            .await;
+            for result in check_rx {
+                by_ip
+                    .entry(result.ip.clone())
+                    .or_default()
+                    .push((check.clone(), result));
+            }
+            if cancel.load(Ordering::Relaxed) {
+                stop_after_port = true;
+                break;
+            }
         }
-        let mut check_args = (*args).clone();
-        check_args.path = check.path.clone();
-        check_args.health_checks.clear();
-        let (check_tx, check_rx) = std::sync::mpsc::channel();
-        run_scan(
-            targets.clone(),
-            Arc::new(check_args),
-            check_tx,
-            cancel.clone(),
-            paused.clone(),
-        )
-        .await;
-        for result in check_rx {
-            by_ip
-                .entry(result.ip.clone())
-                .or_default()
-                .push((check.clone(), result));
+        for (ip, entries) in by_ip {
+            if let Some(merged) = merge_profile_results(&entries, &expected_checks) {
+                all_by_ip.entry(ip).or_default().push(merged);
+            }
+        }
+        if stop_after_port {
+            break 'ports;
         }
     }
-
-    if cancelled || cancel.load(Ordering::Relaxed) {
-        return;
-    }
-
-    for (_, entries) in by_ip {
-        if let Some(merged) = merge_profile_results(&entries, &expected_checks) {
-            let _ = tx.send(merged);
+    for (_, results) in all_by_ip {
+        if let Some(result) = merge_port_results(&results) {
+            let _ = tx.send(result);
         }
     }
 }
@@ -1741,10 +1941,11 @@ pub async fn run_scan_two_phase(
 #[cfg(test)]
 mod tests {
     use super::{
-        bootstrap_score_interval, cidr_valid, collect_from_cidrs_with_seed, merge_profile_results,
-        parse_colo, record_best, resolve_host_for_ip, result_confidence, result_status,
-        score_from_samples, select_focus_cidrs, select_next_target, should_stop_early,
-        validate_response, wilson_interval, DiagnosticCategory, ProbeResult, TargetState,
+        bootstrap_score_interval, cidr_valid, collect_from_cidrs_with_seed, https_authority,
+        merge_port_results, merge_profile_results, parse_colo, record_best, resolve_host_for_ip,
+        result_confidence, result_status, score_from_samples, select_focus_cidrs,
+        select_next_target, should_stop_early, validate_response, wilson_interval,
+        DiagnosticCategory, ProbeResult, TargetState,
     };
     use crate::config::{AppConfig, HealthCheck};
 
@@ -1757,6 +1958,7 @@ mod tests {
     ) -> TargetState {
         TargetState {
             ip: ip.to_string(),
+            port: 443,
             url: String::new(),
             client: None,
             samples: samples.to_vec(),
@@ -1796,6 +1998,17 @@ mod tests {
         assert_eq!(resolve_host_for_ip("example.test:443"), "example.test");
         assert_eq!(resolve_host_for_ip("[2001:db8::1]:443"), "2001:db8::1");
         assert_eq!(resolve_host_for_ip("2001:db8::1"), "2001:db8::1");
+    }
+
+    #[test]
+    fn https_authority_formats_supported_ports_and_ipv6() {
+        assert_eq!(https_authority("example.test", 2053), "example.test:2053");
+        assert_eq!(
+            https_authority("example.test:443", 8443),
+            "example.test:8443"
+        );
+        assert_eq!(https_authority("[2001:db8::1]", 2087), "[2001:db8::1]:2087");
+        assert_eq!(https_authority("2001:db8::1", 2096), "[2001:db8::1]:2096");
     }
 
     #[test]
@@ -1962,8 +2175,8 @@ mod tests {
             ..Default::default()
         };
 
-        let with_warmup = TargetState::new("192.0.2.1".to_string(), &enabled, 4);
-        let without_warmup = TargetState::new("192.0.2.1".to_string(), &disabled, 4);
+        let with_warmup = TargetState::new("192.0.2.1".to_string(), &enabled, 4, 443);
+        let without_warmup = TargetState::new("192.0.2.1".to_string(), &disabled, 4, 443);
 
         assert!(!with_warmup.warmup_done);
         assert!(without_warmup.warmup_done);
@@ -1978,7 +2191,7 @@ mod tests {
         // An unresolvable/invalid IP makes client construction fail, so the
         // target is completed during initialization and must not be selected
         // for a warmup probe (which would panic on the missing client).
-        let failed = TargetState::new("not-an-ip".to_string(), &enabled, 4);
+        let failed = TargetState::new("not-an-ip".to_string(), &enabled, 4, 443);
         assert!(failed.warmup_done);
         assert_eq!(failed.completed, 4);
         assert_eq!(failed.fail, 4);
@@ -1988,6 +2201,7 @@ mod tests {
     fn warmup_excluded_from_latency_stats() {
         let mut state = TargetState {
             ip: "192.0.2.1".to_string(),
+            port: 443,
             url: String::new(),
             client: None,
             samples: vec![0.2, 0.3, 0.25],
@@ -2044,6 +2258,7 @@ mod tests {
     fn jitter_stddev_and_packet_loss_are_computed() {
         let mut state = TargetState {
             ip: "192.0.2.1".to_string(),
+            port: 443,
             url: String::new(),
             client: None,
             samples: vec![0.10, 0.20, 0.30],
@@ -2086,6 +2301,7 @@ mod tests {
         // Equal p95/max values with different p50 values isolate jitter.
         let steady = TargetState {
             ip: "192.0.2.1".to_string(),
+            port: 443,
             url: String::new(),
             client: None,
             samples: vec![0.20, 0.20, 0.30, 0.30],
@@ -2113,6 +2329,7 @@ mod tests {
         .result();
         let jittery = TargetState {
             ip: "192.0.2.2".to_string(),
+            port: 443,
             url: String::new(),
             client: None,
             samples: vec![0.10, 0.10, 0.30, 0.30],
@@ -2147,6 +2364,7 @@ mod tests {
         // packet loss; disabling jitter must not disable the loss penalty.
         let reliable = TargetState {
             ip: "192.0.2.3".to_string(),
+            port: 443,
             url: String::new(),
             client: None,
             samples: vec![0.20, 0.20, 0.20],
@@ -2174,6 +2392,7 @@ mod tests {
         .result();
         let lossy = TargetState {
             ip: "192.0.2.4".to_string(),
+            port: 443,
             url: String::new(),
             client: None,
             samples: vec![0.20, 0.20, 0.20],
@@ -2254,6 +2473,7 @@ mod tests {
         // The shared scoring helper must agree with the full ProbeResult score.
         let mut state = TargetState {
             ip: "192.0.2.1".to_string(),
+            port: 443,
             url: String::new(),
             client: None,
             samples: vec![0.10, 0.20, 0.30],
@@ -2380,6 +2600,7 @@ mod tests {
         let mut best: Vec<(f64, f64)> = Vec::new();
         let make = |score: f64| ProbeResult {
             ip: String::new(),
+            port: 443,
             protocol: String::new(),
             ok: 1,
             fail: 0,
@@ -2410,6 +2631,7 @@ mod tests {
             decision: "competitive".to_string(),
             checks: Vec::new(),
             health_ok: true,
+            port_results: Vec::new(),
         };
         for s in [1.0, 5.0, 3.0, 9.0, 2.0] {
             record_best(&mut best, &make(s), 3);
@@ -2423,6 +2645,7 @@ mod tests {
     fn focus_result(ip: &str, colo: Option<&str>, score: f64, ok: usize) -> ProbeResult {
         ProbeResult {
             ip: ip.to_string(),
+            port: 443,
             protocol: String::new(),
             ok,
             fail: 0,
@@ -2453,7 +2676,22 @@ mod tests {
             decision: "competitive".to_string(),
             checks: Vec::new(),
             health_ok: true,
+            port_results: Vec::new(),
         }
+    }
+
+    #[test]
+    fn port_merge_chooses_best_healthy_port_and_keeps_details() {
+        let mut failed = focus_result("192.0.2.1", None, 100.0, 0);
+        failed.port = 443;
+        failed.health_ok = false;
+        let mut healthy = focus_result("192.0.2.1", None, 2.0, 1);
+        healthy.port = 2053;
+        let merged = merge_port_results(&[failed, healthy]).unwrap();
+        assert_eq!(merged.port, 2053);
+        assert!(merged.health_ok);
+        assert_eq!(merged.port_results.len(), 2);
+        assert_eq!(merged.port_results[0].port, 443);
     }
 
     #[test]

@@ -16,6 +16,7 @@ the best Cloudflare edge IPs to reach a given origin host.
   the `--cli` flag.
 - Custom DNS resolution per IP, HTTP/2 adaptive windows, configurable
   concurrency, probes, and timeouts.
+- Cloudflare HTTPS port selection across 443, 2053, 2083, 2087, 2096, and 8443.
 - Selective upload/download throughput tests for successful latency targets.
 - Persistent TUI settings, including selected CIDR ranges and scan parameters.
 
@@ -145,7 +146,7 @@ Navigation mirrors the selection screen:
 | `q`            | Quit                                    |
 
 The following parameters are editable, with the same meaning as their CLI
-counterparts: `Host` (`--host`), `Path` (`--path`), `Sample per CIDR`
+counterparts: `Host` (`--host`), `Path` (`--path`), `HTTPS ports` (`--port`, repeatable), `Sample per CIDR`
 (`--sample-per-cidr`), `Probes` (`--probes`), `Concurrency` (`--concurrency`),
 `Timeout (ms)` (`--timeout-ms`), `Connect timeout (ms)` (`--connect-timeout-ms`),
 `Top results` (`--top`), `Stability weight` (`--stability-weight`, default `1.0`),
@@ -207,6 +208,7 @@ latency dashboard.
 | `--cli`                | off              | Use tab-separated CLI output instead of the TUI  |
 | `--host`               | required         | Hostname for HTTPS / SNI / Host header (no built-in default) |
 | `--path`               | `/cdn-cgi/trace` | Path to probe                                    |
+| `--port`               | `443`            | Cloudflare HTTPS port to probe; repeatable (`443`, `2053`, `2083`, `2087`, `2096`, or `8443`) |
 | `--check NAME=PATH`    | —                | Additional required health check; repeatable     |
 | `--expect-status`      | any 2xx          | Expected HTTP status code (repeatable)           |
 | `--require-body`       | —                | Required literal response-body marker (repeatable) |
@@ -290,8 +292,11 @@ successful results to a timestamped
 CIDR ranges are sampled randomly, so overlapping samples may produce fewer
 unique targets than `sample-per-cidr` suggests. Each probe is an HTTPS request
 to the configured host and path, using the candidate IP for the connection
-while retaining the hostname for TLS SNI and the Host header. Before the
-counted latency probes, cleanscan sends one discarded warmup probe per IP so
+while retaining the hostname for TLS SNI and the Host header. Selected ports
+are probed independently; results remain one row per IP and use the best
+healthy port as the summary while preserving per-port details in structured
+output. Before the counted latency probes, cleanscan sends one discarded warmup
+probe per IP and port so
 the TCP + TLS connection is established; the reported `avg`/`p50`/`p90`/`p95`/`max`
 latencies reflect steady-state RTT rather than connection-setup cost, and the
 one-off cold-request latency is reported separately as `cold_ms`. Pass
