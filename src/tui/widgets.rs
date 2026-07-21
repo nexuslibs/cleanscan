@@ -70,11 +70,24 @@ pub fn panel_block(title: &str, focused: bool) -> Block<'static> {
         });
     if !title.is_empty() {
         block = block.title(Span::styled(
-            format!(" {} ", title.trim()),
+            format!(" {}{} ", if focused { "› " } else { "" }, title.trim()),
             theme::panel_title_style(),
         ));
     }
     block
+}
+
+/// A low-weight section container for supporting information. Primary panels
+/// retain the rounded treatment; secondary content uses a bottom rule so the
+/// screen has hierarchy without making every region feel like a separate card.
+pub fn subtle_panel_block(title: &str) -> Block<'static> {
+    Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(theme::border_style())
+        .title(Span::styled(
+            format!(" {} ", title.trim()),
+            theme::panel_title_style(),
+        ))
 }
 
 /// A key/value segment rendered in the shared app header.
@@ -170,7 +183,7 @@ pub fn button_style(kind: ButtonKind, active: bool) -> Style {
         (ButtonKind::Primary, false) => Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
         (ButtonKind::Secondary, true) => Style::default()
             .fg(p.highlight)
-            .add_modifier(Modifier::BOLD),
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         (ButtonKind::Secondary, false) => Style::default().fg(p.subtitle),
     }
 }
