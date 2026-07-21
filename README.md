@@ -420,11 +420,15 @@ run.
 
 When `--proxy-url` is supplied in CLI mode, cleanscan parses only the
 transport-safe parts of a VLESS/Trojan share URL: destination port, TLS/SNI,
-network type, and WebSocket host/path. It then checks the top healthy latency
-candidates for TCP connectivity, TLS negotiation, a short long-lived TLS idle
-hold, and WebSocket endpoint reachability when applicable. This is a transport
-survivability check, not a VLESS/Trojan authentication or full-tunnel test; no
-Xray process is started and UUIDs/passwords are not printed.
+network type, and WebSocket host/path. The survivability check supports TLS
+transports and non-TLS TCP transports; `security=none`/non-TLS WebSocket URLs
+are unsupported. For TLS URLs it checks the top healthy latency candidates for
+TCP connectivity, TLS negotiation, a short long-lived TLS idle hold, and
+WebSocket endpoint reachability when applicable. For non-TLS TCP URLs it
+reports TCP connectivity only, with TLS, long-lived TLS, and WebSocket checks
+not applicable. This is a transport survivability check, not a VLESS/Trojan
+authentication or full-tunnel test; no Xray process is started and
+UUIDs/passwords are not printed.
 
 ## Development
 

@@ -159,7 +159,7 @@ jobs:
           fi
 
           test "$(tar -tzf "cleanscan-${{ matrix.target }}.tar.gz")" = "cleanscan"
-          test "$(cut -d' ' -f1 "cleanscan-${{ matrix.target }}.tar.gz.sha256")" = "$(sha256sum "cleanscan-${{ matrix.target }}.tar.gz" | cut -d' ' -f1 2>/dev/null || shasum -a 256 "cleanscan-${{ matrix.target }}.tar.gz" | cut -d' ' -f1)"
+          test "$(cut -d' ' -f1 "cleanscan-${{ matrix.target }}.tar.gz.sha256")" = "$(if command -v sha256sum >/dev/null 2>&1; then sha256sum "cleanscan-${{ matrix.target }}.tar.gz"; else shasum -a 256 "cleanscan-${{ matrix.target }}.tar.gz"; fi | cut -d' ' -f1)"
 
       - name: Smoke test native Linux artifact
         if: matrix.target == 'x86_64-unknown-linux-musl'

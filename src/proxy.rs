@@ -1,5 +1,5 @@
 use std::{
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -63,6 +63,11 @@ pub fn parse_share_url(raw: &str) -> Result<ProxyTransport> {
     let tls = query
         .get("security")
         .map_or(protocol == "trojan", |v| v != "none");
+    if network == "ws" && !tls {
+        return Err(anyhow!(
+            "non-TLS WebSocket proxy transports are unsupported"
+        ));
+    }
     let sni = query
         .get("sni")
         .map_or_else(|| address.clone(), |v| v.to_string());
@@ -86,15 +91,14 @@ pub fn parse_share_url(raw: &str) -> Result<ProxyTransport> {
     })
 }
 
-fn tls_config() -> TlsConnector {
-    let config = ClientConfig::with_platform_verifier()
-        .expect("platform certificate verifier must be available");
-    TlsConnector::from(Arc::new(config))
+fn tls_config() -> Result<TlsConnector> {
+    let config = ClientConfig::with_platform_verifier()?;
+    Ok(TlsConnector::from(Arc::new(config)))
 }
 
 async fn tls_connect(stream: TcpStream, sni: &str) -> Result<TlsStream<TcpStream>> {
     let name = ServerName::try_from(sni.to_string()).map_err(|_| anyhow!("invalid TLS SNI"))?;
-    Ok(tls_config().connect(name, stream).await?)
+    Ok(tls_config()?.connect(name, stream).await?)
 }
 
 pub async fn check_candidate(
@@ -105,10 +109,10 @@ pub async fn check_candidate(
     let started = Instant::now();
     let timeout_duration = Duration::from_millis(timeout_ms.max(500));
     let addr = match ip.parse::<IpAddr>() {
-        Ok(ip) => format!("{ip}:{}", transport.port),
+        Ok(ip) => SocketAddr::new(ip, transport.port),
         Err(e) => return failed(ip, transport, started, format!("invalid candidate IP: {e}")),
     };
-    let stream = match timeout(timeout_duration, TcpStream::connect(&addr)).await {
+    let stream = match timeout(timeout_duration, TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => return failed(ip, transport, started, format!("TCP connect: {e}")),
         Err(_) => return failed(ip, transport, started, "TCP connect timed out".into()),
@@ -140,12 +144,9 @@ pub async fn check_candidate(
             Ok(Err(e)) => result.error = Some(format!("TLS handshake: {e}")),
             Err(_) => result.error = Some("TLS handshake timed out".into()),
         }
-    } else if transport.network == "ws" {
-        result.websocket_reached = Some(false);
-        result.websocket_accepted = Some(false);
     }
     result.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    if result.error.is_none() && !result.long_tls_ok {
+    if transport.tls && result.error.is_none() && !result.long_tls_ok {
         result.error = Some("long-lived TLS connection did not survive idle hold".into());
     }
     result
