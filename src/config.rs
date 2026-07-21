@@ -4,6 +4,35 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::{fs, io::Write};
 
+pub const CLOUDFLARE_HTTPS_PORTS: &[u16] = &[443, 2053, 2083, 2087, 2096, 8443];
+
+pub fn default_ports() -> Vec<u16> {
+    vec![443]
+}
+
+pub fn validate_ports(ports: &[u16]) -> Result<Vec<u16>, String> {
+    if ports.is_empty() {
+        return Err("select at least one HTTPS port".to_string());
+    }
+    let mut normalized = ports.to_vec();
+    normalized.sort_unstable();
+    normalized.dedup();
+    if let Some(port) = normalized
+        .iter()
+        .find(|port| !CLOUDFLARE_HTTPS_PORTS.contains(port))
+    {
+        return Err(format!(
+            "unsupported Cloudflare HTTPS port {port}; choose one of {}",
+            CLOUDFLARE_HTTPS_PORTS
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Ok(normalized)
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct HealthCheck {
     pub name: String,
@@ -45,6 +74,8 @@ pub fn parse_required_header(expression: &str) -> Result<(String, String), Strin
 pub struct AppConfig {
     pub host: String,
     pub path: String,
+    #[serde(default = "default_ports")]
+    pub ports: Vec<u16>,
     #[serde(default)]
     pub health_checks: Vec<HealthCheck>,
     /// Expected HTTP statuses. An empty list accepts any 2xx response.
@@ -223,6 +254,7 @@ impl Default for AppConfig {
         Self {
             host: String::new(),
             path: "/cdn-cgi/trace".to_string(),
+            ports: default_ports(),
             health_checks: Vec::new(),
             expected_statuses: Vec::new(),
             required_body_markers: Vec::new(),
@@ -314,6 +346,7 @@ pub fn load_config() -> AppConfig {
 
 fn parse_config(content: &str) -> Option<AppConfig> {
     let mut config = serde_json::from_str::<AppConfig>(content).ok()?;
+    config.ports = validate_ports(&config.ports).unwrap_or_else(|_| default_ports());
     config.selected_cidrs_persisted = serde_json::from_str::<serde_json::Value>(content)
         .ok()
         .and_then(|value| value.get("selected_cidrs").cloned())
@@ -363,6 +396,28 @@ pub fn save_config(config: &AppConfig) -> Result<()> {
         result?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::*;
+
+    #[test]
+    fn ports_default_to_https_443() {
+        assert_eq!(AppConfig::default().ports, vec![443]);
+        let json = serde_json::to_string(&AppConfig::default()).unwrap();
+        let mut without_ports: serde_json::Value = serde_json::from_str(&json).unwrap();
+        without_ports.as_object_mut().unwrap().remove("ports");
+        let parsed: AppConfig = serde_json::from_value(without_ports).unwrap();
+        assert_eq!(parsed.ports, vec![443]);
+    }
+
+    #[test]
+    fn ports_are_deduplicated_and_validated() {
+        assert_eq!(validate_ports(&[8443, 443, 443]), Ok(vec![443, 8443]));
+        assert!(validate_ports(&[]).is_err());
+        assert!(validate_ports(&[443, 22]).is_err());
+    }
 }
 
 #[cfg(test)]

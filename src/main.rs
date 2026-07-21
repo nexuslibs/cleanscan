@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use anyhow::Result;
-use config::{AppConfig, HealthCheck};
+use config::{validate_ports, AppConfig, HealthCheck};
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Cloudflare IP scanner / latency prober")]
@@ -26,6 +26,10 @@ pub struct Args {
     /// Path to test
     #[arg(long)]
     pub path: Option<String>,
+
+    /// Cloudflare HTTPS port to probe. Repeatable; defaults to 443.
+    #[arg(long = "port")]
+    pub ports: Vec<u16>,
 
     /// Additional health check in NAME=PATH form. Global validation flags apply.
     #[arg(long = "check")]
@@ -245,6 +249,11 @@ fn main() -> Result<()> {
     }
     if let Some(path) = args.path {
         config.path = path;
+    }
+    if !args.ports.is_empty() {
+        config.ports = validate_ports(&args.ports).map_err(anyhow::Error::msg)?;
+    } else {
+        config.ports = validate_ports(&config.ports).unwrap_or_else(|_| vec![443]);
     }
     if !args.checks.is_empty() {
         config.health_checks = args
@@ -523,6 +532,7 @@ pub(crate) struct Manifest {
     generated_at_unix: u64,
     host: String,
     path: String,
+    ports: Vec<u16>,
     seed: u64,
     targets: Vec<String>,
     validation: ManifestValidation,
@@ -619,6 +629,7 @@ pub(crate) fn build_manifest(
             .as_secs(),
         host: config.host.clone(),
         path: config.path.clone(),
+        ports: config.ports.clone(),
         seed: config.seed,
         targets,
         validation: ManifestValidation {
@@ -745,8 +756,12 @@ fn cli_mode(
 
     if !use_two_phase {
         eprintln!(
-            "Testing {} targets × {} probes, concurrency={}",
-            total, config.probes, config.concurrency
+            "Testing {} targets × {} probes × {} ports ({:?}), concurrency={}",
+            total,
+            config.probes,
+            config.ports.len(),
+            config.ports,
+            config.concurrency
         );
     }
 
@@ -824,7 +839,7 @@ fn cli_mode(
             .collect::<std::result::Result<Vec<_>, _>>()?
             .join("\n"),
         _ => {
-            let mut text = String::from("rank\tip\tcolo\tcountry\tprotocol\tok\tfail\tsuccess_rate\tconfidence\tavg\tp50\tp90\tp95\tmax\tjitter\tloss\tpkt_loss\tcold_ms\tmin_score\tmax_score\tsamples\tfailures\tdiagnostics\n");
+            let mut text = String::from("rank\tip\tport\tcolo\tcountry\tprotocol\tok\tfail\tsuccess_rate\tconfidence\tavg\tp50\tp90\tp95\tmax\tjitter\tloss\tpkt_loss\tcold_ms\tmin_score\tmax_score\tsamples\tfailures\tdiagnostics\n");
             for (i, r) in rows.iter().enumerate() {
                 let samples = r
                     .samples
@@ -840,9 +855,10 @@ fn cli_mode(
                     .join(",");
 
                 text.push_str(&format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{:.1}\t{}\t{:.5}\t{:.5}\t{}\t{}\t{}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{}\t{:.1}\t{}\t{:.5}\t{:.5}\t{}\t{}\t{}\n",
                     i + 1,
                     r.ip,
+                    r.port,
                     r.colo.clone().unwrap_or_default(),
                     r.country.clone().unwrap_or_default(),
                     r.protocol,
@@ -1160,6 +1176,7 @@ mod tests {
     fn required_check_thresholds_are_all_enforced() {
         let mut result = scanner::ProbeResult {
             ip: "192.0.2.1".to_string(),
+            port: 443,
             protocol: "h2".to_string(),
             ok: 8,
             fail: 0,
@@ -1235,6 +1252,7 @@ mod tests {
                 },
             ],
             health_ok: true,
+            port_results: Vec::new(),
         };
 
         assert!(!healthy_result(
@@ -1320,6 +1338,7 @@ mod tests {
     fn country_filter_is_unicode_aware() {
         let results = vec![scanner::ProbeResult {
             ip: "198.41.0.4".to_string(),
+            port: 443,
             protocol: "h2".to_string(),
             ok: 1,
             fail: 0,
@@ -1350,6 +1369,7 @@ mod tests {
             decision: "competitive".to_string(),
             checks: Vec::new(),
             health_ok: true,
+            port_results: Vec::new(),
         }];
         let mut filtered = results.clone();
         filtered.retain(|r| {

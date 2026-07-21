@@ -13,7 +13,10 @@ use futures::stream;
 use reqwest::{Client, StatusCode};
 use tokio::{sync::Semaphore, task::JoinSet};
 
-use crate::{config::AppConfig, scanner::resolve_host_for_ip};
+use crate::{
+    config::AppConfig,
+    scanner::{https_authority, resolve_host_for_ip},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpeedDirection {
@@ -45,14 +48,15 @@ pub struct SpeedMeasurement {
 #[derive(Debug, Clone)]
 pub struct SpeedResult {
     pub ip: String,
+    pub port: u16,
     pub download: Option<SpeedMeasurement>,
     pub upload: Option<SpeedMeasurement>,
     pub error: Option<String>,
 }
 
-fn client_for_ip(host: &str, ip: &str, args: &AppConfig) -> Result<Client> {
+fn client_for_ip(host: &str, ip: &str, args: &AppConfig, port: u16) -> Result<Client> {
     let ip_addr = IpAddr::from_str(ip)?;
-    let socket = SocketAddr::new(ip_addr, 443);
+    let socket = SocketAddr::new(ip_addr, port);
     Ok(reqwest::Client::builder()
         .http2_adaptive_window(true)
         .no_proxy()
@@ -168,20 +172,27 @@ fn average_measurements(values: Vec<SpeedMeasurement>) -> Option<SpeedMeasuremen
     })
 }
 
-async fn test_target(ip: String, args: Arc<AppConfig>, direction: SpeedDirection) -> SpeedResult {
-    let client = match client_for_ip(&args.host, &ip, &args) {
+async fn test_target(
+    ip: String,
+    port: u16,
+    args: Arc<AppConfig>,
+    direction: SpeedDirection,
+) -> SpeedResult {
+    let client = match client_for_ip(&args.host, &ip, &args, port) {
         Ok(client) => client,
         Err(error) => {
             return SpeedResult {
                 ip,
+                port,
                 download: None,
                 upload: None,
                 error: Some(error.to_string()),
             }
         }
     };
-    let download_url = format!("https://{}{}", args.host, args.download_path);
-    let upload_url = format!("https://{}{}", args.host, args.upload_path);
+    let authority = https_authority(&args.host, port);
+    let download_url = format!("https://{}{}", authority, args.download_path);
+    let upload_url = format!("https://{}{}", authority, args.upload_path);
     let repetitions = args.speed_repetitions.max(1);
     let mut downloads = Vec::new();
     let mut uploads = Vec::new();
@@ -215,6 +226,7 @@ async fn test_target(ip: String, args: Arc<AppConfig>, direction: SpeedDirection
 
     SpeedResult {
         ip,
+        port,
         download: average_measurements(downloads),
         upload: average_measurements(uploads),
         error: (!errors.is_empty()).then(|| errors.join("; ")),
@@ -222,7 +234,7 @@ async fn test_target(ip: String, args: Arc<AppConfig>, direction: SpeedDirection
 }
 
 pub async fn run_speed_scan(
-    targets: Vec<String>,
+    targets: Vec<(String, u16)>,
     args: Arc<AppConfig>,
     direction: SpeedDirection,
     tx: std::sync::mpsc::Sender<SpeedResult>,
@@ -237,7 +249,7 @@ pub async fn run_speed_scan(
         }
     });
 
-    for ip in targets {
+    for (ip, port) in targets {
         while tasks.len() >= concurrency {
             tokio::select! {
                 biased;
@@ -261,7 +273,7 @@ pub async fn run_speed_scan(
         let args = args.clone();
         tasks.spawn(async move {
             let _permit = permit;
-            test_target(ip, args, direction).await
+            test_target(ip, port, args, direction).await
         });
     }
 

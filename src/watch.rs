@@ -229,6 +229,7 @@ mod tests {
     fn result(ip: &str, score: f64) -> ProbeResult {
         ProbeResult {
             ip: ip.to_string(),
+            port: 443,
             protocol: "h2".to_string(),
             ok: 1,
             fail: 0,
@@ -259,6 +260,7 @@ mod tests {
             decision: "competitive".to_string(),
             checks: Vec::new(),
             health_ok: true,
+            port_results: Vec::new(),
         }
     }
 
