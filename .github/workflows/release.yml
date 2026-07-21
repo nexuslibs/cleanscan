@@ -163,7 +163,14 @@ jobs:
 
       - name: Smoke test native Linux artifact
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: "target/${{ matrix.target }}/release/cleanscan --version"
+        shell: bash
+        run: |
+          archive="cleanscan-${{ matrix.target }}.tar.gz"
+          test -f "$archive"
+          extract_dir="$(mktemp -d)"
+          trap 'rm -rf "$extract_dir"' EXIT
+          tar -xzf "$archive" -C "$extract_dir"
+          "$extract_dir/cleanscan" --version
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2 # v2

@@ -1262,6 +1262,7 @@ async fn run_scan_port(
     port: u16,
     include_port_details: bool,
     progress_offsets: (usize, usize, usize),
+    progress_phase: Option<ScanPhase>,
 ) -> (usize, usize, usize) {
     let sem = Arc::new(Semaphore::new(args.concurrency.max(1)));
 
@@ -1278,13 +1279,15 @@ async fn run_scan_port(
     let mut futs = FuturesUnordered::new();
     let (mut probes_started, mut probes_completed, mut targets_completed) = progress_offsets;
 
+    let warming_phase = progress_phase.unwrap_or(if args.warmup {
+        ScanPhase::WarmingUp
+    } else {
+        ScanPhase::Probing
+    });
+    let probing_phase = progress_phase.unwrap_or(ScanPhase::Probing);
     send_progress(
         progress.as_ref(),
-        if args.warmup {
-            ScanPhase::WarmingUp
-        } else {
-            ScanPhase::Probing
-        },
+        warming_phase,
         probes_started,
         probes_completed,
         futs.len(),
@@ -1299,6 +1302,9 @@ async fn run_scan_port(
                 result.port_results = vec![port_result(&result)];
             }
             let _ = tx.send(result);
+            if include_port_details {
+                targets_completed += 1;
+            }
         }
     }
 
@@ -1341,7 +1347,7 @@ async fn run_scan_port(
                     probes_started += 1;
                     send_progress(
                         progress.as_ref(),
-                        ScanPhase::WarmingUp,
+                        warming_phase,
                         probes_started,
                         probes_completed,
                         futs.len() + 1,
@@ -1397,7 +1403,7 @@ async fn run_scan_port(
             probes_started += 1;
             send_progress(
                 progress.as_ref(),
-                ScanPhase::Probing,
+                probing_phase,
                 probes_started,
                 probes_completed,
                 futs.len() + 1,
@@ -1531,8 +1537,10 @@ async fn run_scan_port(
                             }
                             record_best(&mut best, &result, args.top);
                             let _ = tx.send(result);
-                            targets_completed += 1;
-                            completed_target = Some(state.ip.clone());
+                            if include_port_details {
+                                targets_completed += 1;
+                                completed_target = Some(state.ip.clone());
+                            }
                         } else if completed == probe_count {
                             let state = &mut states[index];
                             let mut result = state.result_with_mode(args.adaptive_probing);
@@ -1541,12 +1549,14 @@ async fn run_scan_port(
                             }
                             record_best(&mut best, &result, args.top);
                             let _ = tx.send(result);
-                            targets_completed += 1;
-                            completed_target = Some(state.ip.clone());
+                            if include_port_details {
+                                targets_completed += 1;
+                                completed_target = Some(state.ip.clone());
+                            }
                         }
                         send_progress(
                             progress.as_ref(),
-                            ScanPhase::Probing,
+                            probing_phase,
                             probes_started,
                             probes_completed,
                             futs.len(),
@@ -1569,10 +1579,20 @@ pub async fn run_scan_with_progress(
     paused: Arc<AtomicBool>,
     progress: Option<std::sync::mpsc::Sender<ScanProgress>>,
 ) {
-    run_scan_with_progress_from_offsets(targets, args, tx, cancel, paused, progress, (0, 0, 0))
-        .await;
+    run_scan_with_progress_from_offsets(
+        targets,
+        args,
+        tx,
+        cancel,
+        paused,
+        progress,
+        (0, 0, 0),
+        None,
+    )
+    .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_scan_with_progress_from_offsets(
     targets: Vec<String>,
     args: Arc<AppConfig>,
@@ -1581,6 +1601,7 @@ async fn run_scan_with_progress_from_offsets(
     paused: Arc<AtomicBool>,
     progress: Option<std::sync::mpsc::Sender<ScanProgress>>,
     mut progress_offsets: (usize, usize, usize),
+    progress_phase: Option<ScanPhase>,
 ) -> (usize, usize, usize) {
     let ports = if args.ports.is_empty() {
         vec![443]
@@ -1598,6 +1619,7 @@ async fn run_scan_with_progress_from_offsets(
             ports[0],
             true,
             progress_offsets,
+            progress_phase,
         )
         .await;
     }
@@ -1610,7 +1632,7 @@ async fn run_scan_with_progress_from_offsets(
         let mut port_args = (*args).clone();
         port_args.ports = vec![port];
         let (port_tx, port_rx) = std::sync::mpsc::channel();
-        progress_offsets = run_scan_port(
+        let (probes_started, probes_completed, _) = run_scan_port(
             targets.clone(),
             Arc::new(port_args),
             port_tx,
@@ -1620,16 +1642,26 @@ async fn run_scan_with_progress_from_offsets(
             port,
             false,
             progress_offsets,
+            progress_phase,
         )
         .await;
+        progress_offsets.0 = probes_started;
+        progress_offsets.1 = probes_completed;
         for result in port_rx {
             let _ = tx.send(result.clone());
             by_ip.entry(result.ip.clone()).or_default().push(result);
         }
     }
+    let mut merged_targets = 0;
+    for results in by_ip.values() {
+        if merge_port_results(results).is_some() {
+            merged_targets += 1;
+        }
+    }
+    progress_offsets.2 += merged_targets;
     send_progress(
         progress.as_ref(),
-        ScanPhase::Finalizing,
+        progress_phase.unwrap_or(ScanPhase::Finalizing),
         progress_offsets.0,
         progress_offsets.1,
         0,
@@ -1715,6 +1747,7 @@ async fn run_profile_scan_with_progress_from_offsets(
             paused,
             progress,
             progress_offsets,
+            None,
         )
         .await;
     }
@@ -1749,6 +1782,7 @@ async fn run_profile_scan_with_progress_from_offsets(
                 port,
                 false,
                 progress_offsets,
+                None,
             )
             .await;
             for result in check_rx {
@@ -1772,6 +1806,7 @@ async fn run_profile_scan_with_progress_from_offsets(
             break 'ports;
         }
     }
+    progress_offsets.2 += all_by_ip.len();
     for (_, results) in all_by_ip {
         if let Some(result) = merge_port_results(&results) {
             let _ = tx.send(result);
@@ -2095,6 +2130,7 @@ pub async fn run_scan_two_phase_with_progress(
         paused.clone(),
         progress.clone(),
         (0, 0, 0),
+        Some(ScanPhase::Discovery),
     )
     .await;
     let phase1: Vec<ProbeResult> = p1_rx.iter().collect();
@@ -2153,6 +2189,7 @@ pub async fn run_scan_two_phase_with_progress(
             paused,
             progress,
             progress_offsets,
+            Some(ScanPhase::Focus),
         )
         .await;
     }

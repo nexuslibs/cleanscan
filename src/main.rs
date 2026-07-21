@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use config::{validate_ports, AppConfig, HealthCheck};
+use futures::StreamExt;
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Cloudflare IP scanner / latency prober")]
@@ -20,6 +21,10 @@ pub struct Args {
     /// Use CLI output mode (tab-separated) instead of TUI
     #[arg(long)]
     pub cli: bool,
+
+    /// Skip the best-effort public IP and network metadata lookup.
+    #[arg(long)]
+    pub no_network_info: bool,
 
     /// Hostname used for HTTPS/SNI/Host header
     #[arg(long)]
@@ -246,7 +251,6 @@ pub struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let system_network = system_info::lookup_sync();
     let mut config = config::load_config();
 
     if let Some(host) = args.host {
@@ -450,6 +454,8 @@ fn main() -> Result<()> {
             "no host configured — pass --host <domain> or set a host in the TUI settings"
         );
     }
+
+    let system_network = system_info::lookup_sync(!args.no_network_info);
 
     let watch_policy = watch::WatchPolicy {
         promote_after: args.watch_promote_after,
@@ -842,24 +848,41 @@ fn cli_mode(
     results.sort_by(crate::tui::App::natural_cmp);
 
     if let Some(raw_proxy_url) = proxy_url {
-        let transport = proxy::parse_share_url(raw_proxy_url)?;
-        let checks = results
-            .iter()
-            .filter(|result| result.ok > 0)
-            .take(protocol_check_top)
-            .map(|result| proxy::check_candidate(&transport, &result.ip, config.timeout_ms))
-            .collect::<Vec<_>>();
-        let checks = rt.block_on(futures::future::join_all(checks));
-        eprintln!(
-            "protocol transport: {} {}:{} via {} (top {})",
-            transport.protocol,
-            transport.address,
-            transport.port,
-            transport.network,
-            protocol_check_top
-        );
-        for check in checks {
-            eprintln!("protocol_check\tip={}\ttcp={}\ttls={}\tlong_tls={}\tws_reached={}\tws_accepted={}\telapsed_ms={:.1}\terror={}", check.ip, check.tcp_ok, check.tls_ok, check.long_tls_ok, check.websocket_reached.map_or_else(|| "-".into(), |v| v.to_string()), check.websocket_accepted.map_or_else(|| "-".into(), |v| v.to_string()), check.elapsed_ms, check.error.unwrap_or_default());
+        if let Ok(transport) = proxy::parse_share_url(raw_proxy_url) {
+            let checks = results
+                .iter()
+                .filter(|result| result.ok > 0)
+                .take(protocol_check_top)
+                .map(|result| proxy::check_candidate(&transport, &result.ip, config.timeout_ms))
+                .collect::<Vec<_>>();
+            let checks = rt.block_on(
+                futures::stream::iter(checks)
+                    .buffer_unordered(config.concurrency.max(1))
+                    .collect::<Vec<_>>(),
+            );
+            eprintln!(
+                "protocol transport: {} {}:{} via {} (top {})",
+                transport.protocol,
+                transport.address,
+                transport.port,
+                transport.network,
+                protocol_check_top
+            );
+            for check in checks {
+                eprintln!(
+                    "protocol_check\tip={}\ttcp={}\ttls={}\tlong_tls={}\tws_reached={}\tws_accepted={}\telapsed_ms={:.1}\terror={}",
+                    check.ip,
+                    check.tcp_ok,
+                    check.tls_ok,
+                    check.long_tls_ok,
+                    check.websocket_reached
+                        .map_or_else(|| "-".into(), |v| v.to_string()),
+                    check.websocket_accepted
+                        .map_or_else(|| "-".into(), |v| v.to_string()),
+                    check.elapsed_ms,
+                    check.error.unwrap_or_default()
+                );
+            }
         }
     }
     let healthy = results.iter().any(|result| {

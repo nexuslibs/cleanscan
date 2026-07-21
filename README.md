@@ -323,7 +323,7 @@ latency dashboard.
 ## Output
 
 At startup, cleanscan performs a best-effort lookup of the current public IP,
-origin ASN, and ISP name through `ipwho.is`. The TUI shows these values in its dashboard and
+the public IP's network ASN, and ISP name through `ipwho.is`. The TUI shows these values in its dashboard and
 speed-test headers; CLI mode prints them to stderr so tabular stdout remains
 pipe-friendly. If the lookup is unavailable, the scan continues and displays
 `—`/`unknown` instead.

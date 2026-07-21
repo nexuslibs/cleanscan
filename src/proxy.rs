@@ -1,6 +1,6 @@
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -92,8 +92,15 @@ pub fn parse_share_url(raw: &str) -> Result<ProxyTransport> {
 }
 
 fn tls_config() -> Result<TlsConnector> {
-    let config = ClientConfig::with_platform_verifier()?;
-    Ok(TlsConnector::from(Arc::new(config)))
+    static CONNECTOR: OnceLock<std::result::Result<TlsConnector, String>> = OnceLock::new();
+    CONNECTOR
+        .get_or_init(|| {
+            ClientConfig::with_platform_verifier()
+                .map(|config| TlsConnector::from(Arc::new(config)))
+                .map_err(|error| error.to_string())
+        })
+        .clone()
+        .map_err(|error| anyhow!(error))
 }
 
 async fn tls_connect(stream: TcpStream, sni: &str) -> Result<TlsStream<TcpStream>> {
@@ -217,7 +224,10 @@ mod tests {
 
     #[test]
     fn parses_vless_websocket_transport_without_exposing_credentials() {
-        let config = parse_share_url("vless://secret@example.com:2053?type=ws&security=tls&sni=edge.example&host=cdn.example&path=%2Fws").unwrap();
+        let config = parse_share_url(
+            "vless://secret@example.com:2053?type=ws&security=tls&sni=edge.example&host=cdn.example&path=%2Fws",
+        )
+        .unwrap();
         assert_eq!(config.protocol, "vless");
         assert_eq!(config.port, 2053);
         assert_eq!(config.sni, "edge.example");

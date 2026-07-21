@@ -28,9 +28,9 @@ run_detection() {
   grep -qx "install_dir=$expected_dir" <<<"$output"
 }
 
-run_detection Linux x86_64 x86_64-unknown-linux-musl "$TEST_ROOT/linux-x86"
-run_detection Linux aarch64 aarch64-unknown-linux-musl "$TEST_ROOT/linux-arm64"
-run_detection Darwin x86_64 x86_64-apple-darwin "$TEST_ROOT/macos-x86"
+run_detection Linux x86_64 x86_64-unknown-linux-musl "$TEST_ROOT/linux-x86" CLEANSCAN_TEST_TERMUX=0
+run_detection Linux aarch64 aarch64-unknown-linux-musl "$TEST_ROOT/linux-arm64" CLEANSCAN_TEST_TERMUX=0
+run_detection Darwin x86_64 x86_64-apple-darwin "$TEST_ROOT/macos-x86" CLEANSCAN_TEST_TERMUX=0
 
 TERMUX_PREFIX="$TEST_ROOT/termux/usr"
 run_detection Linux aarch64 aarch64-unknown-linux-musl "$TERMUX_PREFIX/bin" \

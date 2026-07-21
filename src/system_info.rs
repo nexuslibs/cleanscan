@@ -23,7 +23,10 @@ struct IpWhoConnection {
     org: Option<String>,
 }
 
-pub fn lookup_sync() -> SystemNetworkInfo {
+pub fn lookup_sync(enabled: bool) -> SystemNetworkInfo {
+    if !enabled {
+        return SystemNetworkInfo::default();
+    }
     let Ok(runtime) = tokio::runtime::Runtime::new() else {
         return SystemNetworkInfo::default();
     };
@@ -46,6 +49,10 @@ async fn lookup() -> SystemNetworkInfo {
     let Ok(data) = response.json::<IpWhoResponse>().await else {
         return SystemNetworkInfo::default();
     };
+    map_response(data)
+}
+
+fn map_response(data: IpWhoResponse) -> SystemNetworkInfo {
     if !data.success {
         return SystemNetworkInfo::default();
     }
@@ -78,7 +85,7 @@ impl SystemNetworkInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::SystemNetworkInfo;
+    use super::{map_response, IpWhoResponse, SystemNetworkInfo};
 
     #[test]
     fn missing_metadata_has_safe_display_values() {
@@ -86,5 +93,29 @@ mod tests {
         assert_eq!(info.public_ip_display(), "—");
         assert_eq!(info.asn_display(), "—");
         assert_eq!(info.isp_display(), "unknown");
+    }
+
+    #[test]
+    fn maps_ipwho_response_fields_and_fallbacks() {
+        let data: IpWhoResponse = serde_json::from_str(
+            r#"{"success":true,"ip":"203.0.113.8","connection":{"asn":64500,"isp":null,"org":"Example Org"}}"#,
+        ).unwrap();
+        let info = map_response(data);
+        assert_eq!(info.public_ip.as_deref(), Some("203.0.113.8"));
+        assert_eq!(info.asn.as_deref(), Some("AS64500"));
+        assert_eq!(info.isp.as_deref(), Some("Example Org"));
+    }
+
+    #[test]
+    fn unsuccessful_or_missing_connection_is_safe() {
+        let failed: IpWhoResponse =
+            serde_json::from_str(r#"{"success":false,"ip":"203.0.113.8"}"#).unwrap();
+        assert_eq!(map_response(failed).public_ip, None);
+        let missing: IpWhoResponse =
+            serde_json::from_str(r#"{"success":true,"ip":"203.0.113.8"}"#).unwrap();
+        assert_eq!(
+            map_response(missing).public_ip.as_deref(),
+            Some("203.0.113.8")
+        );
     }
 }

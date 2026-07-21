@@ -34,8 +34,10 @@ OS="${CLEANSCAN_TEST_OS:-$(uname -s)}"
 ARCH="${CLEANSCAN_TEST_ARCH:-$(uname -m)}"
 
 IS_TERMUX=0
-if [ -n "${CLEANSCAN_TEST_TERMUX:-}" ]; then
+if [ "${CLEANSCAN_TEST_TERMUX:-}" = "1" ]; then
   IS_TERMUX=1
+elif [ "${CLEANSCAN_TEST_TERMUX:-}" = "0" ]; then
+  IS_TERMUX=0
 elif [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == */com.termux/* ]]; then
   IS_TERMUX=1
 fi

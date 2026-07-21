@@ -206,7 +206,7 @@ fn render_compact(app: &mut App, frame: &mut Frame, area: Rect) {
 
 fn render_compact_stats(app: &App, frame: &mut Frame, area: Rect) {
     let total = app.total_targets;
-    let done = app.scan_progress.targets_completed.max(app.results.len());
+    let done = app.scan_progress.targets_completed;
     let ratio = if total > 0 {
         done as f64 / total as f64
     } else {
@@ -820,7 +820,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
         ])
         .split(area);
 
-    let passed = app.scan_progress.targets_completed.max(app.results.len());
+    let passed = app.scan_progress.targets_completed;
     let total = app.total_targets;
     let pct = if total > 0 {
         (passed as f64 / total as f64 * 100.0) as u16
@@ -849,13 +849,11 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
         let rate = app.scan_progress.probes_completed as f64 / elapsed.max(0.001);
         let remaining = total.saturating_sub(passed);
         let target_rate = passed as f64 / elapsed.max(0.001);
-        let eta = if target_rate > 0.0 {
-            (remaining as f64 / target_rate).max(0.0)
-        } else {
-            0.0
-        };
         rate_str = format!("{:.1} probes/s", rate);
-        eta_str = format!("{:02}:{:02}", eta as u64 / 60, eta as u64 % 60);
+        if target_rate > 0.0 {
+            let eta = (remaining as f64 / target_rate).max(0.0);
+            eta_str = format!("{:02}:{:02}", eta as u64 / 60, eta as u64 % 60);
+        }
     } else if let Some(label) = terminal_label {
         rate_str = label.to_string();
         eta_str = "--:--".to_string();

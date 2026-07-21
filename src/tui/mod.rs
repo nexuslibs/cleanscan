@@ -1721,6 +1721,7 @@ pub fn run_tui(
                 while let Ok(r) = rx.try_recv() {
                     app.add_result(r);
                 }
+                while progress_rx.try_recv().is_ok() {}
                 if let Some(handle) = scanner.take() {
                     match handle.join() {
                         Ok(Ok(actual_targets)) => {
