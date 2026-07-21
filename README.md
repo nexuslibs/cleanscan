@@ -99,6 +99,18 @@ cleanscan --cli --host example.com \
   --cidr 188.114.96.0/20
 ```
 
+### TUI environment options
+
+For terminals that do not support Unicode box-drawing or braille glyphs, use
+ASCII rendering:
+
+```sh
+CLEANSCAN_ASCII=1 cleanscan --cidr 188.114.96.0/20
+```
+
+Set `CLEANSCAN_REDUCED_MOTION=1` to disable modal slide transitions while
+keeping status updates and progress feedback enabled.
+
 ### TUI controls
 
 When `cleanscan` is run with no `--cidr` / `--ips`, it opens a guided setup

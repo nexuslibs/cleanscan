@@ -262,6 +262,9 @@ pub struct App {
     pub scan_seed: u64,
     pub scan_complete: bool,
     pub scan_lifecycle: ScanLifecycle,
+    /// Persistent error from the scan worker, retained for diagnosis after
+    /// the worker exits instead of being shown only as a transient toast.
+    pub scan_error: Option<String>,
     pub should_quit: bool,
     pub paused: Arc<AtomicBool>,
     pub cancel: Option<Arc<AtomicBool>>,
@@ -277,6 +280,8 @@ pub struct App {
     /// Scroll offset into the wizard settings list.
     pub settings_scroll: usize,
     pub settings_list_state: ListState,
+    /// Whether expert ranking/adaptive scan settings are visible.
+    pub show_advanced_settings: bool,
     /// Currently sorted column index in the results table (natural order = 0).
     pub sort_col: usize,
     pub sort_asc: bool,
@@ -288,6 +293,8 @@ pub struct App {
     pub start_time: Instant,
     /// Help overlay visibility.
     pub show_help: bool,
+    /// Vertical scroll offset for contextual help on short terminals.
+    pub help_scroll: usize,
     /// Animation frame counter, advanced once per event-loop iteration.
     pub tick: u64,
     /// Last known mouse position, used for button hover styling.
@@ -382,9 +389,29 @@ pub struct App {
 
 /// Default animation configuration shared by every modal overlay.
 fn modal_state() -> OverlayState {
+    let duration = if reduced_motion() {
+        Duration::ZERO
+    } else {
+        Duration::from_millis(140)
+    };
     OverlayState::new()
-        .with_duration(Duration::from_millis(140))
+        .with_duration(duration)
         .with_easing(Easing::EaseOut)
+}
+
+/// Terminal applications do not receive a platform reduced-motion signal, so
+/// provide an explicit opt-in that works in SSH and CI environments too.
+/// `CLEANSCAN_REDUCED_MOTION=1` disables modal sliding while retaining all
+/// state and status feedback.
+fn reduced_motion() -> bool {
+    std::env::var("CLEANSCAN_REDUCED_MOTION")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// Build a centered, dimmed, sliding modal overlay with a themed title block.
@@ -393,13 +420,17 @@ pub(crate) fn modal_overlay(
     percent_w: u16,
     percent_h: u16,
 ) -> Overlay<'static> {
-    Overlay::new()
+    let overlay = Overlay::new()
         .anchor(Anchor::Center)
         .width(Constraint::Percentage(percent_w))
         .height(Constraint::Percentage(percent_h))
         .backdrop(Backdrop::new(theme::palette().sel_bg))
-        .block(widgets::panel_block(title, true))
-        .slide(Slide::Top)
+        .block(widgets::panel_block(title, true));
+    if reduced_motion() {
+        overlay
+    } else {
+        overlay.slide(Slide::Top)
+    }
 }
 
 impl App {
@@ -627,6 +658,7 @@ impl App {
             scan_seed,
             scan_complete: false,
             scan_lifecycle: ScanLifecycle::Running,
+            scan_error: None,
             should_quit: false,
             paused,
             cancel: None,
@@ -639,6 +671,7 @@ impl App {
             ranges_list_state: ListState::default(),
             settings_scroll: 0,
             settings_list_state: ListState::default(),
+            show_advanced_settings: false,
             sort_col: 0,
             sort_asc: true,
             show_failures: false,
@@ -648,6 +681,7 @@ impl App {
             column_picker_cursor: 0,
             start_time: Instant::now(),
             show_help: false,
+            help_scroll: 0,
             tick: 0,
             hover_pos: None,
             throughput: Vec::new(),
@@ -792,6 +826,7 @@ impl App {
         self.total_targets = total;
         self.scan_complete = false;
         self.scan_lifecycle = ScanLifecycle::Running;
+        self.scan_error = None;
         self.results.clear();
         self.scroll = 0;
         self.result_cursor = 0;
@@ -1643,12 +1678,14 @@ pub fn run_tui(
                             app.scan_complete = true;
                             app.scan_lifecycle =
                                 app.resolve_terminal_lifecycle(ScanLifecycle::Failed);
+                            app.scan_error = Some(e.to_string());
                             app.toast_error(format!("Scan failed: {e}"));
                         }
                         Err(_) => {
                             app.scan_complete = true;
                             app.scan_lifecycle =
                                 app.resolve_terminal_lifecycle(ScanLifecycle::Failed);
+                            app.scan_error = Some("Scan worker panicked".to_string());
                             app.toast_error("Scan worker panicked");
                         }
                     }
@@ -2115,14 +2152,38 @@ impl App {
                 KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q')
             ) {
                 self.show_help = false;
+                self.help_scroll = 0;
+            } else {
+                match code {
+                    KeyCode::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
+                    KeyCode::Down => self.help_scroll = self.help_scroll.saturating_add(1),
+                    KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(8),
+                    KeyCode::PageDown => self.help_scroll = self.help_scroll.saturating_add(8),
+                    KeyCode::Home => self.help_scroll = 0,
+                    _ => {}
+                }
             }
             return;
         }
 
         // Global keys work on every screen.
         match code {
+            KeyCode::Esc if self.screen == Screen::SpeedTesting => {
+                self.request_cancel();
+                return;
+            }
+            KeyCode::Esc if self.screen == Screen::Scanning => {
+                if self.scan_complete {
+                    self.show_help = false;
+                    self.should_quit = true;
+                } else {
+                    self.confirm_quit = true;
+                }
+                return;
+            }
             KeyCode::Char('?') => {
                 self.show_help = !self.show_help;
+                self.help_scroll = 0;
                 return;
             }
             KeyCode::Char('/') if self.screen == Screen::SpeedSelect => {
@@ -2210,7 +2271,10 @@ impl App {
                 }
             }
             Action::CloseDetails => self.show_result_details = false,
-            Action::OpenHelp => self.show_help = true,
+            Action::OpenHelp => {
+                self.show_help = true;
+                self.help_scroll = 0;
+            }
             Action::OpenCommandPalette => self.open_command_palette(),
             Action::ConfigureColumns => {
                 if self.screen == Screen::Scanning {
@@ -2371,7 +2435,7 @@ impl App {
         frame.render_stateful_widget(
             ratatui::widgets::List::new(items)
                 .highlight_style(theme::row_selected_style())
-                .highlight_symbol("› "),
+                .highlight_symbol(widgets::focus_marker()),
             body[0],
             &mut self.column_picker_list_state,
         );
@@ -2394,7 +2458,7 @@ impl App {
             return;
         };
         let actions = self.filtered_actions();
-        let visible = inner.height.saturating_sub(3) as usize;
+        let visible = inner.height.saturating_sub(3).saturating_div(2) as usize;
         self.command_cursor = self.command_cursor.min(actions.len().saturating_sub(1));
         let start = self
             .command_cursor
@@ -2408,17 +2472,17 @@ impl App {
                 } else {
                     ratatui::style::Style::default()
                 };
-                ratatui::widgets::ListItem::new(
+                ratatui::widgets::ListItem::new(vec![
                     Line::from(vec![
                         Span::styled(format!(" {:<24}", action.label()), style),
                         Span::styled(
                             format!(" {:<6}", action.shortcut()),
                             theme::highlight_style(),
                         ),
-                        Span::styled(action.description(), theme::hint_style()),
                     ])
                     .style(style),
-                )
+                    Line::from(format!("   {}", action.description())).style(theme::hint_style()),
+                ])
             })
             .collect::<Vec<_>>();
         let chunks = Layout::default()
@@ -2456,7 +2520,7 @@ impl App {
         frame.render_stateful_widget(
             ratatui::widgets::List::new(items)
                 .highlight_style(theme::row_selected_style())
-                .highlight_symbol("› "),
+                .highlight_symbol(widgets::focus_marker()),
             chunks[1],
             &mut self.command_list_state,
         );
@@ -2632,9 +2696,23 @@ impl App {
         self.show_failures = !self.show_failures;
         self.result_cursor = 0;
         self.scroll = 0;
+        if self.show_failures {
+            let first_failure = self
+                .sorted_results()
+                .iter()
+                .position(|result| result.fail > 0);
+            if let Some(index) = first_failure {
+                self.result_cursor = index;
+                self.show_result_details = true;
+                self.detail_tab = 1;
+            } else if self.scan_error.is_some() {
+                self.show_result_details = true;
+                self.detail_tab = 1;
+            }
+        }
         self.toast_kind(
             if self.show_failures {
-                "Showing all targets, including failures"
+                "Showing failures — opening the first cause"
             } else {
                 "Showing successful targets"
             },
@@ -3075,6 +3153,17 @@ impl App {
                             }
                         }
                     }
+                    if let Some(inner) = self.table_inner {
+                        if p.1 > inner.y && point_in(inner, p) {
+                            let row = self.scroll + (p.1 - inner.y - 1) as usize;
+                            let max = self
+                                .sorted_results()
+                                .len()
+                                .min(self.config.top)
+                                .saturating_sub(1);
+                            self.result_cursor = row.min(max);
+                        }
+                    }
                 } else if self.screen == Screen::SpeedSelect {
                     if let Some(header) = self.speed_table_header {
                         if point_in(header, p) {
@@ -3235,6 +3324,7 @@ mod tests {
         ProbeResult, ScanLifecycle, Screen, WizardStep,
     };
     use crate::config::AppConfig;
+    use crate::scanner::{DiagnosticCategory, DiagnosticPhase, ProbeDiagnostic};
     use crate::watch::{WatchPolicy, WatchState};
     use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::{backend::TestBackend, Terminal};
@@ -3345,6 +3435,142 @@ mod tests {
         app.focus_index = 4;
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn escape_cancels_active_scan_and_quits_completed_dashboard() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(1);
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.confirm_quit);
+
+        app.confirm_quit = false;
+        app.scan_complete = true;
+        app.scan_lifecycle = ScanLifecycle::Completed;
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn f_opens_diagnostics_for_the_first_failed_target() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(2);
+        let mut failed = result("192.0.2.2", 2, 0.2);
+        failed.ok = 0;
+        failed.failures = vec!["request timeout".to_string()];
+        app.results = vec![result("192.0.2.1", 0, 0.1), failed];
+
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::NONE);
+
+        assert!(app.show_failures);
+        assert!(app.show_result_details);
+        assert_eq!(app.detail_tab, 1);
+        assert_eq!(app.result_cursor, 1);
+    }
+
+    #[test]
+    fn f_opens_a_failed_target_outside_the_normal_top_limit() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(2);
+        app.config.top = 1;
+        let mut first = result("192.0.2.1", 1, 0.01);
+        first.ok = 0;
+        first.failures = vec!["first failure".to_string()];
+        let mut second = result("192.0.2.2", 1, 0.02);
+        second.ok = 0;
+        second.failures = vec!["actual cause".to_string()];
+        app.results = vec![first, second];
+
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::NONE);
+
+        assert!(app.show_result_details);
+        assert_eq!(app.detail_tab, 1);
+        assert_eq!(app.sorted_results()[app.result_cursor].ip, "192.0.2.1");
+    }
+
+    #[test]
+    fn diagnostics_are_rendered_when_only_structured_diagnostics_exist() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(1);
+        let mut failed = result("192.0.2.9", 1, 0.02);
+        failed.ok = 0;
+        failed.failures.clear();
+        failed.diagnostics.push(ProbeDiagnostic {
+            category: DiagnosticCategory::Timeout,
+            phase: DiagnosticPhase::ResponseHeaders,
+            message: "request timed out while reading response headers".to_string(),
+            status: None,
+            location: None,
+            elapsed_ms: Some(1_000.0),
+        });
+        app.results = vec![failed];
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::NONE);
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("request timed out"));
+    }
+
+    #[test]
+    fn escape_closes_details_before_quitting_completed_results() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(1);
+        app.scan_complete = true;
+        app.scan_lifecycle = ScanLifecycle::Completed;
+        app.show_result_details = true;
+
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(!app.show_result_details);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn worker_failure_remains_available_from_f() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(1);
+        app.scan_complete = true;
+        app.scan_lifecycle = ScanLifecycle::Failed;
+        app.scan_error = Some("connection scheduler failed".to_string());
+
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::NONE);
+
+        assert!(app.show_result_details);
+        assert_eq!(app.detail_tab, 1);
     }
 
     #[test]
@@ -3483,6 +3709,8 @@ mod tests {
         // Render at a comfortable size and a smaller one to exercise layouts.
         draw(&mut app, 140, 40);
         draw(&mut app, 90, 30);
+        draw(&mut app, 60, 20);
+        draw(&mut app, 40, 9);
         // Completed state and overlays should also render cleanly.
         app.scan_complete = true;
         app.show_help = true;
@@ -3639,11 +3867,12 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("[✓]"));
+        assert!(rendered.contains("[✓]") || rendered.contains("[x]"));
         assert!(rendered.contains("[ ]"));
 
         assert!(terminal.backend().buffer().content().iter().any(|cell| {
-            cell.symbol() == "✓" && cell.modifier.contains(ratatui::style::Modifier::BOLD)
+            (cell.symbol() == "✓" || cell.symbol() == "x")
+                && cell.modifier.contains(ratatui::style::Modifier::BOLD)
         }));
     }
 
@@ -3741,6 +3970,42 @@ mod tests {
         app.show_result_details = true;
         draw(&mut app, 80, 24);
         draw(&mut app, 79, 23);
+    }
+
+    #[test]
+    fn micro_dashboard_keeps_scrolling_and_details_available() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(12);
+        for index in 0..12 {
+            app.add_result(result(&format!("192.0.2.{}", index + 1), 0, 0.04));
+        }
+        app.result_cursor = 11;
+        app.show_result_details = true;
+        draw(&mut app, 40, 12);
+        std::thread::sleep(Duration::from_millis(160));
+        draw(&mut app, 40, 12);
+        assert!(app.scroll > 0);
+        assert!(app.result_details_overlay.inner_area().is_some());
+    }
+
+    #[test]
+    fn help_scroll_is_keyboard_accessible() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.show_help = true;
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.help_scroll, 1);
+        app.handle_key(KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(app.help_scroll, 9);
+        app.handle_key(KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(app.help_scroll, 0);
     }
 
     #[test]

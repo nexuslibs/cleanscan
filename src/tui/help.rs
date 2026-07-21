@@ -2,14 +2,15 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Paragraph, Wrap},
     Frame,
 };
 use std::time::Duration;
 
 use crate::tui::{modal_overlay, theme, App, Screen, WizardStep};
 
-/// Render a context-aware help overlay. Closed by any key (`?` toggles).
+/// Render a context-aware help overlay. It remains open until `?`, `Esc`, or
+/// `q`, so navigation keys can be read without accidentally dismissing help.
 pub fn overlay(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) {
     let overlay = modal_overlay(" Help — ? / Esc / q to close ", 64, 70);
     if app.show_help {
@@ -31,7 +32,14 @@ pub fn overlay(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) 
         Screen::SpeedResults => speed_results_lines(),
     };
 
-    let para = Paragraph::new(lines).style(Style::default());
+    let para = Paragraph::new(lines)
+        .style(Style::default())
+        .wrap(Wrap { trim: false });
+    let max_scroll = para
+        .line_count(inner.width)
+        .saturating_sub(inner.height as usize);
+    let scroll = app.help_scroll.min(max_scroll).min(u16::MAX as usize) as u16;
+    let para = para.scroll((scroll, 0));
     frame.render_widget(para, inner);
 }
 
@@ -48,6 +56,10 @@ fn wizard_lines(step: WizardStep) -> Vec<Line<'static>> {
         key("↑ / ↓  or  k / j", "Move cursor through the list"),
         key("Tab / Shift+Tab", "Move focus between controls"),
         key("Enter / Esc", "Activate or go back"),
+        key(
+            "↑ / ↓ / PgUp / PgDn / Home",
+            "Scroll this help on short terminals",
+        ),
         key("/", "Search the command palette"),
         key("?  Esc  q", "Close this help"),
         key("q", "Quit cleanscan"),
@@ -126,6 +138,7 @@ fn scanning_lines(app: &App) -> Vec<Line<'static>> {
         key("Click header", "Sort results by that column"),
         key("Mouse wheel", "Scroll the results table"),
         key("?  Esc  q", "Close this help"),
+        key("Esc", "Cancel scan or quit results"),
         key("q", "Quit (press twice while scanning)"),
         Line::from(""),
         Line::from(Span::styled(
@@ -159,6 +172,7 @@ fn speed_selection_lines() -> Vec<Line<'static>> {
 fn speed_testing_lines() -> Vec<Line<'static>> {
     vec![
         Line::from(Span::styled(" Speed tests running", theme::header_style())),
+        key("Esc", "Cancel speed tests"),
         key("q", "Quit cleanscan"),
     ]
 }

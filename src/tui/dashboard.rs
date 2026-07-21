@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{
         canvas::{Canvas, Points},
         Axis, Bar, BarChart, BarGroup, Cell, Chart, Dataset, GraphType, LineGauge, Paragraph, Row,
-        Scrollbar, ScrollbarState, Sparkline, Table, Tabs,
+        Scrollbar, ScrollbarState, Sparkline, Table, Tabs, Wrap,
     },
     Frame,
 };
@@ -51,10 +51,8 @@ const WIDTHS: [Constraint; 14] = [
 
 /// Render the live scanning dashboard.
 pub fn render(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) {
-    if area.width < 80 || area.height < 24 {
-        render_terminal_too_small(frame, area);
-        // Keep the result-details overlay's lifecycle running (so it can still
-        // be dismissed with its close animation) even on a too-small terminal.
+    if area.width < 48 || area.height < 10 {
+        render_micro(app, frame, area);
         render_result_details(app, frame, area, elapsed);
         return;
     }
@@ -68,6 +66,109 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) {
     }
 
     render_result_details(app, frame, area, elapsed);
+}
+
+/// Progressive fallback for very small terminals. It keeps the live scan,
+/// selection, status, and quit affordances usable instead of replacing the
+/// product with a resize warning.
+fn render_micro(app: &mut App, frame: &mut Frame, area: Rect) {
+    let chunks = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(2),
+    ])
+    .split(area);
+    render_micro_header(app, frame, chunks[0]);
+    render_compact_stats(app, frame, chunks[1]);
+
+    let block = widgets::panel_block("Results — Enter details", app.focus_index == 0);
+    let inner = block.inner(chunks[2]);
+    app.table_inner = Some(inner);
+    app.table_header = Some(Rect::new(inner.x, inner.y, inner.width, 1));
+    app.table_col_indices = vec![0, 1, 8];
+    app.table_col_bounds = vec![
+        (inner.x, inner.x.saturating_add(4)),
+        (inner.x.saturating_add(4), inner.x.saturating_add(4 + 12)),
+        (inner.right().saturating_sub(10), inner.right()),
+    ];
+    let visible = inner.height.saturating_sub(1) as usize;
+    let display_len = app.sorted_results().len().min(app.config.top);
+    app.result_cursor = app.result_cursor.min(display_len.saturating_sub(1));
+    let max_start = display_len.saturating_sub(visible);
+    app.scroll = app
+        .scroll
+        .max(app.result_cursor.saturating_sub(visible.saturating_sub(1)))
+        .min(app.result_cursor)
+        .min(max_start);
+    let sorted = app.sorted_results();
+    let rows = sorted
+        .iter()
+        .skip(app.scroll)
+        .take(visible)
+        .enumerate()
+        .map(|(index, result)| {
+            let status = result_status(result);
+            let selected = app.scroll + index == app.result_cursor;
+            Row::new(vec![
+                Cell::from(format!("{}", app.scroll + index + 1)),
+                Cell::from(result.ip.clone()),
+                Cell::from(fmt_ms(result.p95)),
+                Cell::from(status),
+            ])
+            .style(if selected {
+                theme::row_selected_style()
+            } else {
+                Style::default()
+            })
+        });
+    frame.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(4),
+                Constraint::Min(12),
+                Constraint::Length(10),
+                Constraint::Length(10),
+            ],
+        )
+        .header(Row::new(["#", "IP", "P95", "Status"]).style(theme::title_style()))
+        .block(block),
+        chunks[2],
+    );
+    widgets::status_bar(
+        frame,
+        chunks[3],
+        &[
+            ("↑/↓", "select"),
+            (widgets::enter_key(), "details"),
+            ("Esc", "quit"),
+            ("q", "quit"),
+        ],
+        app.visible_message(),
+    );
+}
+
+fn render_micro_header(app: &App, frame: &mut Frame, area: Rect) {
+    let status = match app.scan_lifecycle {
+        ScanLifecycle::Completed => "DONE",
+        ScanLifecycle::Paused => "PAUSED",
+        ScanLifecycle::Cancelling => "CANCELLING",
+        ScanLifecycle::Failed => "FAILED",
+        ScanLifecycle::Cancelled => "CANCELLED",
+        ScanLifecycle::Running => "SCANNING",
+    };
+    let status_text = if status == "SCANNING" {
+        format!("{} {}", widgets::spinner_frame(app.tick), status)
+    } else {
+        status.to_string()
+    };
+    widgets::app_header(
+        frame,
+        area,
+        Some((&status_text, theme::status_style(status))),
+        &[],
+    );
 }
 
 fn render_wide(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -85,27 +186,6 @@ fn render_wide(app: &mut App, frame: &mut Frame, area: Rect) {
     render_stats_panel(app, frame, chunks[1]);
     render_table(app, frame, chunks[2]);
     render_footer(app, frame, chunks[3]);
-}
-
-fn render_terminal_too_small(frame: &mut Frame, area: Rect) {
-    let block = widgets::panel_block("Terminal size", true);
-    let lines = vec![
-        Line::from(Span::styled(
-            "cleanscan needs at least 80×24",
-            theme::header_style(),
-        )),
-        Line::from("Resize the terminal to continue."),
-        Line::from(Span::styled(
-            format!("Current size: {}×{}", area.width, area.height),
-            theme::hint_style(),
-        )),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines)
-            .alignment(ratatui::layout::Alignment::Center)
-            .block(block),
-        area,
-    );
 }
 
 fn render_compact(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -329,16 +409,10 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     let hints: &[widgets::KeyHint] = if app.scan_complete {
         &[
             ("Tab", "focus"),
-            ("↵", "details"),
+            (widgets::enter_key(), "details"),
             ("e", "export"),
-            ("t", "speed test"),
-            ("f", "show failures"),
-            ("v", "columns"),
-            ("r", "rerun targets"),
-            ("n", "new sample"),
-            ("m", "comparison export"),
-            ("w", "customize"),
-            ("c", "copy"),
+            ("t", "speed"),
+            ("f", "failures"),
             ("/", "commands"),
             ("?", "help"),
             ("q", "quit"),
@@ -346,11 +420,12 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     } else {
         &[
             ("Tab", "focus"),
-            ("↵", "details"),
+            (widgets::enter_key(), "details"),
             ("p", "pause"),
             ("c", "copy"),
             ("/", "commands"),
             ("?", "help"),
+            ("Esc", "cancel"),
             ("q", "quit"),
         ]
     };
@@ -381,15 +456,6 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect, elapsed: 
         return;
     };
 
-    let Some(result) = app
-        .sorted_results()
-        .into_iter()
-        .take(app.config.top)
-        .nth(app.result_cursor)
-    else {
-        return;
-    };
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -398,6 +464,21 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect, elapsed: 
             Constraint::Min(1),
         ])
         .split(inner);
+
+    let Some(result) = app.sorted_results().into_iter().nth(app.result_cursor) else {
+        if let Some(error) = &app.scan_error {
+            render_detail_text(
+                frame,
+                chunks[2],
+                vec![
+                    Line::from(Span::styled("Scan worker failure", theme::subtitle_style())),
+                    Line::from(error.clone()),
+                ],
+            );
+        }
+        return;
+    };
+
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             result.ip.clone(),
@@ -482,7 +563,7 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect, elapsed: 
                 "Failure breakdown",
                 theme::subtitle_style(),
             )));
-            if result.failures.is_empty() {
+            if result.failures.is_empty() && result.diagnostics.is_empty() {
                 lines.push(Line::from("  No failed probes"));
             } else {
                 let mut failures = std::collections::BTreeMap::<&str, usize>::new();
@@ -549,7 +630,7 @@ fn render_detail_text(frame: &mut Frame, area: Rect, mut lines: Vec<Line<'static
             theme::hint_style(),
         )),
     ]);
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn render_latency_chart(frame: &mut Frame, area: Rect, result: &ProbeResult) {
@@ -867,7 +948,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
             Span::raw(format!("{:.1}ms", median_latency * 1000.0)),
         ]),
     ];
-    let block_p2 = widgets::panel_block("Latency & Throughput", false);
+    let block_p2 = widgets::subtle_panel_block("Latency & Throughput");
     let p2_inner = block_p2.inner(col_chunks[1]);
     frame.render_widget(block_p2, col_chunks[1]);
     let p2_rows = Layout::default()
@@ -927,7 +1008,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
     })
     .collect::<Vec<_>>();
 
-    let block_p3 = widgets::panel_block("Latency Spread", false);
+    let block_p3 = widgets::subtle_panel_block("Latency Spread");
     let chart = BarChart::default()
         .block(block_p3)
         .data(BarGroup::default().bars(&bars))
@@ -1110,7 +1191,10 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
             // Star the composite-score recommendation wherever it lands in the sort.
             let is_first = best_ip.as_deref() == Some(r.ip.as_str());
             let (ip_text, rank_text) = if is_first {
-                (format!("★ {}", r.ip), format!(" {rank}"))
+                (
+                    format!("{} {}", widgets::best_marker(), r.ip),
+                    format!(" {rank}"),
+                )
             } else {
                 (r.ip.clone(), rank.to_string())
             };
@@ -1365,7 +1449,7 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     let hints: &[widgets::KeyHint] = if app.scan_complete {
         &[
             ("Tab", "focus"),
-            ("↵", "details"),
+            (widgets::enter_key(), "details"),
             ("c", "copy"),
             ("e", "export"),
             ("t", "speed test"),
@@ -1382,7 +1466,7 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     } else {
         &[
             ("Tab", "focus"),
-            ("↵", "details"),
+            (widgets::enter_key(), "details"),
             ("p", "pause"),
             ("c", "copy"),
             ("/", "commands"),

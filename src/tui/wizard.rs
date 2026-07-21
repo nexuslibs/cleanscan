@@ -764,6 +764,27 @@ impl SettingField {
         }
         Ok(())
     }
+
+    /// Ranking and adaptive probing are useful for expert tuning but should
+    /// not compete with the common scan setup path.
+    pub fn is_advanced(self) -> bool {
+        matches!(
+            self,
+            SettingField::StabilityWeight
+                | SettingField::LossWeight
+                | SettingField::EarlyStop
+                | SettingField::EarlyStopLossStreak
+                | SettingField::EarlyStopMinSamples
+                | SettingField::EarlyStopPrune
+                | SettingField::EarlyStopPruneMargin
+                | SettingField::TwoPhase
+                | SettingField::DiscoverFraction
+                | SettingField::AdaptiveProbing
+                | SettingField::MinProbes
+                | SettingField::MaxProbes
+                | SettingField::Confidence
+        )
+    }
 }
 
 /// Render the active wizard step plus the shared top bar and footer.
@@ -870,7 +891,8 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
         // Cursor marker gutter (mirrors the list highlight symbol).
         if idx == app.cursor {
             frame.render_widget(
-                Paragraph::new("› ").style(theme::row_selected_style()),
+                Paragraph::new(format!("{} ", widgets::focus_marker()))
+                    .style(theme::row_selected_style()),
                 Rect {
                     x: inner.x,
                     y,
@@ -880,8 +902,8 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
             );
         }
         let checkbox = Checkbox::new(e.cidr.clone(), e.selected)
-            .checked_symbol("[✓]")
-            .unchecked_symbol("[ ]")
+            .checked_symbol(widgets::checkbox_checked_symbol())
+            .unchecked_symbol(widgets::checkbox_unchecked_symbol())
             .style(if idx == app.cursor || e.selected {
                 theme::row_selected_style()
             } else {
@@ -1070,6 +1092,17 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     let mut row_map: Vec<Option<usize>> = Vec::new();
     let mut field_idx = 0usize;
     for (header, count) in SettingField::GROUPS {
+        let group_start = field_idx;
+        let group_is_advanced = SettingField::ALL[group_start].is_advanced();
+        if group_is_advanced && !app.show_advanced_settings {
+            lines.push(Line::from(Span::styled(
+                " ADVANCED SETTINGS  (press x to show)",
+                theme::hint_style().add_modifier(Modifier::BOLD),
+            )));
+            row_map.push(None);
+            field_idx += count;
+            continue;
+        }
         lines.push(Line::from(Span::styled(
             format!(" {} ", header.to_uppercase()),
             theme::subtitle_style().add_modifier(Modifier::BOLD),
@@ -1095,9 +1128,17 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
                             .any(|value| value == *port);
                         format!(
                             "{}{}{}",
-                            if index == app.port_cursor { "▸" } else { " " },
+                            if index == app.port_cursor {
+                                widgets::focus_marker()
+                            } else {
+                                " "
+                            },
                             port,
-                            if selected { "✓" } else { "·" }
+                            if selected {
+                                widgets::checked_marker()
+                            } else {
+                                widgets::unchecked_marker()
+                            }
                         )
                     })
                     .collect::<Vec<_>>()
@@ -1127,7 +1168,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         List::new(items)
             .block(block)
             .highlight_style(theme::row_selected_style())
-            .highlight_symbol("› "),
+            .highlight_symbol(widgets::focus_marker()),
         main_layout[0],
         &mut app.settings_list_state,
     );
@@ -1163,7 +1204,28 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         desc_para_lines.push(Line::from("  Use j/k to move between fields."));
     }
 
-    let desc_block = widgets::panel_block("Field Context", false);
+    let selected_count = app
+        .cidr_candidates
+        .iter()
+        .filter(|entry| entry.selected)
+        .count();
+    let total_ips = selected_count.saturating_mul(app.config.sample_per_cidr);
+    let total_probes = total_ips
+        .saturating_mul(app.config.probes)
+        .saturating_mul(app.config.ports.len().max(1));
+    desc_para_lines.insert(
+        1,
+        Line::from(Span::styled(
+            format!(
+                "Estimated workload: {total_ips} targets{}{} probes",
+                widgets::workload_separator(),
+                total_probes
+            ),
+            theme::subtitle_style(),
+        )),
+    );
+
+    let desc_block = widgets::subtle_panel_block("Field Context");
     let desc_inner = desc_block.inner(main_layout[1]);
     frame.render_widget(desc_block, main_layout[1]);
 
@@ -1441,12 +1503,16 @@ fn render_hint(app: &App, frame: &mut Frame, area: Rect) {
     let hints: &[widgets::KeyHint] = match app.wizard_step {
         WizardStep::Ranges => {
             if app.custom_input_mode {
-                &[("type", "CIDR"), ("↵", "confirm"), ("Esc", "cancel")]
+                &[
+                    ("type", "CIDR"),
+                    (widgets::enter_key(), "confirm"),
+                    ("Esc", "cancel"),
+                ]
             } else {
                 &[
                     ("Tab", "focus"),
                     ("Space", "toggle"),
-                    ("↵", "next"),
+                    (widgets::enter_key(), "next"),
                     ("/", "commands"),
                     ("?", "help"),
                 ]
@@ -1458,14 +1524,15 @@ fn render_hint(app: &App, frame: &mut Frame, area: Rect) {
                     ("type", "value"),
                     ("←/→", "move"),
                     ("↑/↓", "step"),
-                    ("↵", "confirm"),
+                    (widgets::enter_key(), "confirm"),
                     ("Esc", "cancel"),
                 ]
             } else {
                 &[
                     ("Tab", "focus"),
-                    ("↵", "edit/next"),
+                    (widgets::enter_key(), "edit/next"),
                     ("↑/↓", "move"),
+                    ("x", "advanced"),
                     ("/", "commands"),
                     ("?", "help"),
                 ]
@@ -1473,7 +1540,7 @@ fn render_hint(app: &App, frame: &mut Frame, area: Rect) {
         }
         WizardStep::Review => &[
             ("Tab", "focus"),
-            ("↵", "start"),
+            (widgets::enter_key(), "start"),
             ("s", "new sample"),
             ("c", "save targets"),
             ("Esc", "back"),
@@ -1693,23 +1760,24 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
     }
 
     match code {
+        KeyCode::Char('x') => {
+            app.show_advanced_settings = !app.show_advanced_settings;
+            if !app.show_advanced_settings && SettingField::ALL[app.cursor].is_advanced() {
+                app.cursor = 0;
+            }
+            app.settings_scroll = 0;
+        }
         KeyCode::Char('k') if app.cursor > 0 => {
-            app.cursor -= 1;
+            app.cursor = previous_visible_setting(app.cursor, app.show_advanced_settings);
         }
         KeyCode::Char('j') => {
-            let last = SettingField::ALL.len().saturating_sub(1);
-            if app.cursor < last {
-                app.cursor += 1;
-            }
+            app.cursor = next_visible_setting(app.cursor, app.show_advanced_settings);
         }
         KeyCode::Up if app.cursor > 0 => {
-            app.cursor -= 1;
+            app.cursor = previous_visible_setting(app.cursor, app.show_advanced_settings);
         }
         KeyCode::Down => {
-            let last = SettingField::ALL.len().saturating_sub(1);
-            if app.cursor < last {
-                app.cursor += 1;
-            }
+            app.cursor = next_visible_setting(app.cursor, app.show_advanced_settings);
         }
         KeyCode::Right if (app.wizard_step as usize) < 2 => {
             app.wizard_step = WizardStep::Review;
@@ -1910,6 +1978,19 @@ fn settings_display_row(field_idx: usize) -> usize {
     row.saturating_sub(1)
 }
 
+fn previous_visible_setting(index: usize, show_advanced: bool) -> usize {
+    (0..index)
+        .rev()
+        .find(|candidate| show_advanced || !SettingField::ALL[*candidate].is_advanced())
+        .unwrap_or(index)
+}
+
+fn next_visible_setting(index: usize, show_advanced: bool) -> usize {
+    ((index + 1)..SettingField::ALL.len())
+        .find(|candidate| show_advanced || !SettingField::ALL[*candidate].is_advanced())
+        .unwrap_or(index)
+}
+
 fn previous_char_boundary(s: &str, index: usize) -> usize {
     s[..index]
         .char_indices()
@@ -1942,6 +2023,22 @@ mod tests {
             false,
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    #[test]
+    fn advanced_settings_are_collapsed_but_navigation_stays_on_visible_fields() {
+        let mut app = settings_app();
+        app.cursor = 14; // last regular latency field
+        handle_settings_key(&mut app, crossterm::event::KeyCode::Down);
+        assert_eq!(app.cursor, 28); // collapsed advanced group is skipped
+
+        handle_settings_key(&mut app, crossterm::event::KeyCode::Char('x'));
+        app.cursor = 15;
+        handle_settings_key(&mut app, crossterm::event::KeyCode::Down);
+        assert_eq!(app.cursor, 16);
+
+        handle_settings_key(&mut app, crossterm::event::KeyCode::Char('x'));
+        assert_eq!(app.cursor, 0);
     }
 
     #[test]

@@ -221,15 +221,23 @@ pub fn panel_title_style() -> Style {
 
 /// Full-width background fill for the selected/active row in a list or table.
 pub fn row_selected_style() -> Style {
-    Style::default()
+    let mut style = Style::default()
         .bg(palette().sel_bg)
         .fg(palette().title)
-        .add_modifier(Modifier::BOLD)
+        .add_modifier(Modifier::BOLD);
+    if no_color() {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    style
 }
 
 /// Subtle alternating (zebra) row fill for even rows in dense tables.
 pub fn row_alt_style() -> Style {
     Style::default().bg(palette().row_alt)
+}
+
+pub fn no_color() -> bool {
+    std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
 }
 
 /// Color a latency value (in milliseconds) so good/ok/bad are visually distinct.
