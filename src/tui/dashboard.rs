@@ -1,5 +1,5 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Flex, Layout, Rect},
     style::Style,
     symbols::Marker,
     text::{Line, Span},
@@ -190,27 +190,20 @@ fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
         .collect::<Vec<_>>();
     let block = widgets::panel_block("Results — Enter details", app.focus_index == 0);
     let inner = block.inner(area);
+    let column_rects = Layout::horizontal(widths.clone())
+        .flex(Flex::Start)
+        .spacing(1)
+        .split(inner);
     app.table_header = Some(Rect::new(inner.x, inner.y, inner.width, 1));
     app.table_col_indices = compact_columns
         .iter()
         .filter_map(|(source, _, _)| *source)
         .collect();
     app.table_col_bounds.clear();
-    let mut bound_x = inner.x;
-    for (index, (_, _, constraint)) in compact_columns.iter().enumerate() {
-        let width = match constraint {
-            Constraint::Length(width) => *width,
-            Constraint::Min(width) => inner.width.saturating_sub(bound_x - inner.x).max(*width),
-            _ => inner.width.saturating_sub(bound_x - inner.x),
-        };
-        let end = if index + 1 == compact_columns.len() {
-            inner.right()
-        } else {
-            bound_x.saturating_add(width.min(inner.right().saturating_sub(bound_x)))
-        };
-        app.table_col_bounds.push((bound_x, end));
-        bound_x = end;
-    }
+    app.table_col_bounds = column_rects
+        .iter()
+        .map(|rect| (rect.x, rect.right()))
+        .collect();
     app.table_inner = Some(inner);
     let visible = inner.height.saturating_sub(1) as usize;
     let display_len = app.sorted_results().len().min(app.config.top);
@@ -234,13 +227,14 @@ fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
                 (Some(0), _) => Cell::from((index + 1).to_string()),
                 (Some(1), _) => Cell::from(r.ip.clone()),
                 (Some(8), _) => Cell::from(fmt_ms(r.p95)),
-                (None, _) => Cell::from(format!("{} {status}", status_marker(status))).style(
-                    if r.fail == 0 {
-                        theme::good_style()
-                    } else {
-                        theme::warn_style()
-                    },
-                ),
+                (None, _) => {
+                    let marker = status_marker(status);
+                    Cell::from(format!("{marker} {status}")).style(match marker {
+                        "OK" => theme::good_style(),
+                        "WARN" => theme::warn_style(),
+                        _ => theme::bad_style(),
+                    })
+                }
                 _ => Cell::from("—"),
             })
             .collect::<Vec<_>>();
@@ -748,6 +742,19 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
     };
 
     // Calculate rates and ETA
+    let terminal_label = match app.scan_lifecycle {
+        ScanLifecycle::Completed => Some("Finished"),
+        ScanLifecycle::Failed => Some("Failed"),
+        ScanLifecycle::Cancelled => Some("Cancelled"),
+        ScanLifecycle::Cancelling => Some("Cancelling"),
+        ScanLifecycle::Running | ScanLifecycle::Paused => None,
+    };
+    let terminal_style = match app.scan_lifecycle {
+        ScanLifecycle::Completed => theme::good_style(),
+        ScanLifecycle::Failed => theme::bad_style(),
+        ScanLifecycle::Cancelled | ScanLifecycle::Cancelling => theme::warn_style(),
+        ScanLifecycle::Running | ScanLifecycle::Paused => theme::status_style("SCANNING"),
+    };
     let mut rate_str = "~0.0/s".to_string();
     let mut eta_str = "00:00".to_string();
     if !app.scan_complete && total > 0 && passed > 0 {
@@ -757,8 +764,8 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
         let eta = (remaining as f64 / rate.max(0.001)).max(0.0);
         rate_str = format!("{:.1}/s", rate);
         eta_str = format!("{:02}:{:02}", eta as u64 / 60, eta as u64 % 60);
-    } else if app.scan_complete {
-        rate_str = "Finished".to_string();
+    } else if let Some(label) = terminal_label {
+        rate_str = label.to_string();
         eta_str = "--:--".to_string();
     }
 
@@ -795,11 +802,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
         0.0
     };
     let gauge = LineGauge::default()
-        .filled_style(if app.scan_complete {
-            theme::good_style()
-        } else {
-            theme::status_style("SCANNING")
-        })
+        .filled_style(terminal_style)
         .unfilled_style(theme::hint_style())
         .label(Span::styled(
             format!("{passed}/{total} ({pct}%)"),

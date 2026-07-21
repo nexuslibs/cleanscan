@@ -403,6 +403,14 @@ pub(crate) fn modal_overlay(
 }
 
 impl App {
+    fn resolve_terminal_lifecycle(&self, outcome: ScanLifecycle) -> ScanLifecycle {
+        if self.scan_lifecycle == ScanLifecycle::Cancelling {
+            ScanLifecycle::Cancelled
+        } else {
+            outcome
+        }
+    }
+
     /// Elapsed time since the previous frame, used to advance overlay animations.
     /// Called once per `render` so every modal ticks by the same delta.
     fn anim_elapsed(&mut self) -> Duration {
@@ -1628,31 +1636,19 @@ pub fn run_tui(
                                 state.targets = actual_targets;
                             }
                             app.scan_complete = true;
-                            app.scan_lifecycle = if app.scan_lifecycle == ScanLifecycle::Cancelling
-                            {
-                                ScanLifecycle::Cancelled
-                            } else {
-                                ScanLifecycle::Completed
-                            };
+                            app.scan_lifecycle =
+                                app.resolve_terminal_lifecycle(ScanLifecycle::Completed);
                         }
                         Ok(Err(e)) => {
                             app.scan_complete = true;
-                            app.scan_lifecycle = if app.scan_lifecycle == ScanLifecycle::Cancelling
-                            {
-                                ScanLifecycle::Cancelled
-                            } else {
-                                ScanLifecycle::Failed
-                            };
+                            app.scan_lifecycle =
+                                app.resolve_terminal_lifecycle(ScanLifecycle::Failed);
                             app.toast_error(format!("Scan failed: {e}"));
                         }
                         Err(_) => {
                             app.scan_complete = true;
-                            app.scan_lifecycle = if app.scan_lifecycle == ScanLifecycle::Cancelling
-                            {
-                                ScanLifecycle::Cancelled
-                            } else {
-                                ScanLifecycle::Failed
-                            };
+                            app.scan_lifecycle =
+                                app.resolve_terminal_lifecycle(ScanLifecycle::Failed);
                             app.toast_error("Scan worker panicked");
                         }
                     }
@@ -1787,19 +1783,23 @@ pub fn run_tui(
                         }
                         app.last_watch_healthy = Some(healthy);
                     }
-                    if app.watch_interval.is_none() {
+                    if app.watch_interval.is_none()
+                        && app.scan_lifecycle != ScanLifecycle::Cancelled
+                    {
                         if let Some(path) = &app.manifest_path {
                             queue_manifest_write(path, build_current_manifest(&app), &manifest_tx);
                         }
                     }
-                    if let Some(interval) = app.watch_interval {
-                        if !app.last_targets.is_empty() {
-                            app.watch_due = Some(Instant::now() + interval);
-                            app.toast_info(format!(
-                                "Watch cycle {} complete; next scan in {}s",
-                                app.watch_cycle,
-                                interval.as_secs()
-                            ));
+                    if app.scan_lifecycle != ScanLifecycle::Cancelled {
+                        if let Some(interval) = app.watch_interval {
+                            if !app.last_targets.is_empty() {
+                                app.watch_due = Some(Instant::now() + interval);
+                                app.toast_info(format!(
+                                    "Watch cycle {} complete; next scan in {}s",
+                                    app.watch_cycle,
+                                    interval.as_secs()
+                                ));
+                            }
                         }
                     }
                 }
@@ -1823,50 +1823,38 @@ pub fn run_tui(
                     match handle.join() {
                         Ok(Ok(())) => {
                             app.speed_complete = true;
-                            let cancelled = app.scan_lifecycle == ScanLifecycle::Cancelling;
-                            app.scan_lifecycle = if cancelled {
-                                ScanLifecycle::Cancelled
-                            } else {
-                                ScanLifecycle::Completed
-                            };
+                            app.scan_lifecycle =
+                                app.resolve_terminal_lifecycle(ScanLifecycle::Completed);
                             app.speed_result_cursor = 0;
                             app.scroll = 0;
                             app.focus_index = 0;
                             app.focus_target = FocusTarget::Table;
                             app.screen = Screen::SpeedResults;
-                            if cancelled {
+                            if app.scan_lifecycle == ScanLifecycle::Cancelled {
                                 app.should_quit = true;
                             }
                         }
                         Ok(Err(e)) => {
                             app.speed_complete = true;
-                            let cancelled = app.scan_lifecycle == ScanLifecycle::Cancelling;
-                            app.scan_lifecycle = if cancelled {
-                                ScanLifecycle::Cancelled
-                            } else {
-                                ScanLifecycle::Failed
-                            };
+                            app.scan_lifecycle =
+                                app.resolve_terminal_lifecycle(ScanLifecycle::Failed);
                             app.toast_error(format!("Speed test failed: {e}"));
                             app.focus_index = 0;
                             app.focus_target = FocusTarget::Table;
                             app.screen = Screen::SpeedResults;
-                            if cancelled {
+                            if app.scan_lifecycle == ScanLifecycle::Cancelled {
                                 app.should_quit = true;
                             }
                         }
                         Err(_) => {
                             app.speed_complete = true;
-                            let cancelled = app.scan_lifecycle == ScanLifecycle::Cancelling;
-                            app.scan_lifecycle = if cancelled {
-                                ScanLifecycle::Cancelled
-                            } else {
-                                ScanLifecycle::Failed
-                            };
+                            app.scan_lifecycle =
+                                app.resolve_terminal_lifecycle(ScanLifecycle::Failed);
                             app.toast_error("Speed test worker panicked");
                             app.focus_index = 0;
                             app.focus_target = FocusTarget::Table;
                             app.screen = Screen::SpeedResults;
-                            if cancelled {
+                            if app.scan_lifecycle == ScanLifecycle::Cancelled {
                                 app.should_quit = true;
                             }
                         }
