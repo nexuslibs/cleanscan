@@ -13,7 +13,7 @@ use ratatui::{
 
 use crate::scanner::{result_confidence, result_status, ProbeResult};
 use crate::tui::theme;
-use crate::tui::{modal_overlay, widgets, App, ButtonAction, ButtonKind};
+use crate::tui::{modal_overlay, widgets, App, ButtonAction, ButtonKind, ScanLifecycle};
 use std::time::Duration;
 
 pub const RESULT_COLUMNS: [&str; 14] = [
@@ -168,13 +168,9 @@ fn render_compact_stats(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
-    const COMPACT_COLUMNS: [(Option<usize>, &str, Constraint); 8] = [
+    const COMPACT_COLUMNS: [(Option<usize>, &str, Constraint); 4] = [
         (Some(0), "#", Constraint::Length(5)),
         (Some(1), "IP", Constraint::Min(15)),
-        (Some(10), "Colo", Constraint::Length(7)),
-        (Some(11), "Country", Constraint::Length(14)),
-        (None, "Reliability", Constraint::Length(12)),
-        (Some(5), "Avg", Constraint::Length(12)),
         (Some(8), "P95", Constraint::Length(12)),
         (None, "Status", Constraint::Length(10)),
     ];
@@ -194,6 +190,27 @@ fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
         .collect::<Vec<_>>();
     let block = widgets::panel_block("Results — Enter details", app.focus_index == 0);
     let inner = block.inner(area);
+    app.table_header = Some(Rect::new(inner.x, inner.y, inner.width, 1));
+    app.table_col_indices = compact_columns
+        .iter()
+        .filter_map(|(source, _, _)| *source)
+        .collect();
+    app.table_col_bounds.clear();
+    let mut bound_x = inner.x;
+    for (index, (_, _, constraint)) in compact_columns.iter().enumerate() {
+        let width = match constraint {
+            Constraint::Length(width) => *width,
+            Constraint::Min(width) => inner.width.saturating_sub(bound_x - inner.x).max(*width),
+            _ => inner.width.saturating_sub(bound_x - inner.x),
+        };
+        let end = if index + 1 == compact_columns.len() {
+            inner.right()
+        } else {
+            bound_x.saturating_add(width.min(inner.right().saturating_sub(bound_x)))
+        };
+        app.table_col_bounds.push((bound_x, end));
+        bound_x = end;
+    }
     app.table_inner = Some(inner);
     let visible = inner.height.saturating_sub(1) as usize;
     let display_len = app.sorted_results().len().min(app.config.top);
@@ -210,23 +227,20 @@ fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
     let rows = page.enumerate().map(|(i, r)| {
         let index = app.scroll + i;
         let selected = index == app.result_cursor;
-        let reliability = format!("{}/{}", r.ok, r.completed);
         let status = result_status(r);
         let cells = compact_columns
             .iter()
             .map(|(source, label, _)| match (source, *label) {
                 (Some(0), _) => Cell::from((index + 1).to_string()),
                 (Some(1), _) => Cell::from(r.ip.clone()),
-                (Some(5), _) => Cell::from(fmt_ms(r.avg)),
                 (Some(8), _) => Cell::from(fmt_ms(r.p95)),
-                (Some(10), _) => Cell::from(r.colo.clone().unwrap_or_else(|| "—".to_string())),
-                (Some(11), _) => Cell::from(r.country.clone().unwrap_or_else(|| "—".to_string())),
-                (None, "Reliability") => Cell::from(reliability.clone()),
-                (None, _) => Cell::from(status).style(if r.fail == 0 {
-                    theme::good_style()
-                } else {
-                    theme::warn_style()
-                }),
+                (None, _) => Cell::from(format!("{} {status}", status_marker(status))).style(
+                    if r.fail == 0 {
+                        theme::good_style()
+                    } else {
+                        theme::warn_style()
+                    },
+                ),
                 _ => Cell::from("—"),
             })
             .collect::<Vec<_>>();
@@ -673,14 +687,14 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
         elapsed.as_secs() % 60
     );
 
-    let status = if app.scan_complete && app.watch_due.is_some() {
-        "WATCH"
-    } else if app.scan_complete {
-        "DONE"
-    } else if app.paused.load(std::sync::atomic::Ordering::Relaxed) {
-        "PAUSED"
-    } else {
-        "SCANNING"
+    let status = match app.scan_lifecycle {
+        ScanLifecycle::Completed if app.watch_due.is_some() => "WATCH",
+        ScanLifecycle::Completed => "DONE",
+        ScanLifecycle::Paused => "PAUSED",
+        ScanLifecycle::Cancelling => "CANCELLING",
+        ScanLifecycle::Failed => "FAILED",
+        ScanLifecycle::Cancelled => "CANCELLED",
+        ScanLifecycle::Running => "SCANNING",
     };
 
     // A spinner reinforces the "live" state while scanning.
@@ -712,7 +726,7 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
-    if app.scan_complete {
+    if app.scan_complete && app.scan_lifecycle == ScanLifecycle::Completed {
         render_decision_panel(app, frame, area);
         return;
     }
@@ -796,9 +810,11 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Success  : ", theme::title_style()),
+            Span::styled("Targets completed: ", theme::title_style()),
             Span::raw(format!(
-                "{:.1}% ({} ok, {} fail)",
+                "{}/{} ({:.1}% probe success; {} ok, {} fail)",
+                passed,
+                total,
                 success_rate,
                 total_probes_ok,
                 total_probes_done - total_probes_ok
@@ -808,8 +824,8 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Speed/ETA: ", theme::title_style()),
-            Span::raw(format!("{} • ETA {}", rate_str, eta_str)),
+            Span::styled("Probe rate / ETA: ", theme::title_style()),
+            Span::raw(format!("{} • approx. ETA {}", rate_str, eta_str)),
         ])),
         p1_rows[2],
     );
@@ -1220,6 +1236,14 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
 
 fn fmt_ms(sec: f64) -> String {
     format!("{:.1}ms", sec * 1000.0)
+}
+
+fn status_marker(status: &str) -> &'static str {
+    match status {
+        "READY" | "HEALTHY" => "OK",
+        "DEGRADED" | "SLOW" => "WARN",
+        _ => "FAIL",
+    }
 }
 
 fn median(mut values: Vec<f64>) -> f64 {

@@ -196,6 +196,8 @@ pub fn status_style(code: &str) -> Style {
     match code {
         "DONE" => good_style().add_modifier(Modifier::BOLD),
         "PAUSED" => warn_style().add_modifier(Modifier::BOLD),
+        "CANCELLING" | "CANCELLED" => warn_style().add_modifier(Modifier::BOLD),
+        "FAILED" => bad_style().add_modifier(Modifier::BOLD),
         _ => Style::default()
             .fg(palette().info)
             .add_modifier(Modifier::BOLD),

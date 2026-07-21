@@ -44,6 +44,22 @@ pub enum Screen {
     SpeedResults,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanLifecycle {
+    Running,
+    Paused,
+    Cancelling,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingScanAction {
+    RepeatTargets,
+    NewSample,
+}
+
 /// Step within the guided wizard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WizardStep {
@@ -245,8 +261,10 @@ pub struct App {
     pub last_targets: Vec<String>,
     pub scan_seed: u64,
     pub scan_complete: bool,
+    pub scan_lifecycle: ScanLifecycle,
     pub should_quit: bool,
     pub paused: Arc<AtomicBool>,
+    pub cancel: Option<Arc<AtomicBool>>,
     pub message: Option<String>,
     pub message_kind: ToastKind,
     pub message_time: Option<Instant>,
@@ -315,6 +333,7 @@ pub struct App {
     pub speed_start_time: Instant,
     pub pending_speed_start: bool,
     pub confirm_speed_start: bool,
+    confirm_scan_action: Option<PendingScanAction>,
     /// Active semantic focus target and its position in the current screen's
     /// focus map. Focus is intentionally independent from list cursors.
     pub focus_target: FocusTarget,
@@ -355,6 +374,7 @@ pub struct App {
     pub command_palette_overlay: OverlayState,
     pub column_picker_overlay: OverlayState,
     pub result_details_overlay: OverlayState,
+    pub scan_action_overlay: OverlayState,
     /// Last frame timestamp used to derive per-frame animation deltas.
     anim_clock: Option<Instant>,
     explicit_target_source: Option<(Vec<String>, Option<String>)>,
@@ -405,7 +425,7 @@ impl App {
                 WizardStep::Review => 3,
             },
             Screen::Scanning => {
-                if self.scan_complete {
+                if self.scan_complete && self.scan_lifecycle != ScanLifecycle::Cancelling {
                     5
                 } else {
                     3
@@ -474,22 +494,26 @@ impl App {
                     || (action == Action::Start && self.wizard_step == WizardStep::Review)
                     || matches!(action, Action::Quit | Action::OpenHelp)
             }
-            Screen::Scanning if self.scan_complete => matches!(
-                action,
-                Action::Quit
-                    | Action::Export
-                    | Action::SpeedTest
-                    | Action::CopyIp
-                    | Action::OpenDetails
-                    | Action::OpenHelp
-                    | Action::OpenCommandPalette
-                    | Action::ConfigureColumns
-                    | Action::ToggleFailures
-                    | Action::RepeatTargets
-                    | Action::NewSample
-                    | Action::ExportComparison
-                    | Action::CustomizeScan
-            ),
+            Screen::Scanning
+                if self.scan_complete && self.scan_lifecycle != ScanLifecycle::Cancelling =>
+            {
+                matches!(
+                    action,
+                    Action::Quit
+                        | Action::Export
+                        | Action::SpeedTest
+                        | Action::CopyIp
+                        | Action::OpenDetails
+                        | Action::OpenHelp
+                        | Action::OpenCommandPalette
+                        | Action::ConfigureColumns
+                        | Action::ToggleFailures
+                        | Action::RepeatTargets
+                        | Action::NewSample
+                        | Action::ExportComparison
+                        | Action::CustomizeScan
+                )
+            }
             Screen::Scanning => matches!(
                 action,
                 Action::Quit
@@ -498,6 +522,7 @@ impl App {
                     | Action::OpenDetails
                     | Action::OpenHelp
                     | Action::OpenCommandPalette
+                    | Action::ToggleFailures
             ),
             Screen::SpeedSelect => matches!(
                 action,
@@ -593,8 +618,10 @@ impl App {
             last_targets: Vec::new(),
             scan_seed,
             scan_complete: false,
+            scan_lifecycle: ScanLifecycle::Running,
             should_quit: false,
             paused,
+            cancel: None,
             message: None,
             message_kind: ToastKind::Info,
             message_time: None,
@@ -647,6 +674,7 @@ impl App {
             speed_start_time: Instant::now(),
             pending_speed_start: false,
             confirm_speed_start: false,
+            confirm_scan_action: None,
             focus_target: FocusTarget::List,
             focus_index: 0,
             show_command_palette: false,
@@ -681,6 +709,7 @@ impl App {
             command_palette_overlay: modal_state(),
             column_picker_overlay: modal_state(),
             result_details_overlay: modal_state(),
+            scan_action_overlay: modal_state(),
             anim_clock: None,
             explicit_target_source: None,
         }
@@ -754,6 +783,7 @@ impl App {
         self.detail_tab = 0;
         self.total_targets = total;
         self.scan_complete = false;
+        self.scan_lifecycle = ScanLifecycle::Running;
         self.results.clear();
         self.scroll = 0;
         self.result_cursor = 0;
@@ -766,6 +796,23 @@ impl App {
         self.throughput.clear();
         self.last_tp_instant = Instant::now();
         self.last_tp_count = 0;
+    }
+
+    pub fn set_cancel_token(&mut self, cancel: Arc<AtomicBool>) {
+        self.cancel = Some(cancel);
+    }
+
+    fn request_cancel(&mut self) {
+        if matches!(
+            self.scan_lifecycle,
+            ScanLifecycle::Running | ScanLifecycle::Paused
+        ) {
+            if let Some(cancel) = &self.cancel {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            self.scan_lifecycle = ScanLifecycle::Cancelling;
+            self.toast_info("Cancelling… waiting for active work to stop");
+        }
     }
 
     pub fn set_scan_targets(&mut self, targets: Vec<String>) {
@@ -934,7 +981,11 @@ impl App {
     /// Whether the current toast should still be visible (auto-fade after 4s).
     pub fn visible_message(&self) -> Option<(&str, ToastKind)> {
         match (self.message.as_deref(), self.message_time) {
-            (Some(m), Some(t)) if t.elapsed() < Duration::from_secs(4) => {
+            (Some(m), Some(t))
+                if (self.message_kind == ToastKind::Warn
+                    || self.message_kind == ToastKind::Error
+                    || t.elapsed() < Duration::from_secs(4)) =>
+            {
                 Some((m, self.message_kind))
             }
             (Some(m), None) => Some((m, self.message_kind)),
@@ -945,7 +996,10 @@ impl App {
     /// Clear stale toast.
     pub fn tick_message(&mut self) {
         if let (Some(_), Some(t)) = (self.message.as_deref(), self.message_time) {
-            if t.elapsed() >= Duration::from_secs(4) {
+            if self.message_kind != ToastKind::Warn
+                && self.message_kind != ToastKind::Error
+                && t.elapsed() >= Duration::from_secs(4)
+            {
                 self.message = None;
                 self.message_time = None;
             }
@@ -1352,6 +1406,7 @@ pub fn run_tui(
     let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
     let _guard = RestoreGuard;
     let mut app = App::new((*config_arc).clone(), has_cli_targets, paused.clone());
+    app.set_cancel_token(cancel.clone());
     app.watch_interval = watch_interval.map(|seconds| Duration::from_secs(seconds.max(1)));
     app.manifest_path = manifest_path;
     app.manifest_thresholds = crate::HealthThresholds {
@@ -1573,17 +1628,41 @@ pub fn run_tui(
                                 state.targets = actual_targets;
                             }
                             app.scan_complete = true;
+                            app.scan_lifecycle = if app.scan_lifecycle == ScanLifecycle::Cancelling
+                            {
+                                ScanLifecycle::Cancelled
+                            } else {
+                                ScanLifecycle::Completed
+                            };
                         }
                         Ok(Err(e)) => {
                             app.scan_complete = true;
+                            app.scan_lifecycle = if app.scan_lifecycle == ScanLifecycle::Cancelling
+                            {
+                                ScanLifecycle::Cancelled
+                            } else {
+                                ScanLifecycle::Failed
+                            };
                             app.toast_error(format!("Scan failed: {e}"));
                         }
                         Err(_) => {
                             app.scan_complete = true;
+                            app.scan_lifecycle = if app.scan_lifecycle == ScanLifecycle::Cancelling
+                            {
+                                ScanLifecycle::Cancelled
+                            } else {
+                                ScanLifecycle::Failed
+                            };
                             app.toast_error("Scan worker panicked");
                         }
                     }
-                    if app.watch_interval.is_some() && app.scan_complete {
+                    if app.scan_lifecycle == ScanLifecycle::Cancelled {
+                        app.should_quit = true;
+                    }
+                    if app.watch_interval.is_some()
+                        && app.scan_complete
+                        && app.scan_lifecycle != ScanLifecycle::Cancelled
+                    {
                         if !app.last_targets.is_empty() {
                             app.watch_cycle = app.watch_cycle.saturating_add(1);
                         }
@@ -1744,25 +1823,52 @@ pub fn run_tui(
                     match handle.join() {
                         Ok(Ok(())) => {
                             app.speed_complete = true;
+                            let cancelled = app.scan_lifecycle == ScanLifecycle::Cancelling;
+                            app.scan_lifecycle = if cancelled {
+                                ScanLifecycle::Cancelled
+                            } else {
+                                ScanLifecycle::Completed
+                            };
                             app.speed_result_cursor = 0;
                             app.scroll = 0;
                             app.focus_index = 0;
                             app.focus_target = FocusTarget::Table;
                             app.screen = Screen::SpeedResults;
+                            if cancelled {
+                                app.should_quit = true;
+                            }
                         }
                         Ok(Err(e)) => {
                             app.speed_complete = true;
+                            let cancelled = app.scan_lifecycle == ScanLifecycle::Cancelling;
+                            app.scan_lifecycle = if cancelled {
+                                ScanLifecycle::Cancelled
+                            } else {
+                                ScanLifecycle::Failed
+                            };
                             app.toast_error(format!("Speed test failed: {e}"));
                             app.focus_index = 0;
                             app.focus_target = FocusTarget::Table;
                             app.screen = Screen::SpeedResults;
+                            if cancelled {
+                                app.should_quit = true;
+                            }
                         }
                         Err(_) => {
                             app.speed_complete = true;
+                            let cancelled = app.scan_lifecycle == ScanLifecycle::Cancelling;
+                            app.scan_lifecycle = if cancelled {
+                                ScanLifecycle::Cancelled
+                            } else {
+                                ScanLifecycle::Failed
+                            };
                             app.toast_error("Speed test worker panicked");
                             app.focus_index = 0;
                             app.focus_target = FocusTarget::Table;
                             app.screen = Screen::SpeedResults;
+                            if cancelled {
+                                app.should_quit = true;
+                            }
                         }
                     }
                 }
@@ -1831,6 +1937,7 @@ pub fn run_tui(
                     .collect();
                 app.speed_results.clear();
                 app.speed_complete = false;
+                app.scan_lifecycle = ScanLifecycle::Running;
                 app.speed_start_time = Instant::now();
                 app.screen = Screen::SpeedTesting;
                 speed_runner = Some(spawn_speed(
@@ -1858,6 +1965,9 @@ pub fn run_tui(
 impl App {
     /// Top-level key dispatch.
     fn handle_key(&mut self, code: KeyCode, _mods: KeyModifiers) {
+        if self.scan_lifecycle == ScanLifecycle::Cancelling {
+            return;
+        }
         if self.screen == Screen::Wizard && (self.edit_field.is_some() || self.custom_input_mode) {
             wizard::handle_wizard_key(self, code);
             return;
@@ -1866,8 +1976,29 @@ impl App {
         // The quit-confirm modal captures all input until dismissed.
         if self.confirm_quit {
             match code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.should_quit = true,
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.confirm_quit = false;
+                    self.request_cancel();
+                }
                 _ => self.confirm_quit = false,
+            }
+            return;
+        }
+
+        if self.confirm_scan_action.is_some() {
+            match code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let action = self.confirm_scan_action.take();
+                    match action {
+                        Some(PendingScanAction::RepeatTargets) => self.repeat_targets_now(),
+                        Some(PendingScanAction::NewSample) => self.generate_new_sample_now(),
+                        None => {}
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.confirm_scan_action = None;
+                }
+                _ => {}
             }
             return;
         }
@@ -1945,6 +2076,8 @@ impl App {
                     if let Some(action) = self.selected_action() {
                         self.close_command_palette();
                         self.activate_action(action);
+                    } else {
+                        self.toast_warn("No matching command");
                     }
                 }
                 KeyCode::Backspace => {
@@ -2015,6 +2148,8 @@ impl App {
             KeyCode::Char('q') | KeyCode::Char('Q') => {
                 if self.screen == Screen::Scanning && !self.scan_complete {
                     self.confirm_quit = true;
+                } else if self.screen == Screen::SpeedTesting {
+                    self.request_cancel();
                 } else if self.screen == Screen::Wizard && self.return_to_results {
                     self.return_to_results();
                 } else {
@@ -2081,7 +2216,11 @@ impl App {
             Action::PauseResume => self.activate_button(ButtonAction::PauseResume),
             Action::SpeedTest => self.activate_button(ButtonAction::SpeedTest),
             Action::CopyIp => self.copy_selected_ip(),
-            Action::OpenDetails => self.show_result_details = true,
+            Action::OpenDetails => {
+                if self.scan_lifecycle != ScanLifecycle::Cancelling {
+                    self.show_result_details = true;
+                }
+            }
             Action::CloseDetails => self.show_result_details = false,
             Action::OpenHelp => self.show_help = true,
             Action::OpenCommandPalette => self.open_command_palette(),
@@ -2095,11 +2234,13 @@ impl App {
             }
             Action::Confirm => {
                 if self.confirm_quit {
-                    self.should_quit = true;
+                    self.confirm_quit = false;
+                    self.request_cancel();
                 }
             }
             Action::Cancel => {
                 self.confirm_quit = false;
+                self.confirm_scan_action = None;
                 self.show_result_details = false;
             }
             Action::SelectAll => self.activate_button(ButtonAction::SpeedAll),
@@ -2163,9 +2304,41 @@ impl App {
         // play its open/close animation; each overlay is a no-op while closed.
         help::overlay(self, frame, frame.area(), elapsed);
         self.render_quit_confirm(frame, frame.area(), elapsed);
+        self.render_scan_action_confirm(frame, frame.area(), elapsed);
         self.render_speed_confirm(frame, frame.area(), elapsed);
         self.render_command_palette(frame, frame.area(), elapsed);
         self.render_column_picker(frame, frame.area(), elapsed);
+    }
+
+    fn render_scan_action_confirm(&mut self, frame: &mut Frame, area: Rect, elapsed: Duration) {
+        let overlay = modal_overlay(" Confirm scan action ", 54, 30);
+        if self.confirm_scan_action.is_some() {
+            self.scan_action_overlay.open();
+        } else {
+            self.scan_action_overlay.close();
+        }
+        self.scan_action_overlay.tick(elapsed);
+        frame.render_stateful_widget(overlay, area, &mut self.scan_action_overlay);
+        let Some(inner) = self.scan_action_overlay.inner_area() else {
+            return;
+        };
+        let message = match self.confirm_scan_action {
+            Some(PendingScanAction::RepeatTargets) => {
+                "Repeat the identical target set? Current results will be replaced."
+            }
+            Some(PendingScanAction::NewSample) => {
+                "Generate a new sample? Current results will be replaced."
+            }
+            None => return,
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(message),
+                Line::from("Enter / y to continue • Esc / n to cancel"),
+            ])
+            .alignment(ratatui::layout::Alignment::Center),
+            inner,
+        );
     }
 
     fn render_column_picker(&mut self, frame: &mut Frame, area: Rect, elapsed: Duration) {
@@ -2272,6 +2445,21 @@ impl App {
             Paragraph::new(format!(" /{}", self.command_query)).style(theme::title_style()),
             chunks[0],
         );
+        if actions.is_empty() {
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from("No matching commands"),
+                    Line::from("Try: country:germany  or  colo:FRA"),
+                ])
+                .style(theme::hint_style()),
+                chunks[1],
+            );
+            frame.render_widget(
+                Paragraph::new("Type to search • Esc close").style(theme::hint_style()),
+                chunks[2],
+            );
+            return;
+        }
         self.command_list_state = self.command_list_state.with_offset(start).with_selected(
             actions
                 .get(self.command_cursor)
@@ -2467,6 +2655,10 @@ impl App {
     }
 
     fn repeat_targets(&mut self) {
+        self.confirm_scan_action = Some(PendingScanAction::RepeatTargets);
+    }
+
+    fn repeat_targets_now(&mut self) {
         if self.last_targets.is_empty() {
             self.toast_warn("No previous target manifest available");
         } else {
@@ -2477,6 +2669,10 @@ impl App {
     }
 
     fn generate_new_sample(&mut self) {
+        self.confirm_scan_action = Some(PendingScanAction::NewSample);
+    }
+
+    fn generate_new_sample_now(&mut self) {
         let generated = if self.explicit_target_source.is_some() {
             self.regenerate_explicit_preview()
         } else {
@@ -2741,6 +2937,9 @@ impl App {
 
     fn handle_mouse(&mut self, m: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
+        if self.scan_lifecycle == ScanLifecycle::Cancelling {
+            return;
+        }
         // Track the pointer so buttons can render a hover state.
         self.hover_pos = Some((m.column, m.row));
 
@@ -2768,6 +2967,7 @@ impl App {
         // controls rendered underneath them, including during their close
         // animation (when the visibility flag has already been cleared).
         if self.speed_confirm_overlay.inner_area().is_some()
+            || self.scan_action_overlay.inner_area().is_some()
             || self.command_palette_overlay.inner_area().is_some()
             || self.column_picker_overlay.inner_area().is_some()
             || self.result_details_overlay.inner_area().is_some()
@@ -2981,6 +3181,11 @@ impl App {
             ButtonAction::PauseResume => {
                 let next = !self.paused.load(Ordering::Relaxed);
                 self.paused.store(next, Ordering::Relaxed);
+                self.scan_lifecycle = if next {
+                    ScanLifecycle::Paused
+                } else {
+                    ScanLifecycle::Running
+                };
             }
             ButtonAction::SpeedTest => self.open_speed_selection(),
             ButtonAction::CustomizeScan => {
@@ -2988,7 +3193,10 @@ impl App {
                     self.enter_customization();
                 }
             }
-            ButtonAction::ConfirmQuit => self.should_quit = true,
+            ButtonAction::ConfirmQuit => {
+                self.confirm_quit = false;
+                self.request_cancel();
+            }
             ButtonAction::CancelQuit => self.confirm_quit = false,
             ButtonAction::SpeedAll => {
                 self.speed_selected = self
@@ -3036,7 +3244,7 @@ impl Drop for RestoreGuard {
 mod tests {
     use super::{
         build_current_manifest, export_tsv_line, ranked_export_results, Action, App, FocusTarget,
-        ProbeResult, Screen, WizardStep,
+        ProbeResult, ScanLifecycle, Screen, WizardStep,
     };
     use crate::config::AppConfig;
     use crate::watch::{WatchPolicy, WatchState};
@@ -3044,6 +3252,7 @@ mod tests {
     use ratatui::{backend::TestBackend, Terminal};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     fn result(ip: &str, fail: usize, p95: f64) -> ProbeResult {
         ProbeResult {
@@ -3293,6 +3502,71 @@ mod tests {
         app.show_help = false;
         app.confirm_quit = true;
         draw(&mut app, 120, 36);
+    }
+
+    #[test]
+    fn confirming_quit_requests_immediate_cancellation() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.set_cancel_token(cancel.clone());
+        app.begin_scan(10);
+        app.confirm_quit = true;
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.scan_lifecycle, ScanLifecycle::Cancelling);
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn cancelling_quit_dialog_keeps_scan_running() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(10);
+        app.confirm_quit = true;
+        app.handle_key(KeyCode::Char('n'), KeyModifiers::NONE);
+        assert_eq!(app.scan_lifecycle, ScanLifecycle::Running);
+        assert!(!app.confirm_quit);
+    }
+
+    #[test]
+    fn rerun_confirmation_is_reversible_and_preserves_results() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.screen = Screen::Scanning;
+        app.scan_complete = true;
+        app.scan_lifecycle = ScanLifecycle::Completed;
+        app.results.push(result("192.0.2.1", 0, 0.02));
+        app.handle_key(KeyCode::Char('r'), KeyModifiers::NONE);
+        assert!(app.confirm_scan_action.is_some());
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.confirm_scan_action.is_none());
+        assert_eq!(app.results.len(), 1);
+    }
+
+    #[test]
+    fn warning_and_error_toasts_do_not_expire_automatically() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.toast_error("export failed");
+        app.message_time = Some(Instant::now() - Duration::from_secs(5));
+        assert!(app.visible_message().is_some());
+        app.toast_warn("configuration warning");
+        app.message_time = Some(Instant::now() - Duration::from_secs(5));
+        app.tick_message();
+        assert!(app.visible_message().is_some());
     }
 
     #[test]

@@ -119,6 +119,7 @@ fn scanning_lines(app: &App) -> Vec<Line<'static>> {
         lines.push(key("w", "Customize scan parameters and ranges"));
     } else {
         lines.push(key("p", "Pause / resume the scan"));
+        lines.push(key("f", "Show failed targets while scanning"));
     }
 
     lines.extend([
