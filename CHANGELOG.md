@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.15.1](https://github.com/nexuslibs/cleanscan/compare/v0.15.0...v0.15.1) (2026-07-21)
+
+
+### Bug Fixes
+
+* improve TUI feedback and cancellation ([c70857b](https://github.com/nexuslibs/cleanscan/commit/c70857b00a211cba4ad4ff3394619da8081b4483))
+* improve TUI feedback and cancellation ([eaf492f](https://github.com/nexuslibs/cleanscan/commit/eaf492ff4eda0ff6a8852523a21afbfea811449e))
+
 ## [0.15.0](https://github.com/nexuslibs/cleanscan/compare/v0.14.0...v0.15.0) (2026-07-21)
 
 
