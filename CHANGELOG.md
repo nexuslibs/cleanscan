@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.16.0](https://github.com/nexuslibs/cleanscan/compare/v0.15.1...v0.16.0) (2026-07-21)
+
+
+### Features
+
+* enhance TUI with ASCII support and improved scrolling for help overlay ([b7105c3](https://github.com/nexuslibs/cleanscan/commit/b7105c3caca3b63ea145756876be5598f7cb2e2c))
+* refine TUI for Apple design principles ([0d51283](https://github.com/nexuslibs/cleanscan/commit/0d51283a3e06f1cc5183135aeb0061a029e8f06a))
+* **tui:** add ASCII support and improve help scrolling ([2a4cc52](https://github.com/nexuslibs/cleanscan/commit/2a4cc52c0077097574c89aa18c9f71977f401d8a))
+* **tui:** enhance help overlay scrolling and add ASCII support for markers ([b233035](https://github.com/nexuslibs/cleanscan/commit/b233035288f820ed73702468fca8c7449b289625))
+
 ## [0.15.1](https://github.com/nexuslibs/cleanscan/compare/v0.15.0...v0.15.1) (2026-07-21)
 
 
