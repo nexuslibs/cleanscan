@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::speed::SpeedDirection;
-use crate::tui::{theme, widgets, App, ButtonAction, ButtonKind, Screen};
+use crate::tui::{theme, widgets, App, ButtonAction, ButtonKind, ScanLifecycle, Screen};
 
 pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
     let chunks = Layout::default()
@@ -30,11 +30,15 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_header(app: &App, frame: &mut Frame, area: Rect) {
-    let title = match app.screen {
-        Screen::SpeedSelect => "SELECT SPEED TEST TARGETS",
-        Screen::SpeedTesting => "RUNNING SPEED TESTS",
-        Screen::SpeedResults => "SPEED TEST RESULTS",
-        _ => "SPEED TEST",
+    let title = if app.scan_lifecycle == ScanLifecycle::Cancelling {
+        "CANCELLING SPEED TESTS"
+    } else {
+        match app.screen {
+            Screen::SpeedSelect => "SELECT SPEED TEST TARGETS",
+            Screen::SpeedTesting => "RUNNING SPEED TESTS",
+            Screen::SpeedResults => "SPEED TEST RESULTS",
+            _ => "SPEED TEST",
+        }
     };
     widgets::app_header(
         frame,
