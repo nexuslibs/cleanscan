@@ -44,7 +44,12 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
         frame,
         area,
         Some((title, theme::highlight_style())),
-        &[widgets::HeaderSegment::new("Host", app.config.host.clone())],
+        &[
+            widgets::HeaderSegment::new("Host", app.config.host.clone()),
+            widgets::HeaderSegment::new("IP", app.system_network.public_ip_display()),
+            widgets::HeaderSegment::new("ASN", app.system_network.asn_display()),
+            widgets::HeaderSegment::new("ISP", app.system_network.isp_display()),
+        ],
     );
 }
 

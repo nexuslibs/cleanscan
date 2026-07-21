@@ -1,7 +1,9 @@
 mod colo;
 mod config;
+mod proxy;
 mod scanner;
 mod speed;
+mod system_info;
 mod tui;
 mod watch;
 
@@ -11,6 +13,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use config::{validate_ports, AppConfig, HealthCheck};
+use futures::StreamExt;
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Cloudflare IP scanner / latency prober")]
@@ -18,6 +21,10 @@ pub struct Args {
     /// Use CLI output mode (tab-separated) instead of TUI
     #[arg(long)]
     pub cli: bool,
+
+    /// Skip the best-effort public IP and network metadata lookup.
+    #[arg(long)]
+    pub no_network_info: bool,
 
     /// Hostname used for HTTPS/SNI/Host header
     #[arg(long)]
@@ -98,6 +105,14 @@ pub struct Args {
     /// Write CLI results to a file instead of stdout
     #[arg(long)]
     pub output: Option<String>,
+
+    /// VLESS/Trojan share URL whose transport settings should be checked
+    #[arg(long)]
+    pub proxy_url: Option<String>,
+
+    /// Number of healthy latency candidates to transport-check
+    #[arg(long, default_value_t = 10)]
+    pub protocol_check_top: usize,
 
     /// Minimum per-target probe success rate required for a healthy run
     #[arg(long)]
@@ -440,6 +455,8 @@ fn main() -> Result<()> {
         );
     }
 
+    let system_network = system_info::lookup_sync(!args.no_network_info);
+
     let watch_policy = watch::WatchPolicy {
         promote_after: args.watch_promote_after,
         demote_after: args.watch_demote_after,
@@ -448,6 +465,12 @@ fn main() -> Result<()> {
     };
 
     if args.cli {
+        eprintln!(
+            "System network: ip={} asn={} isp={}",
+            system_network.public_ip_display(),
+            system_network.asn_display(),
+            system_network.isp_display()
+        );
         cli_mode(
             config,
             args.cidr,
@@ -455,6 +478,8 @@ fn main() -> Result<()> {
             args.targets_file,
             &args.format,
             args.output.as_deref(),
+            args.proxy_url.as_deref(),
+            args.protocol_check_top,
             args.min_success_rate,
             args.max_p95_ms,
             args.fail_if_no_healthy_target,
@@ -487,6 +512,7 @@ fn main() -> Result<()> {
             watch_policy,
             args.watch_state.as_deref(),
             args.watch_new_sample,
+            system_network,
         )
     }
 }
@@ -687,6 +713,8 @@ fn cli_mode(
     targets_file: Option<String>,
     format: &str,
     output: Option<&str>,
+    proxy_url: Option<&str>,
+    protocol_check_top: usize,
     min_success_rate: Option<f64>,
     max_p95_ms: Option<f64>,
     fail_if_no_healthy_target: bool,
@@ -818,6 +846,45 @@ fn cli_mode(
     }
 
     results.sort_by(crate::tui::App::natural_cmp);
+
+    if let Some(raw_proxy_url) = proxy_url {
+        if let Ok(transport) = proxy::parse_share_url(raw_proxy_url) {
+            let checks = results
+                .iter()
+                .filter(|result| result.ok > 0)
+                .take(protocol_check_top)
+                .map(|result| proxy::check_candidate(&transport, &result.ip, config.timeout_ms))
+                .collect::<Vec<_>>();
+            let checks = rt.block_on(
+                futures::stream::iter(checks)
+                    .buffer_unordered(config.concurrency.max(1))
+                    .collect::<Vec<_>>(),
+            );
+            eprintln!(
+                "protocol transport: {} {}:{} via {} (top {})",
+                transport.protocol,
+                transport.address,
+                transport.port,
+                transport.network,
+                protocol_check_top
+            );
+            for check in checks {
+                eprintln!(
+                    "protocol_check\tip={}\ttcp={}\ttls={}\tlong_tls={}\tws_reached={}\tws_accepted={}\telapsed_ms={:.1}\terror={}",
+                    check.ip,
+                    check.tcp_ok,
+                    check.tls_ok,
+                    check.long_tls_ok,
+                    check.websocket_reached
+                        .map_or_else(|| "-".into(), |v| v.to_string()),
+                    check.websocket_accepted
+                        .map_or_else(|| "-".into(), |v| v.to_string()),
+                    check.elapsed_ms,
+                    check.error.unwrap_or_default()
+                );
+            }
+        }
+    }
     let healthy = results.iter().any(|result| {
         healthy_result(
             result,

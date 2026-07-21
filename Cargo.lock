@@ -278,12 +278,16 @@ dependencies = [
  "rand 0.8.7",
  "ratatui",
  "reqwest",
+ "rustls",
+ "rustls-platform-verifier",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-rustls",
  "tui-checkbox",
  "tui-overlay",
  "tui-slider",
+ "url",
 ]
 
 [[package]]
@@ -1915,6 +1919,8 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -1978,6 +1984,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "rustls-pki-types",
  "rustls-webpki",

@@ -205,10 +205,7 @@ fn render_compact(app: &mut App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_compact_stats(app: &App, frame: &mut Frame, area: Rect) {
-    let total = app.total_targets;
-    let done = app.results.len();
-    let success = app.results.iter().map(|r| r.ok).sum::<usize>();
-    let failures = app.results.iter().map(|r| r.fail).sum::<usize>();
+    let (done, total) = progress_counts(app);
     let ratio = if total > 0 {
         done as f64 / total as f64
     } else {
@@ -219,11 +216,7 @@ fn render_compact_stats(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(block, area);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(42),
-            Constraint::Percentage(29),
-            Constraint::Percentage(29),
-        ])
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
         .split(inner);
     frame.render_widget(
         ratatui::widgets::LineGauge::default()
@@ -234,16 +227,14 @@ fn render_compact_stats(app: &App, frame: &mut Frame, area: Rect) {
         cols[0],
     );
     frame.render_widget(
-        Paragraph::new(format!("{} ok", success)).style(theme::good_style()),
+        Paragraph::new(format!(
+            "{} • {} probes • {} active",
+            phase_label(app.scan_progress.phase),
+            app.scan_progress.probes_completed,
+            app.scan_progress.active_probes
+        ))
+        .style(theme::hint_style()),
         cols[1],
-    );
-    frame.render_widget(
-        Paragraph::new(format!("{} fail", failures)).style(if failures > 0 {
-            theme::bad_style()
-        } else {
-            theme::hint_style()
-        }),
-        cols[2],
     );
 }
 
@@ -795,9 +786,29 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
         &[
             widgets::HeaderSegment::new("Host", app.config.host.clone()),
             widgets::HeaderSegment::new("Path", app.config.path.clone()),
+            widgets::HeaderSegment::new("IP", app.system_network.public_ip_display()),
+            widgets::HeaderSegment::new("ASN", app.system_network.asn_display()),
+            widgets::HeaderSegment::new("ISP", app.system_network.isp_display()),
             widgets::HeaderSegment::new("Elapsed", elapsed_str),
         ],
     );
+}
+
+fn phase_label(phase: crate::scanner::ScanPhase) -> &'static str {
+    match phase {
+        crate::scanner::ScanPhase::Starting => "starting",
+        crate::scanner::ScanPhase::WarmingUp => "warming up",
+        crate::scanner::ScanPhase::Probing => "probing",
+        crate::scanner::ScanPhase::Finalizing => "finalizing",
+        crate::scanner::ScanPhase::Discovery => "discovery",
+        crate::scanner::ScanPhase::Focus => "focus pass",
+    }
+}
+
+fn progress_counts(app: &App) -> (usize, usize) {
+    let completed = app.scan_progress.targets_completed;
+    let total = app.total_targets.max(completed);
+    (completed.min(total), total)
 }
 
 fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
@@ -814,8 +825,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
         ])
         .split(area);
 
-    let passed = app.results.len();
-    let total = app.total_targets;
+    let (passed, total) = progress_counts(app);
     let pct = if total > 0 {
         (passed as f64 / total as f64 * 100.0) as u16
     } else {
@@ -836,32 +846,22 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
         ScanLifecycle::Cancelled | ScanLifecycle::Cancelling => theme::warn_style(),
         ScanLifecycle::Running | ScanLifecycle::Paused => theme::status_style("SCANNING"),
     };
-    let mut rate_str = "~0.0/s".to_string();
-    let mut eta_str = "00:00".to_string();
-    if !app.scan_complete && total > 0 && passed > 0 {
+    let mut rate_str = "calculating".to_string();
+    let mut eta_str = "--:--".to_string();
+    if !app.scan_complete && total > 0 && app.scan_progress.probes_completed > 0 {
         let elapsed = app.start_time.elapsed().as_secs_f64();
-        let rate = passed as f64 / elapsed.max(0.001);
-        let remaining = total - passed;
-        let eta = (remaining as f64 / rate.max(0.001)).max(0.0);
-        rate_str = format!("{:.1}/s", rate);
-        eta_str = format!("{:02}:{:02}", eta as u64 / 60, eta as u64 % 60);
+        let rate = app.scan_progress.probes_completed as f64 / elapsed.max(0.001);
+        let remaining = total.saturating_sub(passed);
+        let target_rate = passed as f64 / elapsed.max(0.001);
+        rate_str = format!("{:.1} probes/s", rate);
+        if target_rate > 0.0 {
+            let eta = (remaining as f64 / target_rate).max(0.0);
+            eta_str = format!("{:02}:{:02}", eta as u64 / 60, eta as u64 % 60);
+        }
     } else if let Some(label) = terminal_label {
         rate_str = label.to_string();
         eta_str = "--:--".to_string();
     }
-
-    // Success rate calculation
-    let mut total_probes_done = 0;
-    let mut total_probes_ok = 0;
-    for r in &app.results {
-        total_probes_done += r.completed;
-        total_probes_ok += r.ok;
-    }
-    let success_rate = if total_probes_done > 0 {
-        (total_probes_ok as f64 / total_probes_done as f64) * 100.0
-    } else {
-        0.0
-    };
 
     // Panel 1: Progress gauge + throughput / workers.
     let block_p1 = widgets::panel_block("Progress", false);
@@ -871,7 +871,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // gauge
-            Constraint::Length(1), // success
+            Constraint::Length(1), // probe counters
             Constraint::Length(1), // rate / eta
             Constraint::Min(1),    // workers
         ])
@@ -894,22 +894,32 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Targets completed: ", theme::title_style()),
+            Span::styled("Targets / probes: ", theme::title_style()),
             Span::raw(format!(
-                "{}/{} ({:.1}% probe success; {} ok, {} fail)",
+                "{}/{} • {}/{} completed • {} active",
                 passed,
                 total,
-                success_rate,
-                total_probes_ok,
-                total_probes_done - total_probes_ok
+                app.scan_progress.probes_completed,
+                app.scan_progress.probes_started,
+                app.scan_progress.active_probes,
             )),
         ])),
         p1_rows[1],
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Probe rate / ETA: ", theme::title_style()),
-            Span::raw(format!("{} • approx. ETA {}", rate_str, eta_str)),
+            Span::styled("Activity / ETA: ", theme::title_style()),
+            Span::raw(format!(
+                "{} • {} • {}{}",
+                phase_label(app.scan_progress.phase),
+                rate_str,
+                eta_str,
+                app.scan_progress
+                    .latest_target
+                    .as_deref()
+                    .map(|ip| format!(" • {}", ip))
+                    .unwrap_or_default(),
+            )),
         ])),
         p1_rows[2],
     );
@@ -1287,6 +1297,8 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
     if display.is_empty() {
         let msg = if app.scan_complete {
             "No successful IPs found — try widening the CIDR selection or raising timeouts."
+        } else if app.results.is_empty() {
+            "Preparing probes… no target has completed yet."
         } else {
             "Probing edges… successful IPs will appear here as they respond."
         };

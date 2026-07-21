@@ -27,7 +27,7 @@ use ratatui::{
 };
 
 use crate::config::AppConfig;
-use crate::scanner::ProbeResult;
+use crate::scanner::{ProbeResult, ScanPhase, ScanProgress};
 use crate::speed::{SpeedDirection, SpeedResult};
 use crate::tui::wizard::SettingField;
 use tui_overlay::{Anchor, Backdrop, Easing, Overlay, OverlayState, Slide};
@@ -52,6 +52,29 @@ pub enum ScanLifecycle {
     Completed,
     Failed,
     Cancelled,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScanProgressState {
+    pub phase: ScanPhase,
+    pub probes_started: usize,
+    pub probes_completed: usize,
+    pub active_probes: usize,
+    pub targets_completed: usize,
+    pub latest_target: Option<String>,
+}
+
+impl Default for ScanProgressState {
+    fn default() -> Self {
+        Self {
+            phase: ScanPhase::Starting,
+            probes_started: 0,
+            probes_completed: 0,
+            active_probes: 0,
+            targets_completed: 0,
+            latest_target: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,6 +265,7 @@ pub struct CidrEntry {
 pub struct App {
     /// Editable scan parameters; drive the scan when launched from the wizard.
     pub config: AppConfig,
+    pub system_network: crate::system_info::SystemNetworkInfo,
     pub screen: Screen,
     pub wizard_step: WizardStep,
     pub cidr_candidates: Vec<CidrEntry>,
@@ -256,6 +280,7 @@ pub struct App {
     pub edit_caret: usize,
     pub results: Vec<ProbeResult>,
     pub total_targets: usize,
+    pub scan_progress: ScanProgressState,
     /// Exact sampled targets shown in the review screen and used for the run.
     pub preview_targets: Vec<String>,
     pub last_targets: Vec<String>,
@@ -637,6 +662,7 @@ impl App {
 
         Self {
             config,
+            system_network: crate::system_info::SystemNetworkInfo::default(),
             screen: if has_cli_targets {
                 Screen::Scanning
             } else {
@@ -653,6 +679,7 @@ impl App {
             edit_caret: 0,
             results: Vec::new(),
             total_targets: 0,
+            scan_progress: ScanProgressState::default(),
             preview_targets: Vec::new(),
             last_targets: Vec::new(),
             scan_seed,
@@ -824,6 +851,7 @@ impl App {
         self.show_result_details = false;
         self.detail_tab = 0;
         self.total_targets = total;
+        self.scan_progress = ScanProgressState::default();
         self.scan_complete = false;
         self.scan_lifecycle = ScanLifecycle::Running;
         self.scan_error = None;
@@ -972,6 +1000,26 @@ impl App {
 
     pub fn add_result(&mut self, result: ProbeResult) {
         self.results.push(result);
+    }
+
+    pub fn apply_scan_progress(&mut self, progress: ScanProgress) {
+        self.scan_progress = ScanProgressState {
+            phase: progress.phase,
+            probes_started: self
+                .scan_progress
+                .probes_started
+                .max(progress.probes_started),
+            probes_completed: self
+                .scan_progress
+                .probes_completed
+                .max(progress.probes_completed),
+            active_probes: progress.active_probes,
+            targets_completed: self
+                .scan_progress
+                .targets_completed
+                .max(progress.targets_completed),
+            latest_target: progress.latest_target,
+        };
     }
 
     fn copy_selected_ip(&mut self) {
@@ -1426,6 +1474,7 @@ pub fn run_tui(
     watch_policy: crate::watch::WatchPolicy,
     watch_state_path: Option<&str>,
     watch_new_sample: bool,
+    system_network: crate::system_info::SystemNetworkInfo,
 ) -> anyhow::Result<()> {
     let has_cli_targets = cli_ips.is_some() || !cli_cidr.is_empty();
 
@@ -1439,8 +1488,10 @@ pub fn run_tui(
     });
     let config_arc = Arc::new(config);
     let (tx, rx) = std::sync::mpsc::channel::<ProbeResult>();
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel::<ScanProgress>();
     let (speed_tx, speed_rx) = std::sync::mpsc::channel::<SpeedResult>();
     let (manifest_tx, manifest_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let progress_sender = progress_tx.clone();
     let paused = Arc::new(AtomicBool::new(false));
     let cancel = Arc::new(AtomicBool::new(false));
 
@@ -1449,6 +1500,7 @@ pub fn run_tui(
     let _ = crossterm::execute!(io::stdout(), EnableMouseCapture);
     let _guard = RestoreGuard;
     let mut app = App::new((*config_arc).clone(), has_cli_targets, paused.clone());
+    app.system_network = system_network;
     app.set_cancel_token(cancel.clone());
     app.watch_interval = watch_interval.map(|seconds| Duration::from_secs(seconds.max(1)));
     app.manifest_path = manifest_path;
@@ -1473,6 +1525,7 @@ pub fn run_tui(
         let scanner_paused = paused.clone();
         let scanner_cancel = cancel.clone();
         let scanner_tx = tx.clone();
+        let scanner_progress = progress_sender.clone();
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(r) => r,
@@ -1485,22 +1538,24 @@ pub fn run_tui(
                 && !selected_cidrs.is_empty()
                 && scanner_config.health_checks.is_empty()
             {
-                rt.block_on(crate::scanner::run_scan_two_phase(
+                rt.block_on(crate::scanner::run_scan_two_phase_with_progress(
                     selected_cidrs,
                     scanner_config,
                     None,
                     scanner_tx,
                     scanner_cancel,
                     scanner_paused,
+                    Some(scanner_progress.clone()),
                 ))
                 .map_err(|e| e.to_string())
             } else {
-                rt.block_on(crate::scanner::run_profile_scan(
+                rt.block_on(crate::scanner::run_profile_scan_with_progress(
                     targets.clone(),
                     scanner_config,
                     scanner_tx,
                     scanner_cancel,
                     scanner_paused,
+                    Some(scanner_progress.clone()),
                 ));
                 Ok(targets)
             }
@@ -1655,6 +1710,9 @@ pub fn run_tui(
             while let Ok(r) = rx.try_recv() {
                 app.add_result(r);
             }
+            while let Ok(progress) = progress_rx.try_recv() {
+                app.apply_scan_progress(progress);
+            }
             while let Ok(r) = speed_rx.try_recv() {
                 app.speed_results.push(r);
             }
@@ -1663,6 +1721,7 @@ pub fn run_tui(
                 while let Ok(r) = rx.try_recv() {
                     app.add_result(r);
                 }
+                while progress_rx.try_recv().is_ok() {}
                 if let Some(handle) = scanner.take() {
                     match handle.join() {
                         Ok(Ok(actual_targets)) => {
@@ -3324,7 +3383,9 @@ mod tests {
         ProbeResult, ScanLifecycle, Screen, WizardStep,
     };
     use crate::config::AppConfig;
-    use crate::scanner::{DiagnosticCategory, DiagnosticPhase, ProbeDiagnostic};
+    use crate::scanner::{
+        DiagnosticCategory, DiagnosticPhase, ProbeDiagnostic, ScanPhase, ScanProgress,
+    };
     use crate::watch::{WatchPolicy, WatchState};
     use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::{backend::TestBackend, Terminal};
@@ -3970,6 +4031,33 @@ mod tests {
         app.show_result_details = true;
         draw(&mut app, 80, 24);
         draw(&mut app, 79, 23);
+    }
+
+    #[test]
+    fn scan_progress_resets_and_updates_without_creating_results() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(500);
+        app.apply_scan_progress(ScanProgress {
+            phase: ScanPhase::WarmingUp,
+            probes_started: 12,
+            probes_completed: 4,
+            active_probes: 8,
+            targets_completed: 0,
+            latest_target: Some("192.0.2.1".to_string()),
+        });
+        assert!(app.results.is_empty());
+        assert_eq!(app.total_targets, 500);
+        assert_eq!(app.scan_progress.probes_completed, 4);
+        assert_eq!(app.scan_progress.active_probes, 8);
+
+        app.begin_scan(3);
+        assert_eq!(app.scan_progress.phase, ScanPhase::Starting);
+        assert_eq!(app.scan_progress.probes_started, 0);
+        assert_eq!(app.scan_progress.targets_completed, 0);
     }
 
     #[test]

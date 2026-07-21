@@ -19,6 +19,8 @@ the best Cloudflare edge IPs to reach a given origin host.
 - Cloudflare HTTPS port selection across 443, 2053, 2083, 2087, 2096, and 8443.
 - Selective upload/download throughput tests for successful latency targets.
 - Persistent TUI settings, including selected CIDR ranges and scan parameters.
+- Current public IP, ASN, and ISP name in the running dashboard header when
+  network metadata is available.
 
 ## Build
 
@@ -80,6 +82,58 @@ build automatically, and no custom GitHub secret is required.
 The installer continues to support the latest release and pinned versions via
 `CLEANSCAN_VERSION=vX.Y.Z`.
 
+### Termux (Android terminal)
+
+cleanscan runs in [Termux](https://termux.dev/) using the static Linux/musl
+release artifacts. Install Termux from [F-Droid](https://f-droid.org/en/packages/com.termux/)
+rather than the discontinued Play Store build. Then install the required tools:
+
+```sh
+pkg update
+pkg install curl tar
+```
+
+Install the latest cleanscan release directly into Termux's `$PREFIX/bin`:
+
+```sh
+curl -sSfL https://raw.githubusercontent.com/nexuslibs/cleanscan/main/install.sh | bash
+```
+
+To install a specific release:
+
+```sh
+CLEANSCAN_VERSION=v0.16.0 bash -c \
+  'curl -sSfL https://raw.githubusercontent.com/nexuslibs/cleanscan/main/install.sh | bash'
+```
+
+Verify the installation and run a small smoke test:
+
+```sh
+cleanscan --version
+cleanscan --cli --host example.com \
+  --cidr 188.114.96.0/20 --sample-per-cidr 1
+```
+
+The installer selects an artifact for ARM64, ARMv7, x86_64, or x86 Termux
+devices and verifies its SHA256 checksum before installing. It does not require
+root access. On Android, use `termux-setup-storage` only if you want to read or
+write files under shared storage; scans and exports work from the Termux home
+directory without that permission.
+
+The TUI uses the same keyboard controls as desktop terminals. The `c` clipboard
+action depends on Termux clipboard integration and may not work on every setup;
+use the exported TSV or target manifest files if clipboard access is unavailable.
+For long scans, keep Termux in the foreground or use `termux-wake-lock` from the
+`termux-api` package to reduce interruptions when the device sleeps.
+
+Termux support is delivered through static Linux binaries. This release does
+not include an Android APK or a separate Termux package-manager formula.
+
+If installation reports an unsupported architecture, check `uname -m` and use a
+device supported by the published release artifacts. The installer also requires
+Termux's `$PREFIX` to be available; do not run it from an Android shell outside
+Termux.
+
 ## Usage
 
 ```sh
@@ -91,6 +145,10 @@ cleanscan --ips ips.txt
 
 # Pipe-friendly tab-separated output
 cleanscan --cli --cidr 188.114.96.0/20 --top 20
+
+# Check transport survivability for the top 10 healthy candidates
+cleanscan --cli --host example.com --cidr 188.114.96.0/20 \
+  --proxy-url 'vless://UUID@example.com:443?type=ws&security=tls&sni=example.com&host=example.com&path=%2Fws'
 
 # Probe several required application paths.
 cleanscan --cli --host example.com \
@@ -238,6 +296,8 @@ latency dashboard.
 | `--targets-file`       | —                | Exact target list for a reproducible run        |
 | `--format`             | `tsv`            | CLI output format: `tsv`, `json`, or `ndjson`   |
 | `--output`             | stdout           | Write CLI output to a file                     |
+| `--proxy-url`          | —                | Parse VLESS/Trojan transport settings and check top candidates |
+| `--protocol-check-top` | `10`             | Number of healthy candidates to transport-check |
 | `--min-success-rate`   | —                | Minimum per-target success rate threshold       |
 | `--max-p95-ms`         | —                | Maximum per-target p95 latency threshold        |
 | `--fail-if-no-healthy-target` | off         | Fail if no target meets thresholds              |
@@ -261,6 +321,12 @@ latency dashboard.
 | `--watch-new-sample`    | off              | Discard persisted watch targets and resample     |
 
 ## Output
+
+At startup, cleanscan performs a best-effort lookup of the current public IP,
+the public IP's network ASN, and ISP name through `ipwho.is`. The TUI shows these values in its dashboard and
+speed-test headers; CLI mode prints them to stderr so tabular stdout remains
+pipe-friendly. If the lookup is unavailable, the scan continues and displays
+`—`/`unknown` instead.
 
 All sampled IPs are shown, including targets with no successful probes. Probes are scheduled one
 at a time per IP: successful IPs receive priority for their remaining probes,
@@ -351,6 +417,18 @@ host, path, scan parameters, custom CIDRs, and selected ranges. The file is
 stored at the platform-specific user configuration directory under
 `cleanscan/config.json`. Command-line options override saved settings for that
 run.
+
+When `--proxy-url` is supplied in CLI mode, cleanscan parses only the
+transport-safe parts of a VLESS/Trojan share URL: destination port, TLS/SNI,
+network type, and WebSocket host/path. The survivability check supports TLS
+transports and non-TLS TCP transports; `security=none`/non-TLS WebSocket URLs
+are unsupported. For TLS URLs it checks the top healthy latency candidates for
+TCP connectivity, TLS negotiation, a short long-lived TLS idle hold, and
+WebSocket endpoint reachability when applicable. For non-TLS TCP URLs it
+reports TCP connectivity only, with TLS, long-lived TLS, and WebSocket checks
+not applicable. This is a transport survivability check, not a VLESS/Trojan
+authentication or full-tunnel test; no Xray process is started and
+UUIDs/passwords are not printed.
 
 ## Development
 
