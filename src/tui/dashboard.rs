@@ -205,8 +205,7 @@ fn render_compact(app: &mut App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_compact_stats(app: &App, frame: &mut Frame, area: Rect) {
-    let total = app.total_targets;
-    let done = app.scan_progress.targets_completed;
+    let (done, total) = progress_counts(app);
     let ratio = if total > 0 {
         done as f64 / total as f64
     } else {
@@ -806,6 +805,12 @@ fn phase_label(phase: crate::scanner::ScanPhase) -> &'static str {
     }
 }
 
+fn progress_counts(app: &App) -> (usize, usize) {
+    let completed = app.scan_progress.targets_completed;
+    let total = app.total_targets.max(completed);
+    (completed.min(total), total)
+}
+
 fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
     if app.scan_complete && app.scan_lifecycle == ScanLifecycle::Completed {
         render_decision_panel(app, frame, area);
@@ -820,8 +825,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
         ])
         .split(area);
 
-    let passed = app.scan_progress.targets_completed;
-    let total = app.total_targets;
+    let (passed, total) = progress_counts(app);
     let pct = if total > 0 {
         (passed as f64 / total as f64 * 100.0) as u16
     } else {
