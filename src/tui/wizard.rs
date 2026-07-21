@@ -1400,6 +1400,7 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         _ => ButtonAction::Back,
     };
     let left_label = match app.wizard_step {
+        WizardStep::Ranges if app.return_to_results => "Results (Esc)",
         WizardStep::Ranges => "Quit (q)",
         _ => "Back (Esc)",
     };
@@ -1607,12 +1608,14 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
             app.cursor = 0;
         }
         KeyCode::Enter => match app.focus_index {
+            1 if app.return_to_results => app.return_to_results(),
             1 => app.should_quit = true,
             _ => {
                 app.wizard_step = WizardStep::Settings;
                 app.cursor = 0;
             }
         },
+        KeyCode::Esc if app.return_to_results => app.return_to_results(),
         _ => {}
     }
 }
@@ -1808,7 +1811,9 @@ fn toggle_port_buffer(app: &mut App) {
 
 fn handle_review_key(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Char('s') => app.regenerate_preview(),
+        KeyCode::Char('s') => {
+            app.regenerate_preview();
+        }
         KeyCode::Char('c') => app.save_target_manifest(),
         KeyCode::Enter => match app.focus_index {
             1 => {

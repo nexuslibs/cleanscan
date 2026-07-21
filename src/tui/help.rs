@@ -112,9 +112,11 @@ fn scanning_lines(app: &App) -> Vec<Line<'static>> {
         lines.push(key("e", "Export results to a .tsv file"));
         lines.push(key("t", "Run speed tests on successful IPs"));
         lines.push(key("f", "Show failed targets for diagnosis"));
+        lines.push(key("v", "Show or hide result columns"));
         lines.push(key("r", "Repeat the identical sampled target set"));
         lines.push(key("n", "Generate a new sample with the same settings"));
         lines.push(key("m", "Export runs for comparison"));
+        lines.push(key("w", "Customize scan parameters and ranges"));
     } else {
         lines.push(key("p", "Pause / resume the scan"));
     }

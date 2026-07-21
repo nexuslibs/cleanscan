@@ -168,16 +168,30 @@ fn render_compact_stats(app: &App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
-    const COMPACT_WIDTHS: [Constraint; 8] = [
-        Constraint::Length(5),
-        Constraint::Min(15),
-        Constraint::Length(7),
-        Constraint::Length(14),
-        Constraint::Length(12),
-        Constraint::Length(12),
-        Constraint::Length(12),
-        Constraint::Length(10),
+    const COMPACT_COLUMNS: [(Option<usize>, &str, Constraint); 8] = [
+        (Some(0), "#", Constraint::Length(5)),
+        (Some(1), "IP", Constraint::Min(15)),
+        (Some(10), "Colo", Constraint::Length(7)),
+        (Some(11), "Country", Constraint::Length(14)),
+        (None, "Reliability", Constraint::Length(12)),
+        (Some(5), "Avg", Constraint::Length(12)),
+        (Some(8), "P95", Constraint::Length(12)),
+        (None, "Status", Constraint::Length(10)),
     ];
+    let mut compact_columns = COMPACT_COLUMNS
+        .iter()
+        .filter(|(source, _, _)| source.is_none_or(|index| app.column_visible(index)))
+        .collect::<Vec<_>>();
+    if !compact_columns
+        .iter()
+        .any(|(source, _, _)| source.is_some())
+    {
+        compact_columns.push(&COMPACT_COLUMNS[1]);
+    }
+    let widths = compact_columns
+        .iter()
+        .map(|(_, _, width)| *width)
+        .collect::<Vec<_>>();
     let block = widgets::panel_block("Results — Enter details", app.focus_index == 0);
     let inner = block.inner(area);
     app.table_inner = Some(inner);
@@ -198,21 +212,25 @@ fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
         let selected = index == app.result_cursor;
         let reliability = format!("{}/{}", r.ok, r.completed);
         let status = result_status(r);
-        Row::new(vec![
-            Cell::from((index + 1).to_string()),
-            Cell::from(r.ip.clone()),
-            Cell::from(r.colo.clone().unwrap_or_else(|| "—".to_string())),
-            Cell::from(r.country.clone().unwrap_or_else(|| "—".to_string())),
-            Cell::from(reliability),
-            Cell::from(fmt_ms(r.avg)),
-            Cell::from(fmt_ms(r.p95)),
-            Cell::from(status).style(if r.fail == 0 {
-                theme::good_style()
-            } else {
-                theme::warn_style()
-            }),
-        ])
-        .style(if selected {
+        let cells = compact_columns
+            .iter()
+            .map(|(source, label, _)| match (source, *label) {
+                (Some(0), _) => Cell::from((index + 1).to_string()),
+                (Some(1), _) => Cell::from(r.ip.clone()),
+                (Some(5), _) => Cell::from(fmt_ms(r.avg)),
+                (Some(8), _) => Cell::from(fmt_ms(r.p95)),
+                (Some(10), _) => Cell::from(r.colo.clone().unwrap_or_else(|| "—".to_string())),
+                (Some(11), _) => Cell::from(r.country.clone().unwrap_or_else(|| "—".to_string())),
+                (None, "Reliability") => Cell::from(reliability.clone()),
+                (None, _) => Cell::from(status).style(if r.fail == 0 {
+                    theme::good_style()
+                } else {
+                    theme::warn_style()
+                }),
+                _ => Cell::from("—"),
+            })
+            .collect::<Vec<_>>();
+        Row::new(cells).style(if selected {
             theme::row_selected_style()
         } else if index % 2 == 1 {
             theme::row_alt_style()
@@ -220,25 +238,86 @@ fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
             Style::default()
         })
     });
-    let table = Table::new(rows, COMPACT_WIDTHS)
-        .header(
-            Row::new(vec![
-                "#",
-                "IP",
-                "Colo",
-                "Country",
-                "Reliability",
-                "Avg",
-                "P95",
-                "Status",
-            ])
-            .style(theme::title_style()),
-        )
+    let headers = compact_columns
+        .iter()
+        .map(|(_, label, _)| *label)
+        .collect::<Vec<_>>();
+    let table = Table::new(rows, widths)
+        .header(Row::new(headers).style(theme::title_style()))
         .block(block);
     frame.render_widget(table, area);
 }
 
 fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(area);
+    let buttons = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(17),
+            Constraint::Length(16),
+            Constraint::Length(18),
+            Constraint::Min(0),
+            Constraint::Length(12),
+        ])
+        .split(layout[0]);
+    if app.scan_complete {
+        app.button_ex(
+            frame,
+            buttons[0],
+            "Export (e)",
+            ButtonAction::Save,
+            ButtonKind::Secondary,
+            app.focus_index == 1,
+        );
+        app.button_ex(
+            frame,
+            buttons[1],
+            "Speed test (t)",
+            ButtonAction::SpeedTest,
+            ButtonKind::Secondary,
+            app.focus_index == 2,
+        );
+        app.button_ex(
+            frame,
+            buttons[2],
+            "Customize (w)",
+            ButtonAction::CustomizeScan,
+            ButtonKind::Primary,
+            app.focus_index == 3,
+        );
+        app.button_ex(
+            frame,
+            buttons[4],
+            "Quit (q)",
+            ButtonAction::Quit,
+            ButtonKind::Secondary,
+            app.focus_index == 4,
+        );
+    } else {
+        app.button_ex(
+            frame,
+            buttons[1],
+            if app.paused.load(std::sync::atomic::Ordering::Relaxed) {
+                "Resume (p)"
+            } else {
+                "Pause (p)"
+            },
+            ButtonAction::PauseResume,
+            ButtonKind::Secondary,
+            app.focus_index == 1,
+        );
+        app.button_ex(
+            frame,
+            buttons[4],
+            "Quit (q)",
+            ButtonAction::Quit,
+            ButtonKind::Secondary,
+            app.focus_index == 2,
+        );
+    }
     let hints: &[widgets::KeyHint] = if app.scan_complete {
         &[
             ("Tab", "focus"),
@@ -246,9 +325,11 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
             ("e", "export"),
             ("t", "speed test"),
             ("f", "show failures"),
+            ("v", "columns"),
             ("r", "rerun targets"),
             ("n", "new sample"),
             ("m", "comparison export"),
+            ("w", "customize"),
             ("c", "copy"),
             ("/", "commands"),
             ("?", "help"),
@@ -265,7 +346,7 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
             ("q", "quit"),
         ]
     };
-    widgets::status_bar(frame, area, hints, app.visible_message());
+    widgets::status_bar(frame, layout[1], hints, app.visible_message());
 }
 
 fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) {
@@ -1195,6 +1276,7 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         .constraints([
             Constraint::Length(18),
             Constraint::Length(20),
+            Constraint::Length(20),
             Constraint::Min(0),
             Constraint::Length(18),
         ])
@@ -1235,14 +1317,22 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
             ButtonKind::Primary,
             app.focus_index == 2,
         );
+        app.button_ex(
+            frame,
+            chunks[2],
+            "Customize (w)",
+            ButtonAction::CustomizeScan,
+            ButtonKind::Primary,
+            app.focus_index == 3,
+        );
     }
     app.button_ex(
         frame,
-        chunks[3],
+        chunks[4],
         "Quit (q)",
         ButtonAction::Quit,
         ButtonKind::Secondary,
-        app.focus_index == if app.scan_complete { 3 } else { 2 },
+        app.focus_index == if app.scan_complete { 4 } else { 2 },
     );
 
     let hints: &[widgets::KeyHint] = if app.scan_complete {
@@ -1253,9 +1343,11 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
             ("e", "export"),
             ("t", "speed test"),
             ("f", "show failures"),
+            ("v", "columns"),
             ("r", "rerun targets"),
             ("n", "new sample"),
             ("m", "comparison export"),
+            ("w", "customize"),
             ("/", "commands"),
             ("?", "help"),
             ("q", "quit"),
@@ -1271,7 +1363,7 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
             ("q", "quit"),
         ]
     };
-    widgets::status_bar(frame, chunks[2], hints, app.visible_message());
+    widgets::status_bar(frame, chunks[3], hints, app.visible_message());
 }
 
 #[cfg(test)]

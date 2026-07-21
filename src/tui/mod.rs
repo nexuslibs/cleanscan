@@ -89,10 +89,15 @@ pub enum Action {
     Upload,
     Both,
     ConfigureColumns,
+    ToggleFailures,
+    RepeatTargets,
+    NewSample,
+    ExportComparison,
+    CustomizeScan,
 }
 
 impl Action {
-    pub const ALL: [Action; 20] = [
+    pub const ALL: [Action; 25] = [
         Action::Back,
         Action::Next,
         Action::Start,
@@ -113,6 +118,11 @@ impl Action {
         Action::Upload,
         Action::Both,
         Action::ConfigureColumns,
+        Action::ToggleFailures,
+        Action::RepeatTargets,
+        Action::NewSample,
+        Action::ExportComparison,
+        Action::CustomizeScan,
     ];
 
     pub fn label(self) -> &'static str {
@@ -137,6 +147,11 @@ impl Action {
             Action::Upload => "Upload only",
             Action::Both => "Download + upload",
             Action::ConfigureColumns => "Configure result columns",
+            Action::ToggleFailures => "Show failures",
+            Action::RepeatTargets => "Repeat current targets",
+            Action::NewSample => "Generate new sample",
+            Action::ExportComparison => "Export comparison",
+            Action::CustomizeScan => "Customize scan",
         }
     }
 
@@ -152,6 +167,11 @@ impl Action {
             Action::Confirm => "Enter",
             Action::Cancel => "Esc",
             Action::ConfigureColumns => "v",
+            Action::ToggleFailures => "f",
+            Action::RepeatTargets => "r",
+            Action::NewSample => "n",
+            Action::ExportComparison => "m",
+            Action::CustomizeScan => "w",
             _ => "",
         }
     }
@@ -164,6 +184,11 @@ impl Action {
             Action::PauseResume => "Pause or resume the active scan",
             Action::CopyIp => "Copy the selected IP address to the clipboard",
             Action::ConfigureColumns => "Show or hide columns in the results table",
+            Action::ToggleFailures => "Toggle between successful targets and all targets",
+            Action::RepeatTargets => "Run the identical sampled target set again",
+            Action::NewSample => "Generate a new target sample with the same settings",
+            Action::ExportComparison => "Export the current run for comparison",
+            Action::CustomizeScan => "Return to scan parameters without discarding results",
             _ => self.label(),
         }
     }
@@ -188,6 +213,7 @@ pub enum ButtonAction {
     SpeedDirBoth,
     SpeedStart,
     SpeedBack,
+    CustomizeScan,
 }
 
 /// A selectable CIDR candidate in the wizard's ranges step.
@@ -319,6 +345,9 @@ pub struct App {
     pub watch_policy: crate::watch::WatchPolicy,
     pub watch_state_path: Option<String>,
     pub watch_new_sample: bool,
+    /// True when the wizard was opened from completed results and should
+    /// return there instead of quitting when the user backs out.
+    pub return_to_results: bool,
     /// Animation lifecycle state for each modal layer, driven by `render`.
     pub help_overlay: OverlayState,
     pub quit_overlay: OverlayState,
@@ -377,7 +406,7 @@ impl App {
             },
             Screen::Scanning => {
                 if self.scan_complete {
-                    4
+                    5
                 } else {
                     3
                 }
@@ -427,15 +456,72 @@ impl App {
             .iter()
             .copied()
             .filter(|action| {
-                (self.screen != Screen::SpeedTesting || *action != Action::SpeedTest)
-                    && (self.screen != Screen::Scanning
-                        || self.scan_complete
-                        || *action != Action::Start)
+                *action != Action::OpenCommandPalette
+                    && self.action_available(*action)
                     && (query.is_empty()
                         || action.label().to_ascii_lowercase().contains(&query)
                         || action.description().to_ascii_lowercase().contains(&query))
             })
             .collect()
+    }
+
+    fn action_available(&self, action: Action) -> bool {
+        match self.screen {
+            Screen::Wizard => {
+                (action == Action::Back
+                    && (self.wizard_step as usize > 0 || self.return_to_results))
+                    || (action == Action::Next && (self.wizard_step as usize) < 2)
+                    || (action == Action::Start && self.wizard_step == WizardStep::Review)
+                    || matches!(action, Action::Quit | Action::OpenHelp)
+            }
+            Screen::Scanning if self.scan_complete => matches!(
+                action,
+                Action::Quit
+                    | Action::Export
+                    | Action::SpeedTest
+                    | Action::CopyIp
+                    | Action::OpenDetails
+                    | Action::OpenHelp
+                    | Action::OpenCommandPalette
+                    | Action::ConfigureColumns
+                    | Action::ToggleFailures
+                    | Action::RepeatTargets
+                    | Action::NewSample
+                    | Action::ExportComparison
+                    | Action::CustomizeScan
+            ),
+            Screen::Scanning => matches!(
+                action,
+                Action::Quit
+                    | Action::PauseResume
+                    | Action::CopyIp
+                    | Action::OpenDetails
+                    | Action::OpenHelp
+                    | Action::OpenCommandPalette
+            ),
+            Screen::SpeedSelect => matches!(
+                action,
+                Action::Quit
+                    | Action::Back
+                    | Action::Start
+                    | Action::SelectAll
+                    | Action::ClearSelection
+                    | Action::Download
+                    | Action::Upload
+                    | Action::Both
+                    | Action::OpenHelp
+                    | Action::OpenCommandPalette
+            ),
+            Screen::SpeedTesting => matches!(action, Action::Quit | Action::OpenHelp),
+            Screen::SpeedResults => matches!(
+                action,
+                Action::Quit
+                    | Action::CopyIp
+                    | Action::Back
+                    | Action::OpenHelp
+                    | Action::OpenCommandPalette
+            ),
+        }
     }
 
     fn selected_action(&self) -> Option<Action> {
@@ -588,6 +674,7 @@ impl App {
             watch_policy: crate::watch::WatchPolicy::default(),
             watch_state_path: None,
             watch_new_sample: false,
+            return_to_results: false,
             help_overlay: modal_state(),
             quit_overlay: modal_state(),
             speed_confirm_overlay: modal_state(),
@@ -660,6 +747,7 @@ impl App {
     /// Switch to the scanning dashboard once targets are known. Resets per-scan state.
     pub fn begin_scan(&mut self, total: usize) {
         self.screen = Screen::Scanning;
+        self.return_to_results = false;
         self.focus_index = 0;
         self.focus_target = FocusTarget::Table;
         self.show_result_details = false;
@@ -714,7 +802,7 @@ impl App {
         }
     }
 
-    pub fn regenerate_preview(&mut self) {
+    pub fn regenerate_preview(&mut self) -> bool {
         let seed = rand::random();
         match self.collect_preview(seed) {
             Ok(targets) => {
@@ -722,8 +810,12 @@ impl App {
                 self.config.seed = seed;
                 self.preview_targets = targets;
                 self.toast_success(format!("Generated {} targets", self.preview_targets.len()));
+                true
             }
-            Err(error) => self.toast_error(format!("Preview failed: {error}")),
+            Err(error) => {
+                self.toast_error(format!("Preview failed: {error}"));
+                false
+            }
         }
     }
 
@@ -1923,6 +2015,8 @@ impl App {
             KeyCode::Char('q') | KeyCode::Char('Q') => {
                 if self.screen == Screen::Scanning && !self.scan_complete {
                     self.confirm_quit = true;
+                } else if self.screen == Screen::Wizard && self.return_to_results {
+                    self.return_to_results();
                 } else {
                     self.should_quit = true;
                 }
@@ -1947,7 +2041,8 @@ impl App {
                     1 => self.activate_action(Action::PauseResume),
                     2 if self.scan_complete => self.activate_action(Action::SpeedTest),
                     2 => self.activate_action(Action::Quit),
-                    3 if self.scan_complete => self.activate_action(Action::Quit),
+                    3 if self.scan_complete => self.activate_action(Action::CustomizeScan),
+                    4 if self.scan_complete => self.activate_action(Action::Quit),
                     _ => {}
                 }
                 return;
@@ -2012,6 +2107,31 @@ impl App {
             Action::Download => self.activate_button(ButtonAction::SpeedDirDownload),
             Action::Upload => self.activate_button(ButtonAction::SpeedDirUpload),
             Action::Both => self.activate_button(ButtonAction::SpeedDirBoth),
+            Action::ToggleFailures => {
+                if self.screen == Screen::Scanning {
+                    self.toggle_failure_filter();
+                }
+            }
+            Action::RepeatTargets => {
+                if self.screen == Screen::Scanning && self.scan_complete {
+                    self.repeat_targets();
+                }
+            }
+            Action::NewSample => {
+                if self.screen == Screen::Scanning && self.scan_complete {
+                    self.generate_new_sample();
+                }
+            }
+            Action::ExportComparison => {
+                if self.screen == Screen::Scanning && self.scan_complete {
+                    self.export_comparison();
+                }
+            }
+            Action::CustomizeScan => {
+                if self.screen == Screen::Scanning && self.scan_complete {
+                    self.enter_customization();
+                }
+            }
         }
     }
 
@@ -2277,45 +2397,14 @@ impl App {
 
     fn handle_scan_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Char('r') if self.scan_complete => {
-                if self.last_targets.is_empty() {
-                    self.toast_warn("No previous target manifest available");
-                } else {
-                    self.rescan_targets = Some(self.last_targets.clone());
-                    self.pending_start = true;
-                    self.toast_info("Re-running the identical target set");
-                }
-            }
-            KeyCode::Char('n') if self.scan_complete => {
-                let generated = if self.explicit_target_source.is_some() {
-                    self.regenerate_explicit_preview()
-                } else {
-                    self.regenerate_preview();
-                    !self.preview_targets.is_empty()
-                };
-                if generated {
-                    self.watch_source_fingerprint = None;
-                    self.rescan_targets = Some(self.preview_targets.clone());
-                    self.pending_start = true;
-                }
-            }
+            KeyCode::Char('r') if self.scan_complete => self.activate_action(Action::RepeatTargets),
+            KeyCode::Char('n') if self.scan_complete => self.activate_action(Action::NewSample),
             KeyCode::Char('m') if self.scan_complete => {
-                self.export_comparison();
+                self.activate_action(Action::ExportComparison)
             }
-            KeyCode::Char('f') => {
-                self.show_failures = !self.show_failures;
-                self.result_cursor = 0;
-                self.scroll = 0;
-                self.toast_kind(
-                    if self.show_failures {
-                        "Showing all targets, including failures"
-                    } else {
-                        "Showing successful targets"
-                    },
-                    ToastKind::Info,
-                );
-            }
+            KeyCode::Char('f') => self.activate_action(Action::ToggleFailures),
             KeyCode::Char('v') => self.activate_action(Action::ConfigureColumns),
+            KeyCode::Char('w') if self.scan_complete => self.activate_action(Action::CustomizeScan),
             KeyCode::Char('p') => self.activate_action(Action::PauseResume),
             KeyCode::Char('e') => self.activate_action(Action::Export),
             KeyCode::Char('t') if self.scan_complete => self.activate_action(Action::SpeedTest),
@@ -2361,6 +2450,63 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn toggle_failure_filter(&mut self) {
+        self.show_failures = !self.show_failures;
+        self.result_cursor = 0;
+        self.scroll = 0;
+        self.toast_kind(
+            if self.show_failures {
+                "Showing all targets, including failures"
+            } else {
+                "Showing successful targets"
+            },
+            ToastKind::Info,
+        );
+    }
+
+    fn repeat_targets(&mut self) {
+        if self.last_targets.is_empty() {
+            self.toast_warn("No previous target manifest available");
+        } else {
+            self.rescan_targets = Some(self.last_targets.clone());
+            self.pending_start = true;
+            self.toast_info("Re-running the identical target set");
+        }
+    }
+
+    fn generate_new_sample(&mut self) {
+        let generated = if self.explicit_target_source.is_some() {
+            self.regenerate_explicit_preview()
+        } else {
+            self.regenerate_preview()
+        };
+        if generated {
+            self.watch_source_fingerprint = None;
+            self.rescan_targets = Some(self.preview_targets.clone());
+            self.pending_start = true;
+        }
+    }
+
+    fn enter_customization(&mut self) {
+        self.screen = Screen::Wizard;
+        self.wizard_step = WizardStep::Settings;
+        self.return_to_results = true;
+        self.edit_field = None;
+        self.edit_buffer.clear();
+        self.cursor = 0;
+        self.focus_index = 0;
+        self.focus_target = FocusTarget::Field;
+        self.toast_info("Customize scan parameters; results are preserved until Start");
+    }
+
+    fn return_to_results(&mut self) {
+        self.screen = Screen::Scanning;
+        self.return_to_results = false;
+        self.focus_index = 0;
+        self.focus_target = FocusTarget::Table;
+        self.toast_info("Returned to previous scan results");
     }
 
     fn open_speed_selection(&mut self) {
@@ -2801,6 +2947,8 @@ impl App {
                         WizardStep::Review => WizardStep::Settings,
                     };
                     self.cursor = 0;
+                } else if self.return_to_results {
+                    self.return_to_results();
                 }
             }
             ButtonAction::Next => {
@@ -2823,6 +2971,8 @@ impl App {
             ButtonAction::Quit => {
                 if self.screen == Screen::Scanning && !self.scan_complete {
                     self.confirm_quit = true;
+                } else if self.screen == Screen::Wizard && self.return_to_results {
+                    self.return_to_results();
                 } else {
                     self.should_quit = true;
                 }
@@ -2833,6 +2983,11 @@ impl App {
                 self.paused.store(next, Ordering::Relaxed);
             }
             ButtonAction::SpeedTest => self.open_speed_selection(),
+            ButtonAction::CustomizeScan => {
+                if self.screen == Screen::Scanning && self.scan_complete {
+                    self.enter_customization();
+                }
+            }
             ButtonAction::ConfirmQuit => self.should_quit = true,
             ButtonAction::CancelQuit => self.confirm_quit = false,
             ButtonAction::SpeedAll => {
@@ -2989,10 +3144,54 @@ mod tests {
 
         app.confirm_quit = false;
         app.scan_complete = true;
-        assert_eq!(app.focus_count(), 4);
-        app.focus_index = 3;
+        assert_eq!(app.focus_count(), 5);
+        app.focus_index = 4;
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn completed_results_can_customize_and_return_without_rerunning() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(1);
+        app.scan_complete = true;
+        app.last_targets = vec!["192.0.2.1".to_string()];
+        app.results = vec![result("192.0.2.1", 0, 0.02)];
+        app.handle_key(KeyCode::Char('w'), KeyModifiers::NONE);
+        assert_eq!(app.screen, Screen::Wizard);
+        assert_eq!(app.wizard_step, WizardStep::Settings);
+        assert!(app.return_to_results);
+        assert_eq!(app.last_targets, vec!["192.0.2.1"]);
+        assert_eq!(app.results.len(), 1);
+
+        app.wizard_step = WizardStep::Ranges;
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.screen, Screen::Scanning);
+        assert!(!app.return_to_results);
+        assert!(app.scan_complete);
+        assert_eq!(app.results.len(), 1);
+    }
+
+    #[test]
+    fn completed_results_command_palette_is_contextual() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(1);
+        app.scan_complete = true;
+        app.open_command_palette();
+        let actions = app.filtered_actions();
+        assert!(actions.contains(&Action::CustomizeScan));
+        assert!(actions.contains(&Action::ConfigureColumns));
+        assert!(actions.contains(&Action::ToggleFailures));
+        assert!(!actions.contains(&Action::Next));
+        assert!(!actions.contains(&Action::Start));
     }
 
     #[test]
