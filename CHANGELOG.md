@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.14.0](https://github.com/nexuslibs/cleanscan/compare/v0.13.0...v0.14.0) (2026-07-21)
+
+
+### Features
+
+* add health checks and advanced scanning settings to configuration ([393e48b](https://github.com/nexuslibs/cleanscan/commit/393e48b1e8db4538b3b634b14d5b71e9d490ebac))
+* enforce per-required-check thresholds and add two-phase focus C… ([d7a24e0](https://github.com/nexuslibs/cleanscan/commit/d7a24e09b0c8cabd4e1dc95541928082ea8d3e07))
+* enforce per-required-check thresholds and add two-phase focus CIDR limit ([d2b5c8a](https://github.com/nexuslibs/cleanscan/commit/d2b5c8a517751eb2c454006587e85f65d547db76))
+* enhance profile result merging and dashboard rendering with additional metrics ([991b107](https://github.com/nexuslibs/cleanscan/commit/991b10736399df3fae3e8c2d0043fbcc71f23438))
+* refine early stop pruning logic and enhance UI settings for concurrency ([d8d4c76](https://github.com/nexuslibs/cleanscan/commit/d8d4c767d004f057be36e9496bae823baeb90501))
+* update host resolution logic and improve config validation in wizard ([9c6012f](https://github.com/nexuslibs/cleanscan/commit/9c6012fccedf2a5a7bb92a419de59fdd0bc3c11b))
+
+
+### Bug Fixes
+
+* simplify success rate calculation in run_profile_scan ([52ba011](https://github.com/nexuslibs/cleanscan/commit/52ba011ec15dcf809d81ea7840744d09c2e1a5b5))
+
 ## [0.13.0](https://github.com/nexuslibs/cleanscan/compare/v0.12.0...v0.13.0) (2026-07-19)
 
 
