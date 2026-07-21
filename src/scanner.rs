@@ -1483,9 +1483,9 @@ pub async fn run_scan(
     }
 
     let mut by_ip: BTreeMap<String, Vec<ProbeResult>> = BTreeMap::new();
-    for port in ports {
+    'ports: for port in ports {
         if cancel.load(Ordering::Relaxed) {
-            return;
+            break 'ports;
         }
         let mut port_args = (*args).clone();
         port_args.ports = vec![port];
@@ -1572,11 +1572,13 @@ pub async fn run_profile_scan(
     } else {
         args.ports.clone()
     };
-    for port in ports {
+    'ports: for port in ports {
+        let mut stop_after_port = false;
         let mut by_ip: BTreeMap<String, Vec<(HealthCheck, ProbeResult)>> = BTreeMap::new();
         for check in &checks {
             if cancel.load(Ordering::Relaxed) {
-                return;
+                stop_after_port = true;
+                break;
             }
             let mut check_args = (*args).clone();
             check_args.path = check.path.clone();
@@ -1599,11 +1601,18 @@ pub async fn run_profile_scan(
                     .or_default()
                     .push((check.clone(), result));
             }
+            if cancel.load(Ordering::Relaxed) {
+                stop_after_port = true;
+                break;
+            }
         }
         for (ip, entries) in by_ip {
             if let Some(merged) = merge_profile_results(&entries, &expected_checks) {
                 all_by_ip.entry(ip).or_default().push(merged);
             }
+        }
+        if stop_after_port {
+            break 'ports;
         }
     }
     for (_, results) in all_by_ip {

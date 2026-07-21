@@ -1086,13 +1086,19 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
             let value = if app.edit_field == Some(i) && f == SettingField::Ports {
                 CLOUDFLARE_HTTPS_PORTS
                     .iter()
-                    .map(|port| {
+                    .enumerate()
+                    .map(|(index, port)| {
                         let selected = app
                             .edit_buffer
                             .split(',')
                             .filter_map(|v| v.trim().parse::<u16>().ok())
                             .any(|value| value == *port);
-                        format!("{}{}", port, if selected { "✓" } else { "·" })
+                        format!(
+                            "{}{}{}",
+                            if index == app.port_cursor { "▸" } else { " " },
+                            port,
+                            if selected { "✓" } else { "·" }
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join(" ")

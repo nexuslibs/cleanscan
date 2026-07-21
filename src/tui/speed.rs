@@ -83,7 +83,7 @@ fn render_selection(app: &mut App, frame: &mut Frame, area: Rect) {
         1,
     ));
     app.speed_table_col_bounds.clear();
-    let widths = [5u16, 25, 11, 13, 13, 8];
+    let widths = [5u16, 25, 7, 11, 13, 13, 8];
     let mut x = table_inner.x;
     for (column, width) in widths.into_iter().enumerate() {
         let end = if column == widths.len() - 1 {
@@ -201,7 +201,7 @@ fn render_selection(app: &mut App, frame: &mut Frame, area: Rect) {
                     Constraint::Length(11),
                     Constraint::Length(13),
                     Constraint::Length(13),
-                    Constraint::Min(8),
+                    Constraint::Length(8),
                 ],
             )
             .header(header),
