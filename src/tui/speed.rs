@@ -443,8 +443,8 @@ fn render_results(app: &mut App, frame: &mut Frame, area: Rect) {
     let header = Row::new(vec![
         Cell::from("IP"),
         Cell::from("Port"),
-        Cell::from("Download"),
-        Cell::from("Upload"),
+        Cell::from("DL med [p10-p90]"),
+        Cell::from("UL med [p10-p90]"),
         Cell::from("Status"),
     ])
     .style(theme::title_style());
@@ -506,7 +506,7 @@ fn format_measurement(value: Option<&crate::speed::SpeedMeasurement>) -> String 
                 }
             };
             format!(
-                "{}/{}/{}",
+                "{} ({}-{})",
                 compact(measurement.median_bytes_per_second),
                 compact(measurement.p10_bytes_per_second),
                 compact(measurement.p90_bytes_per_second)
@@ -521,12 +521,12 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
             ("s", "reverse sort"),
             ("Tab", "focus"),
             ("Space", "select"),
-            ("↵", "start"),
+            (widgets::enter_key(), "start"),
             ("/", "commands"),
             ("?", "help"),
             ("Esc", "back"),
         ],
-        Screen::SpeedTesting => &[("q", "quit")],
+        Screen::SpeedTesting => &[("Esc", "cancel"), ("q", "quit")],
         Screen::SpeedResults => &[
             ("Tab", "focus"),
             ("c", "copy"),

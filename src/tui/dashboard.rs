@@ -53,6 +53,7 @@ const WIDTHS: [Constraint; 14] = [
 pub fn render(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) {
     if area.width < 48 || area.height < 10 {
         render_micro(app, frame, area);
+        render_result_details(app, frame, area, elapsed);
         return;
     }
 
@@ -78,7 +79,7 @@ fn render_micro(app: &mut App, frame: &mut Frame, area: Rect) {
         Constraint::Length(2),
     ])
     .split(area);
-    render_header(app, frame, chunks[0]);
+    render_micro_header(app, frame, chunks[0]);
     render_compact_stats(app, frame, chunks[1]);
 
     let block = widgets::panel_block("Results — Enter details", app.focus_index == 0);
@@ -91,19 +92,26 @@ fn render_micro(app: &mut App, frame: &mut Frame, area: Rect) {
         (inner.x.saturating_add(4), inner.x.saturating_add(4 + 12)),
         (inner.right().saturating_sub(10), inner.right()),
     ];
-    let visible = inner.height as usize;
+    let visible = inner.height.saturating_sub(1) as usize;
     let display_len = app.sorted_results().len().min(app.config.top);
     app.result_cursor = app.result_cursor.min(display_len.saturating_sub(1));
+    let max_start = display_len.saturating_sub(visible);
+    app.scroll = app
+        .scroll
+        .max(app.result_cursor.saturating_sub(visible.saturating_sub(1)))
+        .min(app.result_cursor)
+        .min(max_start);
     let sorted = app.sorted_results();
     let rows = sorted
         .iter()
+        .skip(app.scroll)
         .take(visible)
         .enumerate()
         .map(|(index, result)| {
             let status = result_status(result);
-            let selected = index == app.result_cursor;
+            let selected = app.scroll + index == app.result_cursor;
             Row::new(vec![
-                Cell::from(format!("{}", index + 1)),
+                Cell::from(format!("{}", app.scroll + index + 1)),
                 Cell::from(result.ip.clone()),
                 Cell::from(fmt_ms(result.p95)),
                 Cell::from(status),
@@ -133,11 +141,33 @@ fn render_micro(app: &mut App, frame: &mut Frame, area: Rect) {
         chunks[3],
         &[
             ("↑/↓", "select"),
-            ("↵", "details"),
+            (widgets::enter_key(), "details"),
             ("Esc", "quit"),
             ("q", "quit"),
         ],
         app.visible_message(),
+    );
+}
+
+fn render_micro_header(app: &App, frame: &mut Frame, area: Rect) {
+    let status = match app.scan_lifecycle {
+        ScanLifecycle::Completed => "DONE",
+        ScanLifecycle::Paused => "PAUSED",
+        ScanLifecycle::Cancelling => "CANCELLING",
+        ScanLifecycle::Failed => "FAILED",
+        ScanLifecycle::Cancelled => "CANCELLED",
+        ScanLifecycle::Running => "SCANNING",
+    };
+    let status_text = if status == "SCANNING" {
+        format!("{} {}", widgets::spinner_frame(app.tick), status)
+    } else {
+        status.to_string()
+    };
+    widgets::app_header(
+        frame,
+        area,
+        Some((&status_text, theme::status_style(status))),
+        &[],
     );
 }
 
@@ -379,7 +409,7 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     let hints: &[widgets::KeyHint] = if app.scan_complete {
         &[
             ("Tab", "focus"),
-            ("↵", "details"),
+            (widgets::enter_key(), "details"),
             ("e", "export"),
             ("t", "speed"),
             ("f", "failures"),
@@ -390,7 +420,7 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     } else {
         &[
             ("Tab", "focus"),
-            ("↵", "details"),
+            (widgets::enter_key(), "details"),
             ("p", "pause"),
             ("c", "copy"),
             ("/", "commands"),
@@ -1161,7 +1191,10 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
             // Star the composite-score recommendation wherever it lands in the sort.
             let is_first = best_ip.as_deref() == Some(r.ip.as_str());
             let (ip_text, rank_text) = if is_first {
-                (format!("★ {}", r.ip), format!(" {rank}"))
+                (
+                    format!("{} {}", widgets::best_marker(), r.ip),
+                    format!(" {rank}"),
+                )
             } else {
                 (r.ip.clone(), rank.to_string())
             };
@@ -1416,7 +1449,7 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     let hints: &[widgets::KeyHint] = if app.scan_complete {
         &[
             ("Tab", "focus"),
-            ("↵", "details"),
+            (widgets::enter_key(), "details"),
             ("c", "copy"),
             ("e", "export"),
             ("t", "speed test"),
@@ -1433,7 +1466,7 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     } else {
         &[
             ("Tab", "focus"),
-            ("↵", "details"),
+            (widgets::enter_key(), "details"),
             ("p", "pause"),
             ("c", "copy"),
             ("/", "commands"),

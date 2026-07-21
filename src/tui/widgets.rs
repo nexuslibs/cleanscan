@@ -5,6 +5,7 @@
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
+    symbols::border,
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
@@ -37,10 +38,22 @@ impl ToastKind {
     /// Leading glyph that reinforces severity without relying on color alone.
     pub fn glyph(self) -> &'static str {
         match self {
-            ToastKind::Info => "•",
-            ToastKind::Success => "✓",
+            ToastKind::Info => {
+                if ascii_mode() {
+                    "-"
+                } else {
+                    "•"
+                }
+            }
+            ToastKind::Success => checked_marker(),
             ToastKind::Warn => "!",
-            ToastKind::Error => "✗",
+            ToastKind::Error => {
+                if ascii_mode() {
+                    "X"
+                } else {
+                    "✗"
+                }
+            }
         }
     }
 }
@@ -55,6 +68,65 @@ pub enum ButtonKind {
 }
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const ASCII_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+
+fn ascii_mode() -> bool {
+    std::env::var_os("CLEANSCAN_ASCII").is_some_and(|value| !value.is_empty())
+        || std::env::var("TERM").is_ok_and(|term| term == "dumb")
+}
+
+pub fn focus_marker() -> &'static str {
+    if ascii_mode() {
+        ">"
+    } else {
+        "›"
+    }
+}
+pub fn step_done_marker() -> &'static str {
+    if ascii_mode() {
+        "[x]"
+    } else {
+        "✓"
+    }
+}
+pub fn step_current_marker() -> &'static str {
+    if ascii_mode() {
+        ">"
+    } else {
+        "▸"
+    }
+}
+pub fn checked_marker() -> &'static str {
+    if ascii_mode() {
+        "x"
+    } else {
+        "✓"
+    }
+}
+pub fn checkbox_checked_symbol() -> &'static str {
+    if ascii_mode() {
+        "[x]"
+    } else {
+        "[✓]"
+    }
+}
+pub fn checkbox_unchecked_symbol() -> &'static str {
+    "[ ]"
+}
+pub fn best_marker() -> &'static str {
+    if ascii_mode() {
+        "*"
+    } else {
+        "★"
+    }
+}
+pub fn enter_key() -> &'static str {
+    if ascii_mode() {
+        "Enter"
+    } else {
+        "↵"
+    }
+}
 
 /// A titled, rounded container block styled from the theme. `focused` panels use
 /// the active border color; all others use the idle border color. Passing an
@@ -62,7 +134,11 @@ const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 pub fn panel_block(title: &str, focused: bool) -> Block<'static> {
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_set(theme::BORDER_SET)
+        .border_set(if ascii_mode() {
+            border::PLAIN
+        } else {
+            theme::BORDER_SET
+        })
         .border_style(if focused {
             theme::border_active_style()
         } else {
@@ -70,7 +146,15 @@ pub fn panel_block(title: &str, focused: bool) -> Block<'static> {
         });
     if !title.is_empty() {
         block = block.title(Span::styled(
-            format!(" {}{} ", if focused { "› " } else { "" }, title.trim()),
+            format!(
+                " {}{} ",
+                if focused {
+                    format!("{} ", focus_marker())
+                } else {
+                    String::new()
+                },
+                title.trim()
+            ),
             theme::panel_title_style(),
         ));
     }
@@ -145,7 +229,11 @@ pub fn app_header(
 
 /// Current spinner glyph for an animation `tick` (advances once per frame).
 pub fn spinner_frame(tick: u64) -> &'static str {
-    SPINNER_FRAMES[(tick as usize) % SPINNER_FRAMES.len()]
+    if ascii_mode() {
+        ASCII_SPINNER_FRAMES[(tick as usize) % ASCII_SPINNER_FRAMES.len()]
+    } else {
+        SPINNER_FRAMES[(tick as usize) % SPINNER_FRAMES.len()]
+    }
 }
 
 /// Render the shared brand badge followed by a numbered step progress strip,
@@ -160,9 +248,9 @@ pub fn stepper_header(frame: &mut Frame, area: Rect, steps: &[&str], current: us
     for (i, label) in steps.iter().enumerate() {
         spans.push(Span::styled(" │", theme::hint_style()));
         let (marker, style) = if i < current {
-            ("✓", theme::good_style())
+            (step_done_marker(), theme::good_style())
         } else if i == current {
-            ("▸", theme::highlight_style())
+            (step_current_marker(), theme::highlight_style())
         } else {
             (" ", theme::hint_style())
         };
@@ -203,7 +291,18 @@ pub fn hint_line(hints: &[KeyHint], max_width: u16) -> Line<'static> {
     let mut used = 0usize;
     let mut truncated = false;
 
-    for (i, (keys, action)) in hints.iter().enumerate() {
+    let total = hints
+        .iter()
+        .enumerate()
+        .map(|(i, (keys, action))| {
+            keys.chars().count() + 1 + action.chars().count() + if i == 0 { 0 } else { sep_len }
+        })
+        .sum::<usize>();
+    let mut ordered = hints.to_vec();
+    if total > budget {
+        ordered.sort_by_key(|(_, action)| !matches!(*action, "quit" | "cancel" | "back"));
+    }
+    for (i, (keys, action)) in ordered.iter().enumerate() {
         // ` key action` per chip; +1 for the space between key and action.
         let chip_len = keys.chars().count() + 1 + action.chars().count();
         let lead = if i == 0 { 0 } else { sep_len };
@@ -251,7 +350,9 @@ pub fn status_bar(
 
 #[cfg(test)]
 mod tests {
-    use super::{hint_line, spinner_frame, ToastKind, SPINNER_FRAMES};
+    use super::{
+        ascii_mode, hint_line, spinner_frame, ToastKind, ASCII_SPINNER_FRAMES, SPINNER_FRAMES,
+    };
 
     fn line_text(line: &ratatui::text::Line) -> String {
         line.spans
@@ -274,20 +375,25 @@ mod tests {
     fn hint_line_truncates_with_ellipsis_when_narrow() {
         let hints = [("Tab", "focus"), ("Enter", "details"), ("q", "quit")];
         let text = line_text(&hint_line(&hints, 12));
-        // The first chip is always kept; the rest are dropped with an ellipsis.
-        assert!(text.contains("focus"));
+        // Safety actions are retained before optional navigation hints.
+        assert!(text.contains("quit"));
         assert!(text.contains('…'));
-        assert!(!text.contains("quit"));
+        assert!(!text.contains("details"));
     }
 
     #[test]
     fn spinner_cycles_through_all_frames() {
-        assert_eq!(spinner_frame(0), SPINNER_FRAMES[0]);
-        assert_eq!(spinner_frame(1), SPINNER_FRAMES[1]);
+        let frames = if ascii_mode() {
+            &ASCII_SPINNER_FRAMES[..]
+        } else {
+            &SPINNER_FRAMES[..]
+        };
+        assert_eq!(spinner_frame(0), frames[0]);
+        assert_eq!(spinner_frame(1), frames[1]);
         // Wraps around after the last frame.
-        let len = SPINNER_FRAMES.len() as u64;
-        assert_eq!(spinner_frame(len), SPINNER_FRAMES[0]);
-        assert_eq!(spinner_frame(len + 3), SPINNER_FRAMES[3]);
+        let len = frames.len() as u64;
+        assert_eq!(spinner_frame(len), frames[0]);
+        assert_eq!(spinner_frame(len + 3), frames[3]);
     }
 
     #[test]

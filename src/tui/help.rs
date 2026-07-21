@@ -2,7 +2,7 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Paragraph, Wrap},
     Frame,
 };
 use std::time::Duration;
@@ -32,7 +32,10 @@ pub fn overlay(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) 
         Screen::SpeedResults => speed_results_lines(),
     };
 
-    let para = Paragraph::new(lines).style(Style::default());
+    let para = Paragraph::new(lines)
+        .style(Style::default())
+        .wrap(Wrap { trim: false })
+        .scroll((app.help_scroll.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(para, inner);
 }
 
@@ -49,6 +52,7 @@ fn wizard_lines(step: WizardStep) -> Vec<Line<'static>> {
         key("↑ / ↓  or  k / j", "Move cursor through the list"),
         key("Tab / Shift+Tab", "Move focus between controls"),
         key("Enter / Esc", "Activate or go back"),
+        key("↑ / ↓ / PgUp", "Scroll this help on short terminals"),
         key("/", "Search the command palette"),
         key("?  Esc  q", "Close this help"),
         key("q", "Quit cleanscan"),

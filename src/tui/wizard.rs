@@ -891,7 +891,8 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
         // Cursor marker gutter (mirrors the list highlight symbol).
         if idx == app.cursor {
             frame.render_widget(
-                Paragraph::new("› ").style(theme::row_selected_style()),
+                Paragraph::new(format!("{} ", widgets::focus_marker()))
+                    .style(theme::row_selected_style()),
                 Rect {
                     x: inner.x,
                     y,
@@ -901,8 +902,8 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
             );
         }
         let checkbox = Checkbox::new(e.cidr.clone(), e.selected)
-            .checked_symbol("[✓]")
-            .unchecked_symbol("[ ]")
+            .checked_symbol(widgets::checkbox_checked_symbol())
+            .unchecked_symbol(widgets::checkbox_unchecked_symbol())
             .style(if idx == app.cursor || e.selected {
                 theme::row_selected_style()
             } else {
@@ -1127,9 +1128,17 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
                             .any(|value| value == *port);
                         format!(
                             "{}{}{}",
-                            if index == app.port_cursor { "▸" } else { " " },
+                            if index == app.port_cursor {
+                                widgets::focus_marker()
+                            } else {
+                                " "
+                            },
                             port,
-                            if selected { "✓" } else { "·" }
+                            if selected {
+                                widgets::checked_marker()
+                            } else {
+                                "·"
+                            }
                         )
                     })
                     .collect::<Vec<_>>()
@@ -1159,7 +1168,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         List::new(items)
             .block(block)
             .highlight_style(theme::row_selected_style())
-            .highlight_symbol("› "),
+            .highlight_symbol(widgets::focus_marker()),
         main_layout[0],
         &mut app.settings_list_state,
     );
@@ -1490,12 +1499,16 @@ fn render_hint(app: &App, frame: &mut Frame, area: Rect) {
     let hints: &[widgets::KeyHint] = match app.wizard_step {
         WizardStep::Ranges => {
             if app.custom_input_mode {
-                &[("type", "CIDR"), ("↵", "confirm"), ("Esc", "cancel")]
+                &[
+                    ("type", "CIDR"),
+                    (widgets::enter_key(), "confirm"),
+                    ("Esc", "cancel"),
+                ]
             } else {
                 &[
                     ("Tab", "focus"),
                     ("Space", "toggle"),
-                    ("↵", "next"),
+                    (widgets::enter_key(), "next"),
                     ("/", "commands"),
                     ("?", "help"),
                 ]
@@ -1507,13 +1520,13 @@ fn render_hint(app: &App, frame: &mut Frame, area: Rect) {
                     ("type", "value"),
                     ("←/→", "move"),
                     ("↑/↓", "step"),
-                    ("↵", "confirm"),
+                    (widgets::enter_key(), "confirm"),
                     ("Esc", "cancel"),
                 ]
             } else {
                 &[
                     ("Tab", "focus"),
-                    ("↵", "edit/next"),
+                    (widgets::enter_key(), "edit/next"),
                     ("↑/↓", "move"),
                     ("x", "advanced"),
                     ("/", "commands"),
@@ -1523,7 +1536,7 @@ fn render_hint(app: &App, frame: &mut Frame, area: Rect) {
         }
         WizardStep::Review => &[
             ("Tab", "focus"),
-            ("↵", "start"),
+            (widgets::enter_key(), "start"),
             ("s", "new sample"),
             ("c", "save targets"),
             ("Esc", "back"),

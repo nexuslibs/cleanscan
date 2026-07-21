@@ -293,6 +293,8 @@ pub struct App {
     pub start_time: Instant,
     /// Help overlay visibility.
     pub show_help: bool,
+    /// Vertical scroll offset for contextual help on short terminals.
+    pub help_scroll: usize,
     /// Animation frame counter, advanced once per event-loop iteration.
     pub tick: u64,
     /// Last known mouse position, used for button hover styling.
@@ -679,6 +681,7 @@ impl App {
             column_picker_cursor: 0,
             start_time: Instant::now(),
             show_help: false,
+            help_scroll: 0,
             tick: 0,
             hover_pos: None,
             throughput: Vec::new(),
@@ -2149,6 +2152,16 @@ impl App {
                 KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q')
             ) {
                 self.show_help = false;
+                self.help_scroll = 0;
+            } else {
+                match code {
+                    KeyCode::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
+                    KeyCode::Down => self.help_scroll = self.help_scroll.saturating_add(1),
+                    KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(8),
+                    KeyCode::PageDown => self.help_scroll = self.help_scroll.saturating_add(8),
+                    KeyCode::Home => self.help_scroll = 0,
+                    _ => {}
+                }
             }
             return;
         }
@@ -2170,6 +2183,7 @@ impl App {
             }
             KeyCode::Char('?') => {
                 self.show_help = !self.show_help;
+                self.help_scroll = 0;
                 return;
             }
             KeyCode::Char('/') if self.screen == Screen::SpeedSelect => {
@@ -2257,7 +2271,10 @@ impl App {
                 }
             }
             Action::CloseDetails => self.show_result_details = false,
-            Action::OpenHelp => self.show_help = true,
+            Action::OpenHelp => {
+                self.show_help = true;
+                self.help_scroll = 0;
+            }
             Action::OpenCommandPalette => self.open_command_palette(),
             Action::ConfigureColumns => {
                 if self.screen == Screen::Scanning {
@@ -2418,7 +2435,7 @@ impl App {
         frame.render_stateful_widget(
             ratatui::widgets::List::new(items)
                 .highlight_style(theme::row_selected_style())
-                .highlight_symbol("› "),
+                .highlight_symbol(widgets::focus_marker()),
             body[0],
             &mut self.column_picker_list_state,
         );
@@ -2441,7 +2458,7 @@ impl App {
             return;
         };
         let actions = self.filtered_actions();
-        let visible = inner.height.saturating_sub(3) as usize;
+        let visible = inner.height.saturating_sub(3).saturating_div(2) as usize;
         self.command_cursor = self.command_cursor.min(actions.len().saturating_sub(1));
         let start = self
             .command_cursor
@@ -2455,17 +2472,17 @@ impl App {
                 } else {
                     ratatui::style::Style::default()
                 };
-                ratatui::widgets::ListItem::new(
+                ratatui::widgets::ListItem::new(vec![
                     Line::from(vec![
                         Span::styled(format!(" {:<24}", action.label()), style),
                         Span::styled(
                             format!(" {:<6}", action.shortcut()),
                             theme::highlight_style(),
                         ),
-                        Span::styled(action.description(), theme::hint_style()),
                     ])
                     .style(style),
-                )
+                    Line::from(format!("   {}", action.description())).style(theme::hint_style()),
+                ])
             })
             .collect::<Vec<_>>();
         let chunks = Layout::default()
@@ -2503,7 +2520,7 @@ impl App {
         frame.render_stateful_widget(
             ratatui::widgets::List::new(items)
                 .highlight_style(theme::row_selected_style())
-                .highlight_symbol("› "),
+                .highlight_symbol(widgets::focus_marker()),
             chunks[1],
             &mut self.command_list_state,
         );
@@ -3850,11 +3867,12 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("[✓]"));
+        assert!(rendered.contains("[✓]") || rendered.contains("[x]"));
         assert!(rendered.contains("[ ]"));
 
         assert!(terminal.backend().buffer().content().iter().any(|cell| {
-            cell.symbol() == "✓" && cell.modifier.contains(ratatui::style::Modifier::BOLD)
+            (cell.symbol() == "✓" || cell.symbol() == "x")
+                && cell.modifier.contains(ratatui::style::Modifier::BOLD)
         }));
     }
 
@@ -3952,6 +3970,42 @@ mod tests {
         app.show_result_details = true;
         draw(&mut app, 80, 24);
         draw(&mut app, 79, 23);
+    }
+
+    #[test]
+    fn micro_dashboard_keeps_scrolling_and_details_available() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(12);
+        for index in 0..12 {
+            app.add_result(result(&format!("192.0.2.{}", index + 1), 0, 0.04));
+        }
+        app.result_cursor = 11;
+        app.show_result_details = true;
+        draw(&mut app, 40, 12);
+        std::thread::sleep(Duration::from_millis(160));
+        draw(&mut app, 40, 12);
+        assert!(app.scroll > 0);
+        assert!(app.result_details_overlay.inner_area().is_some());
+    }
+
+    #[test]
+    fn help_scroll_is_keyboard_accessible() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.show_help = true;
+        app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.help_scroll, 1);
+        app.handle_key(KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(app.help_scroll, 9);
+        app.handle_key(KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(app.help_scroll, 0);
     }
 
     #[test]
