@@ -1,0 +1,25 @@
+name: Conventional Commits
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  validate-title:
+    name: Validate PR title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Conventional Commit title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        shell: bash
+        run: |
+          pattern='^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\([[:alnum:]._/-]+\))?!?:[[:space:]]+[^[:space:]].*'
+          if [[ ! "$TITLE" =~ $pattern ]]; then
+            echo "Invalid pull request title: $TITLE"
+            echo "Use: type(scope): description, for example 'fix(scanner): handle timeout'"
+            exit 1
+          fi

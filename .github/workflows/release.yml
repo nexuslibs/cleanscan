@@ -7,7 +7,11 @@ on:
     inputs:
       tag:
         description: Existing vX.Y.Z tag to rebuild or republish
-        required: true
+        required: false
+        type: string
+      release_as:
+        description: Version to use for a one-time catch-up release (for example 0.15.1)
+        required: false
         type: string
 
 concurrency:
@@ -26,12 +30,12 @@ jobs:
       contents: write
       pull-requests: write
     outputs:
-      should_build: ${{ github.event_name == 'workflow_dispatch' && steps.manual.outputs.should_build || steps.release.outputs.should_build }}
-      tag_name: ${{ github.event_name == 'workflow_dispatch' && steps.manual.outputs.tag_name || steps.release.outputs.tag_name }}
+      should_build: ${{ github.event_name == 'workflow_dispatch' && inputs.release_as != '' && steps.release.outputs.should_build || github.event_name == 'workflow_dispatch' && steps.manual.outputs.should_build || steps.release.outputs.should_build }}
+      tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_as != '' && steps.release.outputs.tag_name || github.event_name == 'workflow_dispatch' && steps.manual.outputs.tag_name || steps.release.outputs.tag_name }}
     steps:
       - name: Run Release Please
         id: release_please
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.release_as != '')
         uses: googleapis/release-please-action@v4
         with:
           # A dedicated token is required when the repository disallows the
@@ -39,10 +43,11 @@ jobs:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+          release-as: ${{ inputs.release_as }}
 
       - name: Select the generated release
         id: release
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.release_as != '')
         env:
           RELEASE_CREATED: ${{ steps.release_please.outputs.release_created }}
           TAG_NAME: ${{ steps.release_please.outputs.tag_name }}
@@ -52,11 +57,16 @@ jobs:
 
       - name: Select a manually requested release
         id: manual
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && inputs.release_as == ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ inputs.tag }}
         run: |
+          test -n "$TAG_NAME" || {
+            echo "Provide either release_as or tag" >&2
+            exit 1
+          }
+
           case "$TAG_NAME" in
             v[0-9]*.[0-9]*.[0-9]*) ;;
             *) echo "tag must use the vX.Y.Z format" >&2; exit 1 ;;
