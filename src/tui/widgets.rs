@@ -71,8 +71,12 @@ const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 const ASCII_SPINNER_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 
 fn ascii_mode() -> bool {
-    std::env::var_os("CLEANSCAN_ASCII").is_some_and(|value| !value.is_empty())
-        || std::env::var("TERM").is_ok_and(|term| term == "dumb")
+    std::env::var("CLEANSCAN_ASCII").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    }) || std::env::var("TERM").is_ok_and(|term| term == "dumb")
 }
 
 pub fn focus_marker() -> &'static str {
@@ -112,6 +116,20 @@ pub fn checkbox_checked_symbol() -> &'static str {
 }
 pub fn checkbox_unchecked_symbol() -> &'static str {
     "[ ]"
+}
+pub fn unchecked_marker() -> &'static str {
+    if ascii_mode() {
+        "."
+    } else {
+        "·"
+    }
+}
+pub fn workload_separator() -> &'static str {
+    if ascii_mode() {
+        " - "
+    } else {
+        " • "
+    }
 }
 pub fn best_marker() -> &'static str {
     if ascii_mode() {

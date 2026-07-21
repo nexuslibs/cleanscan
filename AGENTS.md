@@ -17,6 +17,23 @@ cargo test --locked
 - Clippy uses `-D warnings`; unused fields/vars break the build, not just lint.
 - Run one test: `cargo test <test_name>` (substring match). `cargo test --lib` does **not** work in this bin crate.
 
+## Branch and commit enforcement
+
+- `.github/workflows/conventional-commits.yml` validates PR titles, not branch
+  names. Branch names therefore have no workflow-enforced prefix or pattern.
+- PR titles must match the workflow's Conventional Commit pattern:
+  `type(scope): description`. Allowed types are `build`, `chore`, `ci`, `docs`,
+  `feat`, `fix`, `perf`, `refactor`, `revert`, `style`, and `test`; scope and
+  the `!` breaking-change marker are optional. Scope characters are limited to
+  letters, numbers, `.`, `_`, `/`, and `-`.
+- Commit messages should use the same format so Release Please can classify
+  releases correctly. Examples: `feat(tui): add ASCII rendering`,
+  `fix(scanner): handle timeout`, `docs: clarify release workflow`, and
+  `feat!: change the export schema`.
+- Breaking changes may also use a `BREAKING CHANGE:` footer. The subject must
+  be imperative, concise, and non-empty; free-form messages such as `update
+  stuff` are invalid.
+
 ## Embedded data
 
 `src/colo_db.json` (Cloudflare `colo` code → country) is compiled in via `include_str!` in `colo.rs`. Editing it needs only a rebuild — there is no runtime asset path. Verify entries against the live Cloudflare colo list; the lookup is case-insensitive and unknown codes resolve to `None` (never error).

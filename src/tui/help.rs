@@ -34,8 +34,12 @@ pub fn overlay(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) 
 
     let para = Paragraph::new(lines)
         .style(Style::default())
-        .wrap(Wrap { trim: false })
-        .scroll((app.help_scroll.min(u16::MAX as usize) as u16, 0));
+        .wrap(Wrap { trim: false });
+    let max_scroll = para
+        .line_count(inner.width)
+        .saturating_sub(inner.height as usize);
+    let scroll = app.help_scroll.min(max_scroll).min(u16::MAX as usize) as u16;
+    let para = para.scroll((scroll, 0));
     frame.render_widget(para, inner);
 }
 
@@ -52,7 +56,10 @@ fn wizard_lines(step: WizardStep) -> Vec<Line<'static>> {
         key("↑ / ↓  or  k / j", "Move cursor through the list"),
         key("Tab / Shift+Tab", "Move focus between controls"),
         key("Enter / Esc", "Activate or go back"),
-        key("↑ / ↓ / PgUp", "Scroll this help on short terminals"),
+        key(
+            "↑ / ↓ / PgUp / PgDn / Home",
+            "Scroll this help on short terminals",
+        ),
         key("/", "Search the command palette"),
         key("?  Esc  q", "Close this help"),
         key("q", "Quit cleanscan"),

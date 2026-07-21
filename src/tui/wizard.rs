@@ -1137,7 +1137,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
                             if selected {
                                 widgets::checked_marker()
                             } else {
-                                "·"
+                                widgets::unchecked_marker()
                             }
                         )
                     })
@@ -1216,7 +1216,11 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     desc_para_lines.insert(
         1,
         Line::from(Span::styled(
-            format!("Estimated workload: {total_ips} targets • {total_probes} probes"),
+            format!(
+                "Estimated workload: {total_ips} targets{}{} probes",
+                widgets::workload_separator(),
+                total_probes
+            ),
             theme::subtitle_style(),
         )),
     );
