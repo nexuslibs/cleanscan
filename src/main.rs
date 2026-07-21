@@ -148,7 +148,7 @@ pub struct Args {
     #[arg(long)]
     pub no_early_stop_prune: bool,
 
-    /// Score margin a target must beat the worst top-N candidate by to keep probing.
+    /// Tolerance for a target being worse than the worst top-N candidate before pruning.
     #[arg(long)]
     pub early_stop_prune_margin: Option<f64>,
 
@@ -561,14 +561,37 @@ fn healthy_result(
     thresholds: HealthThresholds,
     min_confidence: &str,
 ) -> bool {
-    result.ok > 0
-        && result.health_ok
-        && thresholds
+    let required_checks = result
+        .checks
+        .iter()
+        .filter(|check| check.required)
+        .collect::<Vec<_>>();
+    let success_rate_ok = if required_checks.is_empty() {
+        thresholds
             .min_success_rate
             .is_none_or(|min| result.success_rate >= min)
-        && thresholds
+    } else {
+        required_checks.iter().all(|check| {
+            thresholds
+                .min_success_rate
+                .is_none_or(|min| check.success_rate >= min)
+        })
+    };
+    let p95_ok = if required_checks.is_empty() {
+        thresholds
             .max_p95_ms
             .is_none_or(|max| result.p95 * 1000.0 <= max)
+    } else {
+        required_checks.iter().all(|check| {
+            thresholds
+                .max_p95_ms
+                .is_none_or(|max| check.p95 * 1000.0 <= max)
+        })
+    };
+    result.ok > 0
+        && result.health_ok
+        && success_rate_ok
+        && p95_ok
         && confidence_rank(scanner::result_confidence(result)) >= confidence_rank(min_confidence)
 }
 
@@ -713,7 +736,7 @@ fn cli_mode(
             source_fingerprint,
         );
     }
-    let manifest_targets = targets.clone();
+    let mut manifest_targets = targets.clone();
     let total = targets.len();
     let use_two_phase = config.two_phase && !has_explicit_targets;
     if use_two_phase && !config.health_checks.is_empty() {
@@ -738,7 +761,7 @@ fn cli_mode(
 
     let rt = tokio::runtime::Runtime::new()?;
     if use_two_phase {
-        rt.block_on(scanner::run_scan_two_phase(
+        manifest_targets = rt.block_on(scanner::run_scan_two_phase(
             selected_cidrs,
             config_arc,
             colo.clone(),
@@ -1112,7 +1135,9 @@ fn cli_watch(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_manifest, normalize_config, write_manifest, HealthThresholds};
+    use super::{
+        build_manifest, healthy_result, normalize_config, write_manifest, HealthThresholds,
+    };
     use crate::config::AppConfig;
     use crate::scanner;
 
@@ -1128,6 +1153,122 @@ mod tests {
         assert_eq!(config.sample_per_cidr, 1);
         assert_eq!(config.probes, 1);
         assert_eq!(config.concurrency, 1);
+        assert_eq!(config.two_phase_focus_cidrs, 0);
+    }
+
+    #[test]
+    fn required_check_thresholds_are_all_enforced() {
+        let mut result = scanner::ProbeResult {
+            ip: "192.0.2.1".to_string(),
+            protocol: "h2".to_string(),
+            ok: 8,
+            fail: 0,
+            completed: 8,
+            avg: 0.01,
+            p50: 0.01,
+            p90: 0.01,
+            p95: 0.01,
+            max: 0.01,
+            jitter: 0.0,
+            stddev: 0.0,
+            loss: 0,
+            packet_loss: 0.0,
+            samples: vec![0.01; 8],
+            failures: Vec::new(),
+            diagnostics: Vec::new(),
+            success_rate: 1.0,
+            score: 1.0,
+            colo: None,
+            country: None,
+            cold_ms: None,
+            stopped_early: false,
+            min_score: 1.0,
+            max_score: 1.0,
+            success_rate_lower: 1.0,
+            success_rate_upper: 1.0,
+            score_confidence: 0.95,
+            decision: "competitive".to_string(),
+            checks: vec![
+                scanner::CheckResult {
+                    name: "primary".to_string(),
+                    path: "/health".to_string(),
+                    required: true,
+                    weight: 1.0,
+                    score: 1.0,
+                    healthy: true,
+                    ok: 8,
+                    fail: 0,
+                    completed: 8,
+                    success_rate: 1.0,
+                    avg: 0.01,
+                    p50: 0.01,
+                    p90: 0.01,
+                    p95: 0.01,
+                    max: 0.01,
+                    jitter: 0.0,
+                    stddev: 0.0,
+                    packet_loss: 0.0,
+                    cold_ms: None,
+                    colo: None,
+                },
+                scanner::CheckResult {
+                    name: "secondary".to_string(),
+                    path: "/ready".to_string(),
+                    required: true,
+                    weight: 1.0,
+                    score: 1.0,
+                    healthy: true,
+                    ok: 8,
+                    fail: 0,
+                    completed: 8,
+                    success_rate: 1.0,
+                    avg: 0.20,
+                    p50: 0.20,
+                    p90: 0.20,
+                    p95: 0.20,
+                    max: 0.20,
+                    jitter: 0.0,
+                    stddev: 0.0,
+                    packet_loss: 0.0,
+                    cold_ms: None,
+                    colo: None,
+                },
+            ],
+            health_ok: true,
+        };
+
+        assert!(!healthy_result(
+            &result,
+            HealthThresholds {
+                min_success_rate: Some(1.0),
+                max_p95_ms: Some(100.0),
+            },
+            "UNKNOWN"
+        ));
+
+        result.checks[1].p95 = 0.05;
+        assert!(healthy_result(
+            &result,
+            HealthThresholds {
+                min_success_rate: Some(1.0),
+                max_p95_ms: Some(100.0),
+            },
+            "UNKNOWN"
+        ));
+
+        for check in &mut result.checks {
+            check.required = false;
+        }
+        result.success_rate = 0.0;
+        result.p95 = 0.20;
+        assert!(!healthy_result(
+            &result,
+            HealthThresholds {
+                min_success_rate: Some(1.0),
+                max_p95_ms: Some(100.0),
+            },
+            "UNKNOWN"
+        ));
     }
 
     #[test]

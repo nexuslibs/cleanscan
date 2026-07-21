@@ -28,8 +28,16 @@ pub struct CheckResult {
     pub ok: usize,
     pub fail: usize,
     pub completed: usize,
+    pub success_rate: f64,
     pub avg: f64,
+    pub p50: f64,
+    pub p90: f64,
     pub p95: f64,
+    pub max: f64,
+    pub jitter: f64,
+    pub stddev: f64,
+    pub packet_loss: f64,
+    pub cold_ms: Option<f64>,
     pub colo: Option<String>,
 }
 
@@ -190,16 +198,30 @@ fn percentile(sorted: &[f64], pct: f64) -> f64 {
 /// full `ProbeResult`.
 fn score_from_samples(
     samples: &[f64],
+    cold_ms: Option<f64>,
+    ok: usize,
     completed: usize,
     loss: usize,
     stability_weight: f64,
     loss_weight: f64,
 ) -> f64 {
-    let ok = samples.len();
     if ok == 0 {
         return 0.0;
     }
-    let mut sorted = samples.to_vec();
+    let fallback = if samples.is_empty() {
+        cold_ms.map(|seconds| vec![seconds]).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let scoring_samples = if samples.is_empty() {
+        fallback.as_slice()
+    } else {
+        samples
+    };
+    if scoring_samples.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = scoring_samples.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let p50 = percentile(&sorted, 0.50);
     let p95 = percentile(&sorted, 0.95);
@@ -207,7 +229,8 @@ fn score_from_samples(
     let jitter = (p95 - p50).max(0.0);
     let total = completed.max(1);
     let reliability = ok as f64 / total as f64;
-    let latency_penalty = max.max(0.001);
+    let tail = (max - p95).max(0.0).min(p95.max(0.001));
+    let latency_penalty = p95.max(0.001) + 0.25 * tail;
     let loss_penalty = loss as f64 / total as f64;
     reliability / (latency_penalty + stability_weight * jitter + loss_weight * loss_penalty)
 }
@@ -246,6 +269,8 @@ fn bootstrap_score_interval(state: &TargetState, confidence: f64) -> (f64, f64) 
             .collect();
         scores.push(score_from_samples(
             &sample,
+            None,
+            state.ok,
             state.completed,
             state.loss,
             state.stability_weight,
@@ -429,6 +454,24 @@ pub fn collect_from_cidrs_with_seed(
     Ok(targets.into_iter().collect())
 }
 
+pub(crate) fn resolve_host_for_ip(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|host| host.split_once(']').map(|(name, _)| name))
+        .or_else(|| {
+            if host.parse::<IpAddr>().is_ok() {
+                return None;
+            }
+            host.rsplit_once(':').and_then(|(name, port)| {
+                if port.parse::<u16>().is_ok() {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or(host)
+}
+
 fn client_for_ip(host: &str, ip: &str, args: &AppConfig) -> Result<Client> {
     let ip_addr = IpAddr::from_str(ip)?;
     let socket = SocketAddr::new(ip_addr, 443);
@@ -436,7 +479,7 @@ fn client_for_ip(host: &str, ip: &str, args: &AppConfig) -> Result<Client> {
     let client = reqwest::Client::builder()
         .http2_adaptive_window(true)
         .no_proxy()
-        .resolve_to_addrs(host, &[socket])
+        .resolve_to_addrs(resolve_host_for_ip(host), &[socket])
         .redirect(if args.follow_redirects {
             reqwest::redirect::Policy::limited(10)
         } else {
@@ -571,19 +614,24 @@ fn validate_response(
         }
     }
     for expression in &args.required_headers {
-        let Some((name, expected)) = expression.split_once('=') else {
-            return Some(ProbeDiagnostic {
-                category: DiagnosticCategory::ValidationHeader,
-                phase: DiagnosticPhase::ResponseHeaders,
-                message: format!("invalid required header expression: {expression}"),
-                status: Some(status),
-                location: location.map(str::to_string),
-                elapsed_ms: None,
-            });
+        let (name, expected) = match crate::config::parse_required_header(expression) {
+            Ok(value) => value,
+            Err(error) => {
+                return Some(ProbeDiagnostic {
+                    category: DiagnosticCategory::ValidationHeader,
+                    phase: DiagnosticPhase::ResponseHeaders,
+                    message: format!("invalid required header expression: {error}"),
+                    status: Some(status),
+                    location: location.map(str::to_string),
+                    elapsed_ms: None,
+                });
+            }
         };
-        let name = name.trim();
-        let expected = expected.trim();
-        if headers.get(name).and_then(|value| value.to_str().ok()) != Some(expected) {
+        if headers
+            .get(name.as_str())
+            .and_then(|value| value.to_str().ok())
+            != Some(expected.as_str())
+        {
             return Some(ProbeDiagnostic {
                 category: DiagnosticCategory::ValidationHeader,
                 phase: DiagnosticPhase::ResponseHeaders,
@@ -632,6 +680,7 @@ struct TargetState {
     client: Option<Client>,
     samples: Vec<f64>,
     protocols: Vec<String>,
+    ok: usize,
     fail: usize,
     loss: usize,
     scheduled: usize,
@@ -660,6 +709,7 @@ struct TargetState {
     loss_streak: usize,
     /// Whether this target was stopped before exhausting its probe budget.
     stopped_early: bool,
+    bootstrap_interval: Option<(f64, f64)>,
 }
 
 impl TargetState {
@@ -679,6 +729,7 @@ impl TargetState {
             client,
             samples: Vec::new(),
             protocols: Vec::new(),
+            ok: 0,
             fail,
             loss,
             scheduled,
@@ -714,6 +765,7 @@ impl TargetState {
             confidence: args.confidence,
             loss_streak: 0,
             stopped_early: false,
+            bootstrap_interval: None,
         }
     }
 
@@ -726,11 +778,37 @@ impl TargetState {
     fn current_score(&self) -> f64 {
         score_from_samples(
             &self.samples,
+            self.cold_ms,
+            self.ok,
             self.completed,
             self.loss,
             self.stability_weight,
             self.loss_weight,
         )
+    }
+
+    fn score_lower_bound(&mut self) -> f64 {
+        if self.samples.is_empty() {
+            return 0.0;
+        }
+        self.cached_bootstrap_interval().0
+    }
+
+    fn prune_score(&mut self, adaptive: bool) -> f64 {
+        if adaptive {
+            self.score_lower_bound()
+        } else {
+            self.current_score()
+        }
+    }
+
+    fn cached_bootstrap_interval(&mut self) -> (f64, f64) {
+        if let Some(interval) = self.bootstrap_interval {
+            return interval;
+        }
+        let interval = bootstrap_score_interval(self, self.confidence);
+        self.bootstrap_interval = Some(interval);
+        interval
     }
 
     #[allow(dead_code)]
@@ -741,9 +819,9 @@ impl TargetState {
     fn result_with_mode(&mut self, adaptive: bool) -> ProbeResult {
         self.samples
             .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let ok = self.samples.len();
-        let avg = if ok > 0 {
-            self.samples.iter().sum::<f64>() / ok as f64
+        let sample_count = self.samples.len();
+        let avg = if sample_count > 0 {
+            self.samples.iter().sum::<f64>() / sample_count as f64
         } else {
             0.0
         };
@@ -752,33 +830,39 @@ impl TargetState {
         let p90 = percentile(&self.samples, 0.90);
         let p95 = percentile(&self.samples, 0.95);
         let max = self.samples.last().copied().unwrap_or(0.0);
-        let jitter = if ok > 0 { (p95 - p50).max(0.0) } else { 0.0 };
-        let stddev = if ok > 1 {
-            let variance =
-                self.samples.iter().map(|s| (s - avg).powi(2)).sum::<f64>() / (ok - 1) as f64;
+        let jitter = if sample_count > 0 {
+            (p95 - p50).max(0.0)
+        } else {
+            0.0
+        };
+        let stddev = if sample_count > 1 {
+            let variance = self.samples.iter().map(|s| (s - avg).powi(2)).sum::<f64>()
+                / (sample_count - 1) as f64;
             variance.sqrt()
         } else {
             0.0
         };
         let total = self.completed.max(1);
-        let success_rate = ok as f64 / total as f64;
+        let success_rate = self.ok as f64 / total as f64;
         let packet_loss = self.loss as f64 / total as f64;
         let point_score = score_from_samples(
             &self.samples,
+            self.cold_ms,
+            self.ok,
             self.completed,
             self.loss,
             self.stability_weight,
             self.loss_weight,
         );
         let (success_rate_lower, success_rate_upper) =
-            wilson_interval(ok, self.completed, self.confidence);
-        let (min_score, max_score) = bootstrap_score_interval(self, self.confidence);
+            wilson_interval(self.ok, self.completed, self.confidence);
+        let (min_score, max_score) = self.cached_bootstrap_interval();
         let score = if adaptive { min_score } else { point_score };
 
         ProbeResult {
             ip: self.ip.clone(),
             protocol: summarize_protocols(&self.protocols),
-            ok,
+            ok: self.ok,
             fail: self.fail,
             completed: self.completed,
             avg,
@@ -807,7 +891,7 @@ impl TargetState {
             success_rate_lower,
             success_rate_upper,
             score_confidence: self.confidence,
-            decision: if ok == 0 {
+            decision: if self.ok == 0 {
                 "discarded"
             } else if self.completed < 3 {
                 "insufficient_data"
@@ -816,7 +900,7 @@ impl TargetState {
             }
             .to_string(),
             checks: Vec::new(),
-            health_ok: ok > 0,
+            health_ok: self.ok > 0,
         }
     }
 }
@@ -896,26 +980,38 @@ fn select_next_target(states: &[TargetState], probe_count: usize) -> Option<usiz
 }
 
 fn select_next_target_adaptive(
-    states: &[TargetState],
+    states: &mut [TargetState],
     probe_count: usize,
     min_probes: usize,
 ) -> Option<usize> {
-    let bootstrap_intervals: Vec<(f64, f64)> = states
+    let candidates: Vec<usize> = states
         .iter()
-        .map(|state| bootstrap_score_interval(state, state.confidence))
+        .enumerate()
+        .filter(|(_, state)| state.has_remaining_probe(probe_count))
+        .map(|(index, _)| index)
+        .collect();
+    let bootstrap_intervals: Vec<(usize, (f64, f64))> = candidates
+        .iter()
+        .map(|&index| (index, states[index].cached_bootstrap_interval()))
         .collect();
     states
         .iter()
         .enumerate()
-        .filter(|(_, state)| state.has_remaining_probe(probe_count))
+        .filter(|(index, _)| candidates.binary_search(index).is_ok())
         .min_by(|(left_index, left), (right_index, right)| {
             let left_min = left.completed < min_probes;
             let right_min = right.completed < min_probes;
             right_min
                 .cmp(&left_min)
                 .then_with(|| {
-                    let (left_min, left_max) = bootstrap_intervals[*left_index];
-                    let (right_min, right_max) = bootstrap_intervals[*right_index];
+                    let (_, (left_min, left_max)) = bootstrap_intervals
+                        .binary_search_by_key(left_index, |(index, _)| *index)
+                        .map(|position| bootstrap_intervals[position])
+                        .unwrap_or((*left_index, (0.0, 0.0)));
+                    let (_, (right_min, right_max)) = bootstrap_intervals
+                        .binary_search_by_key(right_index, |(index, _)| *index)
+                        .map(|position| bootstrap_intervals[position])
+                        .unwrap_or((*right_index, (0.0, 0.0)));
                     let lw = left_max - left_min;
                     let rw = right_max - right_min;
                     rw.partial_cmp(&lw).unwrap_or(std::cmp::Ordering::Equal)
@@ -930,21 +1026,19 @@ fn select_next_target_adaptive(
         .map(|(index, _)| index)
 }
 
-fn adaptive_should_stop(index: usize, states: &[TargetState], cfg: &AppConfig) -> bool {
-    let state = &states[index];
-    if state.completed < cfg.min_probes || state.samples.is_empty() {
+fn adaptive_should_stop(index: usize, states: &mut [TargetState], cfg: &AppConfig) -> bool {
+    if states[index].completed < cfg.min_probes || states[index].samples.is_empty() {
         return false;
     }
-    let bootstrap_intervals: Vec<(f64, f64)> = states
-        .iter()
-        .map(|state| bootstrap_score_interval(state, cfg.confidence))
-        .collect();
-    let own = bootstrap_intervals[index];
-    states.iter().enumerate().any(|(other_index, other)| {
-        other_index != index && other.completed >= cfg.min_probes && !other.samples.is_empty() && {
-            let other_bounds = bootstrap_intervals[other_index];
-            other_bounds.0 > own.1
+    let own = states[index].cached_bootstrap_interval();
+    (0..states.len()).any(|other_index| {
+        if other_index == index
+            || states[other_index].completed < cfg.min_probes
+            || states[other_index].samples.is_empty()
+        {
+            return false;
         }
+        states[other_index].cached_bootstrap_interval().0 > own.1
     })
 }
 
@@ -953,11 +1047,17 @@ fn adaptive_should_stop(index: usize, states: &[TargetState], cfg: &AppConfig) -
 ///  * loss streak: `early_stop_loss_streak` consecutive dropped probes;
 ///  * low success: success rate below `early_stop_success_floor`;
 ///  * prune: at least `top` READY candidates exist and this target's current
-///    best score cannot beat the worst of them by `early_stop_prune_margin`.
+///    best score remains worse than the worst of them after applying the
+///    configured margin tolerance.
 ///
 /// `best` is the running leaderboard of `(score, p95)` for completed targets,
 /// capped at `top` entries (see `record_best`).
-fn should_stop_early(state: &TargetState, cfg: &AppConfig, best: &[(f64, f64)]) -> bool {
+fn should_stop_early(
+    state: &mut TargetState,
+    cfg: &AppConfig,
+    best: &[(f64, f64)],
+    adaptive: bool,
+) -> bool {
     if !cfg.early_stop {
         return false;
     }
@@ -969,7 +1069,7 @@ fn should_stop_early(state: &TargetState, cfg: &AppConfig, best: &[(f64, f64)]) 
     }
 
     if state.completed >= cfg.early_stop_min_samples {
-        let rate = state.samples.len() as f64 / state.completed.max(1) as f64;
+        let rate = state.ok as f64 / state.completed.max(1) as f64;
         if rate < cfg.early_stop_success_floor {
             return true;
         }
@@ -979,8 +1079,10 @@ fn should_stop_early(state: &TargetState, cfg: &AppConfig, best: &[(f64, f64)]) 
         && best.len() >= cfg.top
         && state.samples.len() >= cfg.early_stop_min_samples
     {
-        let current = state.current_score();
+        let current = state.prune_score(adaptive);
         let worst_top = best[best.len() - 1].0;
+        // The margin is slack: tolerate a target being somewhat worse before
+        // pruning it. This is equivalent to current * (1 + margin) < worst.
         if current < worst_top / (1.0 + cfg.early_stop_prune_margin) {
             return true;
         }
@@ -1110,7 +1212,7 @@ pub async fn run_scan(
             }
 
             let next = if args.adaptive_probing {
-                select_next_target_adaptive(&states, probe_count, args.min_probes)
+                select_next_target_adaptive(&mut states, probe_count, args.min_probes)
             } else {
                 select_next_target(&states, probe_count)
             };
@@ -1201,6 +1303,9 @@ pub async fn run_scan(
                         state.completed += 1;
                         match sample {
                             Ok((value, protocol, colo)) => {
+                                state.ok += 1;
+                                state.loss_streak = 0;
+                                state.bootstrap_interval = None;
                                 if state.warmup_discard_first {
                                     // This first successful measured probe paid
                                     // the connection-setup cost; record it as the
@@ -1211,7 +1316,6 @@ pub async fn run_scan(
                                         state.colo = colo;
                                     }
                                 } else {
-                                    state.loss_streak = 0;
                                     state.samples.push(value);
                                     state.protocols.push(protocol);
                                     if state.colo.is_none() {
@@ -1220,6 +1324,7 @@ pub async fn run_scan(
                                 }
                             }
                             Err(diagnostic) => {
+                                state.bootstrap_interval = None;
                                 state.fail += 1;
                                 if is_loss_reason(&diagnostic) {
                                     state.loss += 1;
@@ -1230,10 +1335,12 @@ pub async fn run_scan(
                             }
                         }
                         let adaptive_min_reached = !args.adaptive_probing || state.completed >= args.min_probes;
-                        let legacy_stop = adaptive_min_reached && should_stop_early(state, &args, &best);
+                        let legacy_stop = adaptive_min_reached
+                            && should_stop_early(state, &args, &best, args.adaptive_probing);
                         let completed = state.completed;
                         let _ = state;
-                        let adaptive_stop = args.adaptive_probing && adaptive_should_stop(index, &states, &args);
+                        let adaptive_stop =
+                            args.adaptive_probing && adaptive_should_stop(index, &mut states, &args);
                         if adaptive_stop || legacy_stop {
                             // Target is dead or cannot beat the current
                             // leaderboard; stop probing it and emit a partial
@@ -1258,8 +1365,11 @@ pub async fn run_scan(
 
 /// Run every configured health check and merge the per-path results into one
 /// target result. Checks share the same target set and validation policy, but
-/// currently use independent clients and warmup requests; the first check
-/// remains the compatibility/primary result.
+/// currently use independent clients and warmup requests; top-level latency
+/// fields use the required check with the worst p95 as the summary, while
+/// reliability and score fields are based on required checks. Optional checks
+/// remain available in the per-check details but do not affect recommendation
+/// scoring or required-health accounting.
 pub async fn run_profile_scan(
     targets: Vec<String>,
     args: Arc<AppConfig>,
@@ -1306,60 +1416,173 @@ pub async fn run_profile_scan(
     }
 
     for (_, entries) in by_ip {
-        let Some((_, mut merged)) = entries.first().cloned() else {
-            continue;
-        };
-        let total_weight: f64 = entries.iter().map(|(check, _)| check.weight.max(0.0)).sum();
-        let weighted_score = entries
-            .iter()
-            .map(|(check, result)| check.weight.max(0.0) * result.score)
-            .sum::<f64>();
-        let required_ok = expected_checks
-            .iter()
-            .filter(|check| check.required)
-            .all(|check| {
-                entries
-                    .iter()
-                    .any(|(entry, result)| entry.name == check.name && result.ok > 0)
-            });
-        merged.score = if total_weight > 0.0 {
-            weighted_score / total_weight
+        if let Some(merged) = merge_profile_results(&entries, &expected_checks) {
+            let _ = tx.send(merged);
+        }
+    }
+}
+
+fn merge_profile_results(
+    entries: &[(HealthCheck, ProbeResult)],
+    expected_checks: &[HealthCheck],
+) -> Option<ProbeResult> {
+    let (_, mut merged) = entries.first().cloned()?;
+    let summary = entries
+        .iter()
+        .filter(|(check, _)| check.required)
+        .map(|(_, result)| result)
+        .max_by(|left, right| {
+            left.p95
+                .partial_cmp(&right.p95)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    right
+                        .success_rate
+                        .partial_cmp(&left.success_rate)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        })
+        .unwrap_or(&entries[0].1);
+    let aggregate_entries: Vec<&ProbeResult> = entries
+        .iter()
+        .filter(|(check, _)| check.required)
+        .map(|(_, result)| result)
+        .collect();
+    let aggregate_entries = if aggregate_entries.is_empty() {
+        entries.iter().map(|(_, result)| result).collect()
+    } else {
+        aggregate_entries
+    };
+    let ok = aggregate_entries.iter().map(|result| result.ok).sum();
+    let fail = aggregate_entries.iter().map(|result| result.fail).sum();
+    let completed = aggregate_entries
+        .iter()
+        .map(|result| result.completed)
+        .sum();
+    let loss = aggregate_entries.iter().map(|result| result.loss).sum();
+    let success_rate = if completed > 0 {
+        ok as f64 / completed as f64
+    } else {
+        0.0
+    };
+    let packet_loss = if completed > 0 {
+        loss as f64 / completed as f64
+    } else {
+        0.0
+    };
+    let (success_rate_lower, success_rate_upper) =
+        wilson_interval(ok, completed, summary.score_confidence);
+    let score_entries: Vec<&(HealthCheck, ProbeResult)> =
+        entries.iter().filter(|(check, _)| check.required).collect();
+    let score_entries = if score_entries.is_empty() {
+        entries.iter().collect()
+    } else {
+        score_entries
+    };
+    let total_weight: f64 = score_entries
+        .iter()
+        .map(|(check, _)| check.weight.max(0.0))
+        .sum();
+    let weighted_score = score_entries
+        .iter()
+        .map(|(check, result)| check.weight.max(0.0) * result.score)
+        .sum::<f64>();
+    let weighted_min_score = score_entries
+        .iter()
+        .map(|(check, result)| check.weight.max(0.0) * result.min_score)
+        .sum::<f64>();
+    let weighted_max_score = score_entries
+        .iter()
+        .map(|(check, result)| check.weight.max(0.0) * result.max_score)
+        .sum::<f64>();
+    let normalize = |value: f64| {
+        if total_weight > 0.0 {
+            value / total_weight
         } else {
             0.0
-        };
-        let aggregate_healthy = entries.iter().any(|(_, result)| result.ok > 0);
-        merged.health_ok = required_ok && aggregate_healthy;
-        merged.checks = entries
-            .iter()
-            .map(|(check, result)| CheckResult {
-                name: check.name.clone(),
-                path: check.path.clone(),
-                required: check.required,
-                weight: check.weight,
-                score: result.score,
-                healthy: result.ok > 0,
-                ok: result.ok,
-                fail: result.fail,
-                completed: result.completed,
-                avg: result.avg,
-                p95: result.p95,
-                colo: result.colo.clone(),
-            })
-            .collect();
-        merged.decision = if !required_ok {
-            "required_check_failed".to_string()
-        } else if !aggregate_healthy {
-            "discarded".to_string()
-        } else {
-            "competitive".to_string()
-        };
-        let _ = tx.send(merged);
-    }
+        }
+    };
+    let required_ok = expected_checks
+        .iter()
+        .filter(|check| check.required)
+        .all(|check| {
+            entries
+                .iter()
+                .any(|(entry, result)| entry.name == check.name && result.ok > 0)
+        });
+    let aggregate_healthy = entries.iter().any(|(_, result)| result.ok > 0);
+
+    merged.protocol = summary.protocol.clone();
+    merged.ok = ok;
+    merged.fail = fail;
+    merged.completed = completed;
+    merged.avg = summary.avg;
+    merged.p50 = summary.p50;
+    merged.p90 = summary.p90;
+    merged.p95 = summary.p95;
+    merged.max = summary.max;
+    merged.jitter = summary.jitter;
+    merged.stddev = summary.stddev;
+    merged.loss = loss;
+    merged.packet_loss = packet_loss;
+    merged.samples = summary.samples.clone();
+    merged.failures = entries
+        .iter()
+        .flat_map(|(_, result)| result.failures.iter().cloned())
+        .collect();
+    merged.diagnostics = entries
+        .iter()
+        .flat_map(|(_, result)| result.diagnostics.iter().cloned())
+        .collect();
+    merged.colo = summary.colo.clone();
+    merged.country = summary.country.clone();
+    merged.cold_ms = summary.cold_ms;
+    merged.success_rate = success_rate;
+    merged.min_score = normalize(weighted_min_score);
+    merged.max_score = normalize(weighted_max_score);
+    merged.success_rate_lower = success_rate_lower;
+    merged.success_rate_upper = success_rate_upper;
+    merged.score_confidence = summary.score_confidence;
+    merged.score = normalize(weighted_score);
+    merged.health_ok = required_ok && aggregate_healthy;
+    merged.checks = entries
+        .iter()
+        .map(|(check, result)| CheckResult {
+            name: check.name.clone(),
+            path: check.path.clone(),
+            required: check.required,
+            weight: check.weight,
+            score: result.score,
+            healthy: result.ok > 0,
+            ok: result.ok,
+            fail: result.fail,
+            completed: result.completed,
+            success_rate: result.success_rate,
+            avg: result.avg,
+            p50: result.p50,
+            p90: result.p90,
+            p95: result.p95,
+            max: result.max,
+            jitter: result.jitter,
+            stddev: result.stddev,
+            packet_loss: result.packet_loss,
+            cold_ms: result.cold_ms,
+            colo: result.colo.clone(),
+        })
+        .collect();
+    merged.decision = if !required_ok {
+        "required_check_failed".to_string()
+    } else if !aggregate_healthy {
+        "discarded".to_string()
+    } else {
+        "competitive".to_string()
+    };
+    Some(merged)
 }
 
 /// Select which CIDRs to focus the second phase on, given the discovery-pass
 /// results. When `prefer_colo` is set, focus the CIDRs that produced that colo;
-/// otherwise focus the CIDRs whose best discovery score ranks in the top `top`.
+/// otherwise focus the CIDRs whose best discovery score ranks within `limit`.
 fn select_focus_cidrs(
     phase1: &[ProbeResult],
     selected_cidrs: &[String],
@@ -1425,7 +1648,7 @@ pub async fn run_scan_two_phase(
     tx: std::sync::mpsc::Sender<ProbeResult>,
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     if !config.two_phase || selected_cidrs.is_empty() {
         let targets = collect_from_cidrs_with_seed(
             &selected_cidrs,
@@ -1436,8 +1659,9 @@ pub async fn run_scan_two_phase(
                 config.seed
             },
         )?;
+        let actual = targets.clone();
         run_scan(targets, config, tx, cancel, paused).await;
-        return Ok(());
+        return Ok(actual);
     }
 
     let discover_per = (config.sample_per_cidr as f64 * config.discover_fraction)
@@ -1453,6 +1677,7 @@ pub async fn run_scan_two_phase(
     // Discovery pass.
     let (p1_tx, p1_rx) = std::sync::mpsc::channel();
     let targets1 = collect_from_cidrs_with_seed(&selected_cidrs, discover_per, base_seed)?;
+    let mut actual_targets: BTreeSet<String> = targets1.iter().cloned().collect();
     run_scan(
         targets1,
         config.clone(),
@@ -1466,10 +1691,20 @@ pub async fn run_scan_two_phase(
         let _ = tx.send(result.clone());
     }
     if cancel.load(Ordering::Relaxed) {
-        return Ok(());
+        return Ok(actual_targets.into_iter().collect());
     }
 
-    let focus = select_focus_cidrs(&phase1, &selected_cidrs, prefer_colo.as_deref(), config.top);
+    let focus_limit = if config.two_phase_focus_cidrs == 0 {
+        selected_cidrs.len()
+    } else {
+        config.two_phase_focus_cidrs
+    };
+    let focus = select_focus_cidrs(
+        &phase1,
+        &selected_cidrs,
+        prefer_colo.as_deref(),
+        focus_limit,
+    );
     let focus_set: BTreeSet<String> = focus.iter().cloned().collect();
 
     // Focus pass: oversample the CIDRs that produced good colos; keep a light
@@ -1497,20 +1732,21 @@ pub async fn run_scan_two_phase(
     }
 
     if !targets2.is_empty() {
+        actual_targets.extend(targets2.iter().cloned());
         run_scan(targets2.into_iter().collect(), config, tx, cancel, paused).await;
     }
-    Ok(())
+    Ok(actual_targets.into_iter().collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        bootstrap_score_interval, cidr_valid, collect_from_cidrs_with_seed, parse_colo,
-        record_best, result_confidence, result_status, select_focus_cidrs, select_next_target,
-        should_stop_early, validate_response, wilson_interval, DiagnosticCategory, ProbeResult,
-        TargetState,
+        bootstrap_score_interval, cidr_valid, collect_from_cidrs_with_seed, merge_profile_results,
+        parse_colo, record_best, resolve_host_for_ip, result_confidence, result_status,
+        score_from_samples, select_focus_cidrs, select_next_target, should_stop_early,
+        validate_response, wilson_interval, DiagnosticCategory, ProbeResult, TargetState,
     };
-    use crate::config::AppConfig;
+    use crate::config::{AppConfig, HealthCheck};
 
     fn state(
         ip: &str,
@@ -1525,6 +1761,7 @@ mod tests {
             client: None,
             samples: samples.to_vec(),
             protocols: Vec::new(),
+            ok: samples.len(),
             fail,
             loss: 0,
             scheduled,
@@ -1537,6 +1774,7 @@ mod tests {
             warmup_done: true,
             warmup_in_flight: false,
             warmup_discard_first: false,
+            bootstrap_interval: None,
             stability_weight: 1.0,
             loss_weight: 1.0,
             confidence: 0.95,
@@ -1551,6 +1789,13 @@ mod tests {
         assert_eq!(cidr_valid("2001:db8::1").unwrap().prefix_len(), 128);
         assert!(cidr_valid("192.0.2.0/24").is_ok());
         assert!(cidr_valid("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn resolve_host_for_ip_strips_ports_without_breaking_ipv6() {
+        assert_eq!(resolve_host_for_ip("example.test:443"), "example.test");
+        assert_eq!(resolve_host_for_ip("[2001:db8::1]:443"), "2001:db8::1");
+        assert_eq!(resolve_host_for_ip("2001:db8::1"), "2001:db8::1");
     }
 
     #[test]
@@ -1686,6 +1931,19 @@ mod tests {
     }
 
     #[test]
+    fn cached_bootstrap_interval_refreshes_after_probe_state_changes() {
+        let mut state = state("192.0.2.77", 4, 4, &[0.010, 0.011, 0.012, 0.013], 0);
+        let first = state.cached_bootstrap_interval();
+        state.samples.push(1.0);
+        state.ok += 1;
+        state.completed += 1;
+        state.bootstrap_interval = None;
+        let refreshed = state.cached_bootstrap_interval();
+
+        assert_ne!(first, refreshed);
+    }
+
+    #[test]
     fn parse_colo_extracts_datacenter_code() {
         let body = "fl=abc\nh=example.com\nip=1.2.3.4\ncolo=fra\nts=123\n";
         assert_eq!(parse_colo(body), Some("FRA".to_string()));
@@ -1734,6 +1992,7 @@ mod tests {
             client: None,
             samples: vec![0.2, 0.3, 0.25],
             protocols: vec!["h2".to_string(); 3],
+            ok: 3,
             fail: 0,
             loss: 0,
             scheduled: 3,
@@ -1746,6 +2005,7 @@ mod tests {
             warmup_done: true,
             warmup_in_flight: false,
             warmup_discard_first: false,
+            bootstrap_interval: None,
             stability_weight: 1.0,
             loss_weight: 1.0,
             confidence: 0.95,
@@ -1763,6 +2023,24 @@ mod tests {
     }
 
     #[test]
+    fn discarded_cold_success_counts_toward_reliability_not_latency() {
+        let mut state = state("192.0.2.1", 1, 1, &[], 0);
+        state.ok = 1;
+        state.cold_ms = Some(0.250);
+
+        let result = state.result();
+
+        assert_eq!(result.ok, 1);
+        assert_eq!(result.completed, 1);
+        assert_eq!(result.success_rate, 1.0);
+        assert_eq!(result_status(&result), "READY");
+        assert!(result.health_ok);
+        assert!(result.samples.is_empty());
+        assert_eq!(result.avg, 0.0);
+        assert_eq!(result.cold_ms, Some(250.0));
+    }
+
+    #[test]
     fn jitter_stddev_and_packet_loss_are_computed() {
         let mut state = TargetState {
             ip: "192.0.2.1".to_string(),
@@ -1770,6 +2048,7 @@ mod tests {
             client: None,
             samples: vec![0.10, 0.20, 0.30],
             protocols: vec!["h2".to_string(); 3],
+            ok: 3,
             fail: 1,
             loss: 1,
             scheduled: 4,
@@ -1782,6 +2061,7 @@ mod tests {
             warmup_done: true,
             warmup_in_flight: false,
             warmup_discard_first: false,
+            bootstrap_interval: None,
             stability_weight: 1.0,
             loss_weight: 1.0,
             confidence: 0.95,
@@ -1810,6 +2090,7 @@ mod tests {
             client: None,
             samples: vec![0.20, 0.20, 0.30, 0.30],
             protocols: vec!["h2".to_string(); 4],
+            ok: 4,
             fail: 0,
             loss: 0,
             scheduled: 4,
@@ -1822,6 +2103,7 @@ mod tests {
             warmup_done: true,
             warmup_in_flight: false,
             warmup_discard_first: false,
+            bootstrap_interval: None,
             stability_weight: 1.0,
             loss_weight: 0.0,
             confidence: 0.95,
@@ -1835,6 +2117,7 @@ mod tests {
             client: None,
             samples: vec![0.10, 0.10, 0.30, 0.30],
             protocols: vec!["h2".to_string(); 4],
+            ok: 4,
             fail: 0,
             loss: 0,
             scheduled: 4,
@@ -1847,6 +2130,7 @@ mod tests {
             warmup_done: true,
             warmup_in_flight: false,
             warmup_discard_first: false,
+            bootstrap_interval: None,
             stability_weight: 1.0,
             loss_weight: 0.0,
             confidence: 0.95,
@@ -1867,6 +2151,7 @@ mod tests {
             client: None,
             samples: vec![0.20, 0.20, 0.20],
             protocols: vec!["h2".to_string(); 3],
+            ok: 3,
             fail: 1,
             loss: 0,
             scheduled: 4,
@@ -1879,6 +2164,7 @@ mod tests {
             warmup_done: true,
             warmup_in_flight: false,
             warmup_discard_first: false,
+            bootstrap_interval: None,
             stability_weight: 0.0,
             loss_weight: 1.0,
             confidence: 0.95,
@@ -1892,6 +2178,7 @@ mod tests {
             client: None,
             samples: vec![0.20, 0.20, 0.20],
             protocols: vec!["h2".to_string(); 3],
+            ok: 3,
             fail: 1,
             loss: 1,
             scheduled: 4,
@@ -1904,6 +2191,7 @@ mod tests {
             warmup_done: true,
             warmup_in_flight: false,
             warmup_discard_first: false,
+            bootstrap_interval: None,
             stability_weight: 0.0,
             loss_weight: 1.0,
             confidence: 0.95,
@@ -1914,6 +2202,39 @@ mod tests {
         assert_eq!(reliable.success_rate, lossy.success_rate);
         assert!(reliable.packet_loss < lossy.packet_loss);
         assert!(reliable.score > lossy.score);
+    }
+
+    #[test]
+    fn score_limits_the_influence_of_a_single_extreme_tail() {
+        let ordinary = score_from_samples(&[0.10; 20], None, 20, 20, 0, 1.0, 0.0);
+        let mut samples = vec![0.10; 19];
+        samples.push(10.0);
+        let extreme = score_from_samples(&samples, None, 20, 20, 0, 1.0, 0.0);
+
+        assert!(extreme > ordinary / 3.0);
+    }
+
+    #[test]
+    fn cold_fallback_prevents_empty_sample_score_inflation() {
+        let fallback = score_from_samples(&[], Some(0.10), 1, 1, 0, 1.0, 0.0);
+        let ordinary = score_from_samples(&[0.10], None, 1, 1, 0, 1.0, 0.0);
+
+        assert_eq!(fallback, ordinary);
+        assert!(fallback < 100.0);
+    }
+
+    #[test]
+    fn cold_fallback_is_used_for_result_score_but_not_latency_samples() {
+        let mut state = state("192.0.2.8", 1, 1, &[], 0);
+        state.ok = 1;
+        state.cold_ms = Some(0.10);
+
+        let result = state.result();
+
+        assert_eq!(result.samples, Vec::<f64>::new());
+        assert_eq!(result.avg, 0.0);
+        assert_eq!(result.p95, 0.0);
+        assert!(result.score < 100.0);
     }
 
     fn early_stop_config() -> AppConfig {
@@ -1937,6 +2258,7 @@ mod tests {
             client: None,
             samples: vec![0.10, 0.20, 0.30],
             protocols: vec!["h2".to_string(); 3],
+            ok: 3,
             fail: 1,
             loss: 1,
             scheduled: 4,
@@ -1949,6 +2271,7 @@ mod tests {
             warmup_done: true,
             warmup_in_flight: false,
             warmup_discard_first: false,
+            bootstrap_interval: None,
             stability_weight: 1.0,
             loss_weight: 1.0,
             confidence: 0.95,
@@ -1972,27 +2295,27 @@ mod tests {
             s.completed += 1;
             s.loss_streak += 1;
         }
-        assert!(!should_stop_early(&s, &cfg, &[]));
+        assert!(!should_stop_early(&mut s, &cfg, &[], false));
         // Fifth consecutive loss crosses the streak threshold.
         s.completed += 1;
         s.loss_streak += 1;
-        assert!(should_stop_early(&s, &cfg, &[]));
+        assert!(should_stop_early(&mut s, &cfg, &[], false));
     }
 
     #[test]
     fn early_stop_fires_on_low_success_rate() {
         let cfg = early_stop_config();
-        let s = state("192.0.2.1", 3, 3, &[0.1], 2);
+        let mut s = state("192.0.2.1", 3, 3, &[0.1], 2);
         // 1 success out of 3 completed => 0.33 < 0.5 floor.
-        assert!(should_stop_early(&s, &cfg, &[]));
+        assert!(should_stop_early(&mut s, &cfg, &[], false));
     }
 
     #[test]
     fn early_stop_does_not_fire_before_min_samples() {
         let cfg = early_stop_config();
-        let s = state("192.0.2.1", 1, 1, &[], 1);
+        let mut s = state("192.0.2.1", 1, 1, &[], 1);
         // A single failure must not abort a target prematurely.
-        assert!(!should_stop_early(&s, &cfg, &[]));
+        assert!(!should_stop_early(&mut s, &cfg, &[], false));
     }
 
     #[test]
@@ -2000,9 +2323,26 @@ mod tests {
         let cfg = early_stop_config();
         // Leaderboard already full of strong candidates (score ~ high).
         let best: Vec<(f64, f64)> = vec![(10.0, 0.05); cfg.top];
-        let worse = state("192.0.2.9", 4, 4, &[0.9, 0.9, 0.9, 0.9], 0);
+        let mut worse = state("192.0.2.9", 4, 4, &[0.9, 0.9, 0.9, 0.9], 0);
         // 0.9s latency => far below the leaderboard's score; should be pruned.
-        assert!(should_stop_early(&worse, &cfg, &best));
+        assert!(should_stop_early(&mut worse, &cfg, &best, false));
+    }
+
+    #[test]
+    fn early_stop_prune_margin_is_tolerance_slack() {
+        let cfg = early_stop_config();
+        let best: Vec<(f64, f64)> = vec![(10.0, 0.05); cfg.top];
+
+        let mut within_tolerance = state("192.0.2.10", 3, 3, &[0.117647; 3], 0);
+        assert!(!should_stop_early(
+            &mut within_tolerance,
+            &cfg,
+            &best,
+            false
+        ));
+
+        let mut beyond_tolerance = state("192.0.2.11", 3, 3, &[0.125; 3], 0);
+        assert!(should_stop_early(&mut beyond_tolerance, &cfg, &best, false));
     }
 
     #[test]
@@ -2011,7 +2351,7 @@ mod tests {
         cfg.early_stop = false;
         let mut s = state("192.0.2.1", 6, 6, &[], 6);
         s.loss_streak = 6;
-        assert!(!should_stop_early(&s, &cfg, &[]));
+        assert!(!should_stop_early(&mut s, &cfg, &[], false));
     }
 
     #[test]
@@ -2151,5 +2491,84 @@ mod tests {
         ];
         let focus = select_focus_cidrs(&phase1, &cidrs, None, 1);
         assert_eq!(focus, vec!["198.51.100.0/24".to_string()]);
+    }
+
+    #[test]
+    fn profile_merge_aggregates_required_check_counts() {
+        let mut passing = focus_result("192.0.2.1", Some("FRA"), 8.0, 2);
+        passing.failures = vec!["optional detail".to_string()];
+        let mut failing = focus_result("192.0.2.1", Some("AMS"), 2.0, 0);
+        failing.fail = 2;
+        failing.completed = 2;
+        failing.success_rate = 0.0;
+        failing.samples.clear();
+        failing.failures = vec!["required failure".to_string()];
+        let checks = vec![
+            HealthCheck {
+                name: "primary".to_string(),
+                path: "/".to_string(),
+                required: true,
+                weight: 1.0,
+            },
+            HealthCheck {
+                name: "fallback".to_string(),
+                path: "/health".to_string(),
+                required: true,
+                weight: 1.0,
+            },
+        ];
+        let merged = merge_profile_results(
+            &[(checks[0].clone(), passing), (checks[1].clone(), failing)],
+            &checks,
+        )
+        .unwrap();
+        assert_eq!(merged.ok, 2);
+        assert_eq!(merged.fail, 2);
+        assert_eq!(merged.completed, 4);
+        assert_eq!(merged.success_rate, 0.5);
+        assert_eq!(merged.failures.len(), 2);
+        assert_eq!(merged.checks.len(), 2);
+        assert!(!merged.health_ok);
+    }
+
+    #[test]
+    fn profile_merge_optional_checks_do_not_dilute_recommendation_score() {
+        let required = focus_result("192.0.2.1", Some("FRA"), 5.0, 2);
+        let optional = focus_result("192.0.2.1", Some("AMS"), 100.0, 2);
+        let checks = vec![
+            HealthCheck {
+                name: "primary".to_string(),
+                path: "/".to_string(),
+                required: true,
+                weight: 1.0,
+            },
+            HealthCheck {
+                name: "optional".to_string(),
+                path: "/ready".to_string(),
+                required: false,
+                weight: 100.0,
+            },
+        ];
+        let merged = merge_profile_results(
+            &[(checks[0].clone(), required), (checks[1].clone(), optional)],
+            &checks,
+        )
+        .unwrap();
+        assert_eq!(merged.score, 5.0);
+        assert_eq!(merged.min_score, 5.0);
+        assert_eq!(merged.max_score, 5.0);
+    }
+
+    #[test]
+    fn profile_merge_falls_back_to_all_checks_without_required_checks() {
+        let optional = focus_result("192.0.2.1", Some("AMS"), 7.0, 2);
+        let checks = vec![HealthCheck {
+            name: "optional".to_string(),
+            path: "/ready".to_string(),
+            required: false,
+            weight: 1.0,
+        }];
+        let merged = merge_profile_results(&[(checks[0].clone(), optional)], &checks).unwrap();
+        assert_eq!(merged.score, 7.0);
     }
 }

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use reqwest::header::HeaderName;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::{fs, io::Write};
@@ -18,6 +19,26 @@ fn default_health_check_required() -> bool {
 }
 fn default_health_check_weight() -> f64 {
     1.0
+}
+
+/// Parse and validate a required response-header expression.
+///
+/// The first `=` separates the header name from its expected value; additional
+/// equals signs belong to the value (for example, a base64 token).
+pub fn parse_required_header(expression: &str) -> Result<(String, String), String> {
+    let Some((name, expected)) = expression.split_once('=') else {
+        return Err("headers must use name=value form".to_string());
+    };
+    let name = name.trim();
+    let expected = expected.trim();
+    if name.is_empty() {
+        return Err("header name must not be empty".to_string());
+    }
+    HeaderName::from_bytes(name.as_bytes()).map_err(|_| format!("invalid header name: {name}"))?;
+    if expected.is_empty() {
+        return Err("header value must not be empty".to_string());
+    }
+    Ok((name.to_string(), expected.to_string()))
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -88,11 +109,12 @@ pub struct AppConfig {
     #[serde(default = "default_early_stop_success_floor")]
     pub early_stop_success_floor: f64,
     /// Once at least `top` READY candidates exist, stop probing targets whose
-    /// current best score cannot beat the worst of that set by the margin.
+    /// current best score remains worse than the worst candidate after the
+    /// configured margin tolerance is applied.
     #[serde(default = "default_early_stop_prune")]
     pub early_stop_prune: bool,
-    /// How much better (as a fraction) a target's score must be versus the
-    /// current worst top-N candidate to keep probing it under the prune rule.
+    /// How much worse (as a fraction) a target may be than the current worst
+    /// top-N candidate before it is pruned.
     #[serde(default = "default_early_stop_prune_margin")]
     pub early_stop_prune_margin: f64,
     /// Run a sparse discovery pass first, then focus the remaining probe budget
@@ -103,6 +125,10 @@ pub struct AppConfig {
     /// `two_phase` is enabled (the remainder is spent focusing on good colos).
     #[serde(default = "default_discover_fraction")]
     pub discover_fraction: f64,
+    /// Maximum number of CIDRs selected for the two-phase focus pass. Zero
+    /// means all eligible CIDRs; this is independent of the display limit.
+    #[serde(default)]
+    pub two_phase_focus_cidrs: usize,
     #[serde(default)]
     pub adaptive_probing: bool,
     #[serde(default = "default_min_probes")]
@@ -225,6 +251,7 @@ impl Default for AppConfig {
             early_stop_prune_margin: default_early_stop_prune_margin(),
             two_phase: default_two_phase(),
             discover_fraction: default_discover_fraction(),
+            two_phase_focus_cidrs: 0,
             adaptive_probing: false,
             min_probes: default_min_probes(),
             max_probes: default_max_probes(),
@@ -340,7 +367,23 @@ pub fn save_config(config: &AppConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_config, AppConfig};
+    use super::{parse_config, parse_required_header, AppConfig};
+
+    #[test]
+    fn required_header_parser_validates_names_and_values() {
+        assert_eq!(
+            parse_required_header(" content-type = text/plain ").unwrap(),
+            ("content-type".to_string(), "text/plain".to_string())
+        );
+        assert_eq!(
+            parse_required_header("x-token=a=b=c").unwrap(),
+            ("x-token".to_string(), "a=b=c".to_string())
+        );
+        assert!(parse_required_header("=value").is_err());
+        assert!(parse_required_header("name=").is_err());
+        assert!(parse_required_header("=").is_err());
+        assert!(parse_required_header("bad header=value").is_err());
+    }
 
     #[test]
     fn selected_cidrs_distinguishes_missing_from_explicit_empty() {
