@@ -3146,6 +3146,36 @@ mod tests {
     }
 
     #[test]
+    fn wizard_ranges_render_distinct_checkbox_states() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.cursor = 2;
+        app.cidr_candidates[0].selected = true;
+        app.cidr_candidates[1].selected = false;
+
+        let backend = TestBackend::new(120, 36);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("[✓]"));
+        assert!(rendered.contains("[ ]"));
+
+        assert!(terminal.backend().buffer().content().iter().any(|cell| {
+            cell.symbol() == "✓" && cell.modifier.contains(ratatui::style::Modifier::BOLD)
+        }));
+    }
+
+    #[test]
     fn all_screens_render_without_panicking() {
         let mut app = App::new(
             AppConfig::default(),

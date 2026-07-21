@@ -829,6 +829,17 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
         }
         let e = &app.cidr_candidates[idx];
         let y = inner.y + i as u16;
+        if idx == app.cursor || e.selected {
+            frame.render_widget(
+                Paragraph::new("").style(theme::row_selected_style()),
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+        }
         // Cursor marker gutter (mirrors the list highlight symbol).
         if idx == app.cursor {
             frame.render_widget(
@@ -842,15 +853,22 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
             );
         }
         let checkbox = Checkbox::new(e.cidr.clone(), e.selected)
-            .label_style(if idx == app.cursor {
+            .checked_symbol("[✓]")
+            .unchecked_symbol("[ ]")
+            .style(if idx == app.cursor || e.selected {
                 theme::row_selected_style()
-            } else if e.selected {
-                Style::default().fg(theme::palette().info)
+            } else {
+                theme::hint_style()
+            })
+            .label_style(if idx == app.cursor || e.selected {
+                theme::row_selected_style()
             } else {
                 theme::hint_style()
             })
             .checkbox_style(if e.selected {
-                Style::default().fg(theme::palette().success)
+                Style::default()
+                    .fg(theme::palette().success)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme::palette().subtitle)
             });
