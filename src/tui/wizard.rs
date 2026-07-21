@@ -1811,7 +1811,9 @@ fn toggle_port_buffer(app: &mut App) {
 
 fn handle_review_key(app: &mut App, code: KeyCode) {
     match code {
-        KeyCode::Char('s') => app.regenerate_preview(),
+        KeyCode::Char('s') => {
+            app.regenerate_preview();
+        }
         KeyCode::Char('c') => app.save_target_manifest(),
         KeyCode::Enter => match app.focus_index {
             1 => {

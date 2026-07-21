@@ -802,7 +802,7 @@ impl App {
         }
     }
 
-    pub fn regenerate_preview(&mut self) {
+    pub fn regenerate_preview(&mut self) -> bool {
         let seed = rand::random();
         match self.collect_preview(seed) {
             Ok(targets) => {
@@ -810,8 +810,12 @@ impl App {
                 self.config.seed = seed;
                 self.preview_targets = targets;
                 self.toast_success(format!("Generated {} targets", self.preview_targets.len()));
+                true
             }
-            Err(error) => self.toast_error(format!("Preview failed: {error}")),
+            Err(error) => {
+                self.toast_error(format!("Preview failed: {error}"));
+                false
+            }
         }
     }
 
@@ -2476,8 +2480,7 @@ impl App {
         let generated = if self.explicit_target_source.is_some() {
             self.regenerate_explicit_preview()
         } else {
-            self.regenerate_preview();
-            !self.preview_targets.is_empty()
+            self.regenerate_preview()
         };
         if generated {
             self.watch_source_fingerprint = None;

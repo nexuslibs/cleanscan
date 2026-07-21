@@ -182,7 +182,10 @@ fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
         .iter()
         .filter(|(source, _, _)| source.is_none_or(|index| app.column_visible(index)))
         .collect::<Vec<_>>();
-    if compact_columns.is_empty() {
+    if !compact_columns
+        .iter()
+        .any(|(source, _, _)| source.is_some())
+    {
         compact_columns.push(&COMPACT_COLUMNS[1]);
     }
     let widths = compact_columns
@@ -264,14 +267,6 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         app.button_ex(
             frame,
             buttons[0],
-            "Customize (w)",
-            ButtonAction::CustomizeScan,
-            ButtonKind::Primary,
-            app.focus_index == 3,
-        );
-        app.button_ex(
-            frame,
-            buttons[1],
             "Export (e)",
             ButtonAction::Save,
             ButtonKind::Secondary,
@@ -279,11 +274,19 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         );
         app.button_ex(
             frame,
-            buttons[2],
+            buttons[1],
             "Speed test (t)",
             ButtonAction::SpeedTest,
             ButtonKind::Secondary,
             app.focus_index == 2,
+        );
+        app.button_ex(
+            frame,
+            buttons[2],
+            "Customize (w)",
+            ButtonAction::CustomizeScan,
+            ButtonKind::Primary,
+            app.focus_index == 3,
         );
         app.button_ex(
             frame,
