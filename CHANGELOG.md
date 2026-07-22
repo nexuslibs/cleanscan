@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.1](https://github.com/nexuslibs/cleanscan/compare/v0.18.0...v0.18.1) (2026-07-22)
+
+
+### Bug Fixes
+
+* **colo:** map IAD to United States ([0f43717](https://github.com/nexuslibs/cleanscan/commit/0f43717e265dddc900631a48232c713d7225a611))
+
 ## [0.18.0](https://github.com/nexuslibs/cleanscan/compare/v0.17.0...v0.18.0) (2026-07-22)
 
 
