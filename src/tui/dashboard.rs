@@ -268,15 +268,15 @@ fn render_failure_summary(app: &App, frame: &mut Frame, area: Rect) {
     } else {
         ""
     };
-    let mode = if failure_summary_text(counts, FailureSummaryMode::Wide, suffix).len()
+    let mode = if failure_summary_line(counts, FailureSummaryMode::Wide, suffix).width()
         <= area.width as usize
     {
         FailureSummaryMode::Wide
-    } else if failure_summary_text(counts, FailureSummaryMode::Compact, suffix).len()
+    } else if failure_summary_line(counts, FailureSummaryMode::Compact, suffix).width()
         <= area.width as usize
     {
         FailureSummaryMode::Compact
-    } else if failure_summary_text(counts, FailureSummaryMode::Narrow, narrow_suffix).len()
+    } else if failure_summary_line(counts, FailureSummaryMode::Narrow, narrow_suffix).width()
         <= area.width as usize
     {
         FailureSummaryMode::Narrow
@@ -374,32 +374,6 @@ fn failure_summary_line(
         label!(suffix);
     }
     Line::from(spans)
-}
-
-fn failure_summary_text(
-    counts: ProbeFailureCounts,
-    mode: FailureSummaryMode,
-    suffix: &str,
-) -> String {
-    let text = match mode {
-        FailureSummaryMode::Wide => format!(
-            "Probe failures: Request timeout {} • Connect timeout {} • Connection/TLS {} • General errors {}",
-            counts.request_timeout, counts.connect_timeout, counts.connection_tls, counts.general_errors
-        ),
-        FailureSummaryMode::Compact => format!(
-            "Failures: Req TO {} • Conn TO {} • Conn/TLS {} • Errors {}",
-            counts.request_timeout, counts.connect_timeout, counts.connection_tls, counts.general_errors
-        ),
-        FailureSummaryMode::Narrow => format!(
-            "F rTO:{} cTO:{} net:{} err:{}",
-            counts.request_timeout, counts.connect_timeout, counts.connection_tls, counts.general_errors
-        ),
-        FailureSummaryMode::Shortest => format!(
-            "F r:{} c:{} n:{} e:{}",
-            counts.request_timeout, counts.connect_timeout, counts.connection_tls, counts.general_errors
-        ),
-    };
-    format!("{text}{suffix}")
 }
 
 fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -1742,6 +1716,25 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert_eq!(rendered, text);
+    }
+
+    #[test]
+    fn failure_summary_width_uses_terminal_cells_not_utf8_bytes() {
+        let counts = ProbeFailureCounts {
+            request_timeout: 12,
+            connect_timeout: 3,
+            connection_tls: 2,
+            general_errors: 4,
+        };
+        let line = failure_summary_line(counts, FailureSummaryMode::Wide, "");
+        let rendered = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(line.width() < rendered.len());
+        assert_eq!(line.width(), rendered.chars().count());
     }
 
     fn result(ip: &str, score: f64, samples: &[f64]) -> ProbeResult {

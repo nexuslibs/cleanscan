@@ -73,7 +73,7 @@ impl ProbeFailureCounts {
             }
         } else if matches!(
             diagnostic.category,
-            DiagnosticCategory::Connect | DiagnosticCategory::Tls
+            DiagnosticCategory::ClientSetup | DiagnosticCategory::Connect | DiagnosticCategory::Tls
         ) {
             self.connection_tls = self.connection_tls.saturating_add(1);
         } else {
@@ -2883,6 +2883,10 @@ mod tests {
             DiagnosticPhase::ConnectionTls,
         ));
         counts.record(&diagnostic(
+            DiagnosticCategory::ClientSetup,
+            DiagnosticPhase::ClientConstruction,
+        ));
+        counts.record(&diagnostic(
             DiagnosticCategory::HttpStatus,
             DiagnosticPhase::ResponseBody,
         ));
@@ -2896,7 +2900,7 @@ mod tests {
             ProbeFailureCounts {
                 request_timeout: 1,
                 connect_timeout: 1,
-                connection_tls: 2,
+                connection_tls: 3,
                 general_errors: 1,
             }
         );
