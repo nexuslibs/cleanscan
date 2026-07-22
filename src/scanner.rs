@@ -1469,10 +1469,16 @@ async fn run_scan_port(
                 break;
             }
 
-            // Dispatch any pending warmup probes first so the TCP+TLS
-            // connection is established before steady-state probes run.
-            if args.warmup {
-                while futs.len() < workers {
+            // Prefer measured work that is ready. This interleaves warmup and
+            // measurement: a fast target no longer waits for every sampled IP
+            // (or every port) to finish warmup before producing a result.
+            let next = if args.adaptive_probing {
+                select_next_target_adaptive(&mut states, probe_count, args.min_probes)
+            } else {
+                select_next_target(&states, probe_count)
+            };
+            let Some(index) = next else {
+                if args.warmup && futs.len() < workers {
                     let warmup_index = states
                         .iter()
                         .position(|s| !s.warmup_done && !s.warmup_in_flight && !s.in_flight);
@@ -1523,15 +1529,8 @@ async fn run_scan_port(
                         };
                         ProbeOutcome::Warmup { index, sample }
                     }));
+                    continue;
                 }
-            }
-
-            let next = if args.adaptive_probing {
-                select_next_target_adaptive(&mut states, probe_count, args.min_probes)
-            } else {
-                select_next_target(&states, probe_count)
-            };
-            let Some(index) = next else {
                 break;
             };
             let state = &mut states[index];

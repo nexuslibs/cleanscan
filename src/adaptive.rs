@@ -218,6 +218,8 @@ pub struct AdaptivePolicy {
     baseline_latency_samples: Vec<f64>,
     last_resize: Option<Instant>,
     last_scale_down: Option<Instant>,
+    scale_up_reference: Option<(Instant, f64)>,
+    scale_up_blocked: bool,
     up_streak: usize,
     down_streak: usize,
     healthy_streak: usize,
@@ -249,6 +251,8 @@ impl AdaptivePolicy {
             baseline_latency_samples: Vec::with_capacity(params.baseline_samples),
             last_resize: None,
             last_scale_down: None,
+            scale_up_reference: None,
+            scale_up_blocked: false,
             up_streak: 0,
             down_streak: 0,
             healthy_streak: 0,
@@ -335,6 +339,21 @@ impl AdaptivePolicy {
             .filter(|latency| latency.is_finite())
             .collect();
         (!latencies.is_empty()).then(|| percentile(&latencies, 0.90))
+    }
+
+    fn throughput_per_second(&self, now: Instant) -> Option<f64> {
+        let observations = self.observations_at(now);
+        let first = observations.first()?.at;
+        let last = observations.last()?.at;
+        let elapsed = elapsed_since(last, first).as_secs_f64().max(0.001);
+        Some(observations.len() as f64 / elapsed)
+    }
+
+    fn observations_since(&self, now: Instant, anchor: Instant) -> usize {
+        self.observations_at(now)
+            .into_iter()
+            .filter(|observation| observation.at > anchor)
+            .count()
     }
 
     pub fn evaluate(&self, now: Instant, remaining_work: usize) -> Decision {
@@ -483,9 +502,27 @@ impl AdaptivePolicy {
 
         let should_resize = match (decision.signal, decision.action) {
             (SignalDirection::Up, Action::ScaleUp(step)) => {
-                self.up_streak >= self.params.hysteresis_streak
-                    && self.workers < self.max_workers
-                    && step > 0
+                let wants_scale_up = if self.scale_up_blocked {
+                    false
+                } else if let Some((anchor, reference)) = self.scale_up_reference {
+                    let enough_post_resize_samples =
+                        self.observations_since(now, anchor) >= self.params.min_samples;
+                    let throughput = self.throughput_per_second(now);
+                    if enough_post_resize_samples
+                        && throughput.is_some_and(|current| current <= reference * 1.02)
+                    {
+                        // The latest increase did not improve throughput. Keep
+                        // this worker count as the stable point and do not keep
+                        // ramping into a flat or slower region.
+                        self.scale_up_blocked = true;
+                        false
+                    } else {
+                        self.up_streak >= self.params.hysteresis_streak
+                    }
+                } else {
+                    self.up_streak >= self.params.hysteresis_streak
+                };
+                wants_scale_up && self.workers < self.max_workers && step > 0
             }
             (SignalDirection::Down, Action::ScaleDown(step)) => {
                 self.down_streak >= self.params.hysteresis_streak
@@ -522,7 +559,13 @@ impl AdaptivePolicy {
         self.last_resize = Some(now);
         if downscaled {
             self.last_scale_down = Some(now);
+            self.scale_up_reference = None;
+            self.scale_up_blocked = false;
             self.healthy_streak = 0;
+        } else {
+            self.scale_up_reference = self
+                .throughput_per_second(now)
+                .map(|throughput| (now, throughput));
         }
         self.up_streak = 0;
         self.down_streak = 0;
