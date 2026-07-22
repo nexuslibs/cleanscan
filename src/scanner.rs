@@ -1693,6 +1693,8 @@ async fn run_scan_port(
                                 state.warmup_done = true;
                                 state.warmup_discard_first = !construction_failed;
                                 state.construction_failed = construction_failed;
+                                state.diagnostics.push(diagnostic.clone());
+                                state.failures.push(diagnostic.message);
                                 if construction_failed {
                                     state.fail = probe_count;
                                     state.scheduled = probe_count;
@@ -1706,8 +1708,6 @@ async fn run_scan_port(
                                         targets_completed += 1;
                                     }
                                 }
-                                state.diagnostics.push(diagnostic.clone());
-                                state.failures.push(diagnostic.message);
                             }
                         }
                     }
