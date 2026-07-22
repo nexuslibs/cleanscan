@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.2](https://github.com/nexuslibs/cleanscan/compare/v0.19.1...v0.19.2) (2026-07-22)
+
+
+### Bug Fixes
+
+* **wizard:** update concurrency terminology and add worker summary function ([554eb5b](https://github.com/nexuslibs/cleanscan/commit/554eb5b5cc76a85f5051fef4d01f665d3ed6f75c))
+
 ## [0.19.1](https://github.com/nexuslibs/cleanscan/compare/v0.19.0...v0.19.1) (2026-07-22)
 
 
