@@ -1020,6 +1020,7 @@ impl App {
     }
 
     pub fn add_result(&mut self, result: ProbeResult) {
+        self.scan_started_ips.insert(result.ip.clone());
         self.scan_result_ips.insert(result.ip.clone());
         if result.ok > 0 {
             self.scan_succeeded_ips.insert(result.ip.clone());
@@ -4136,13 +4137,26 @@ mod tests {
             latest_target: Some("192.0.2.1".to_string()),
             current_workers: None,
             adaptive_reason: None,
-            targets_total: None,
+            targets_total: Some(500),
         });
         assert!(app.results.is_empty());
         assert!(app.scan_started_ips.contains("192.0.2.1"));
         assert_eq!(app.total_targets, 500);
         assert_eq!(app.scan_progress.probes_completed, 4);
         assert_eq!(app.scan_progress.active_probes, 8);
+
+        app.apply_scan_progress(ScanProgress {
+            phase: ScanPhase::Probing,
+            probes_started: 13,
+            probes_completed: 5,
+            active_probes: 1,
+            targets_completed: 1,
+            latest_target: None,
+            current_workers: Some(2),
+            adaptive_reason: Some("steady".to_string()),
+            targets_total: None,
+        });
+        assert_eq!(app.scan_progress.targets_total, Some(500));
 
         app.begin_scan(3);
         assert!(app.scan_started_ips.is_empty());

@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt::Display,
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
@@ -905,6 +906,7 @@ struct TargetState {
     port: u16,
     url: String,
     client: Option<Client>,
+    construction_failed: bool,
     samples: Vec<f64>,
     protocols: Vec<String>,
     ok: usize,
@@ -958,6 +960,7 @@ impl TargetState {
             port,
             url,
             client,
+            construction_failed: !client_ok,
             samples: Vec::new(),
             protocols: Vec::new(),
             ok: 0,
@@ -1001,7 +1004,11 @@ impl TargetState {
     }
 
     fn has_remaining_probe(&self, probe_count: usize) -> bool {
-        self.warmup_done && self.scheduled < probe_count && !self.in_flight && !self.stopped_early
+        self.warmup_done
+            && !self.construction_failed
+            && self.scheduled < probe_count
+            && !self.in_flight
+            && !self.stopped_early
     }
 
     /// Current best recommendation score from the samples gathered so far,
@@ -1397,37 +1404,24 @@ async fn probe_with_lazy_client(
                 .await
             {
                 Ok(Ok(client)) => client,
-                Ok(Err(error)) => {
-                    return (
-                        None,
-                        Err(ProbeDiagnostic {
-                            category: DiagnosticCategory::ClientSetup,
-                            phase: DiagnosticPhase::ClientConstruction,
-                            message: error.to_string(),
-                            status: None,
-                            location: None,
-                            elapsed_ms: None,
-                        }),
-                    );
-                }
-                Err(error) => {
-                    return (
-                        None,
-                        Err(ProbeDiagnostic {
-                            category: DiagnosticCategory::ClientSetup,
-                            phase: DiagnosticPhase::ClientConstruction,
-                            message: error.to_string(),
-                            status: None,
-                            location: None,
-                            elapsed_ms: None,
-                        }),
-                    );
-                }
+                Ok(Err(error)) => return (None, Err(client_construction_diagnostic(error))),
+                Err(error) => return (None, Err(client_construction_diagnostic(error))),
             }
         }
     };
     let sample = probe_once(&client, &url, &args).await;
     (Some(client), sample)
+}
+
+fn client_construction_diagnostic(error: impl Display) -> ProbeDiagnostic {
+    ProbeDiagnostic {
+        category: DiagnosticCategory::ClientSetup,
+        phase: DiagnosticPhase::ClientConstruction,
+        message: error.to_string(),
+        status: None,
+        location: None,
+        elapsed_ms: None,
+    }
 }
 
 fn remaining_measured_work(states: &[TargetState], probe_count: usize) -> usize {
@@ -1560,20 +1554,27 @@ async fn run_scan_port(
                 break;
             }
 
-            // Prefer measured work that is ready. This interleaves warmup and
-            // measurement: a fast target no longer waits for every sampled IP
-            // (or every port) to finish warmup before producing a result.
-            let next = if args.adaptive_probing {
+            // Prefer measured work, but reserve the last open slot (and the
+            // first slot when idle) for a pending warmup so cold targets do
+            // not starve behind an endless stream of measured probes.
+            let warmup_index = if args.warmup {
+                states
+                    .iter()
+                    .position(|s| !s.warmup_done && !s.warmup_in_flight && !s.in_flight)
+            } else {
+                None
+            };
+            let reserve_warmup = warmup_index.is_some()
+                && (futs.is_empty() || futs.len().saturating_add(1) >= workers);
+            let next = if reserve_warmup {
+                None
+            } else if args.adaptive_probing {
                 select_next_target_adaptive(&mut states, probe_count, args.min_probes)
             } else {
                 select_next_target(&states, probe_count)
             };
             let Some(index) = next else {
-                if args.warmup && futs.len() < workers {
-                    let warmup_index = states
-                        .iter()
-                        .position(|s| !s.warmup_done && !s.warmup_in_flight && !s.in_flight);
-                    let Some(index) = warmup_index else { break };
+                if let Some(index) = warmup_index {
                     let state = &mut states[index];
                     let client = state.client.clone();
                     let host = args.host.clone();
@@ -1688,8 +1689,26 @@ async fn run_scan_port(
                                 // the warmup phase but flag the first successful
                                 // measured probe to be discarded as the cold
                                 // request, keeping its setup cost out of latency.
+                                let construction_failed = matches!(
+                                    diagnostic.category,
+                                    DiagnosticCategory::ClientSetup
+                                );
                                 state.warmup_done = true;
-                                state.warmup_discard_first = true;
+                                state.warmup_discard_first = !construction_failed;
+                                state.construction_failed = construction_failed;
+                                if construction_failed {
+                                    state.fail = probe_count;
+                                    state.scheduled = probe_count;
+                                    state.completed = probe_count;
+                                    let mut result = state.result_with_mode(args.adaptive_probing);
+                                    if include_port_details {
+                                        result.port_results = vec![port_result(&result)];
+                                    }
+                                    let _ = tx.send(result);
+                                    if include_port_details {
+                                        targets_completed += 1;
+                                    }
+                                }
                                 state.diagnostics.push(diagnostic.clone());
                                 state.failures.push(diagnostic.message);
                             }
@@ -1707,6 +1726,14 @@ async fn run_scan_port(
                         }
                         probes_completed += 1;
                         state.completed += 1;
+                        let construction_failed = matches!(
+                            &sample,
+                            Err(diagnostic)
+                                if diagnostic.category == DiagnosticCategory::ClientSetup
+                        );
+                        if construction_failed {
+                            state.construction_failed = true;
+                        }
                         let fallback_cold = sample.is_ok() && state.warmup_discard_first;
                         let adaptive_now = controller.as_ref().map(|_| Instant::now());
                         if let Some(controller) = controller.as_mut() {
@@ -1770,6 +1797,11 @@ async fn run_scan_port(
                                 state.failures.push(diagnostic.message.clone());
                                 state.diagnostics.push(diagnostic);
                             }
+                        }
+                        if construction_failed {
+                            state.fail += probe_count.saturating_sub(state.completed);
+                            state.scheduled = probe_count;
+                            state.completed = probe_count;
                         }
                         let adaptive_min_reached = !args.adaptive_probing || state.completed >= args.min_probes;
                         let legacy_stop = adaptive_min_reached
@@ -2526,6 +2558,7 @@ mod tests {
             port: 443,
             url: String::new(),
             client: None,
+            construction_failed: false,
             samples: samples.to_vec(),
             protocols: Vec::new(),
             ok: samples.len(),
@@ -2877,6 +2910,7 @@ mod tests {
             port: 443,
             url: String::new(),
             client: None,
+            construction_failed: false,
             samples: vec![0.2, 0.3, 0.25],
             protocols: vec!["h2".to_string(); 3],
             ok: 3,
@@ -2934,6 +2968,7 @@ mod tests {
             port: 443,
             url: String::new(),
             client: None,
+            construction_failed: false,
             samples: vec![0.10, 0.20, 0.30],
             protocols: vec!["h2".to_string(); 3],
             ok: 3,
@@ -2977,6 +3012,7 @@ mod tests {
             port: 443,
             url: String::new(),
             client: None,
+            construction_failed: false,
             samples: vec![0.20, 0.20, 0.30, 0.30],
             protocols: vec!["h2".to_string(); 4],
             ok: 4,
@@ -3005,6 +3041,7 @@ mod tests {
             port: 443,
             url: String::new(),
             client: None,
+            construction_failed: false,
             samples: vec![0.10, 0.10, 0.30, 0.30],
             protocols: vec!["h2".to_string(); 4],
             ok: 4,
@@ -3040,6 +3077,7 @@ mod tests {
             port: 443,
             url: String::new(),
             client: None,
+            construction_failed: false,
             samples: vec![0.20, 0.20, 0.20],
             protocols: vec!["h2".to_string(); 3],
             ok: 3,
@@ -3068,6 +3106,7 @@ mod tests {
             port: 443,
             url: String::new(),
             client: None,
+            construction_failed: false,
             samples: vec![0.20, 0.20, 0.20],
             protocols: vec!["h2".to_string(); 3],
             ok: 3,
@@ -3149,6 +3188,7 @@ mod tests {
             port: 443,
             url: String::new(),
             client: None,
+            construction_failed: false,
             samples: vec![0.10, 0.20, 0.30],
             protocols: vec!["h2".to_string(); 3],
             ok: 3,
