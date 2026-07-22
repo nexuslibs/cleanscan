@@ -284,6 +284,7 @@ pub struct App {
     pub edit_caret: usize,
     pub results: Vec<ProbeResult>,
     pub total_targets: usize,
+    pub scan_started_ips: HashSet<String>,
     pub scan_progress: ScanProgressState,
     /// Exact sampled targets shown in the review screen and used for the run.
     pub preview_targets: Vec<String>,
@@ -685,6 +686,7 @@ impl App {
             edit_caret: 0,
             results: Vec::new(),
             total_targets: 0,
+            scan_started_ips: HashSet::new(),
             scan_progress: ScanProgressState::default(),
             preview_targets: Vec::new(),
             last_targets: Vec::new(),
@@ -858,6 +860,7 @@ impl App {
         self.show_result_details = false;
         self.detail_tab = 0;
         self.total_targets = total;
+        self.scan_started_ips.clear();
         self.scan_progress = ScanProgressState::default();
         self.scan_complete = false;
         self.scan_lifecycle = ScanLifecycle::Running;
@@ -1011,6 +1014,9 @@ impl App {
     }
 
     pub fn apply_scan_progress(&mut self, progress: ScanProgress) {
+        if let Some(ip) = &progress.latest_target {
+            self.scan_started_ips.insert(ip.clone());
+        }
         self.scan_progress = ScanProgressState {
             phase: progress.phase,
             probes_started: self
