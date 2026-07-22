@@ -1,3 +1,6 @@
+use crate::scanner::{result_confidence, result_status, ProbeResult};
+use crate::tui::theme;
+use crate::tui::{modal_overlay, widgets, App, ButtonAction, ButtonKind, ScanLifecycle};
 use ratatui::{
     layout::{Constraint, Direction, Flex, Layout, Rect},
     style::Style,
@@ -10,11 +13,6 @@ use ratatui::{
     },
     Frame,
 };
-use std::collections::HashMap;
-
-use crate::scanner::{result_confidence, result_status, ProbeResult};
-use crate::tui::theme;
-use crate::tui::{modal_overlay, widgets, App, ButtonAction, ButtonKind, ScanLifecycle};
 use std::time::{Duration, Instant};
 
 pub const RESULT_COLUMNS: [&str; 14] = [
@@ -810,7 +808,10 @@ fn phase_label(phase: crate::scanner::ScanPhase) -> &'static str {
 
 fn progress_counts(app: &App) -> (usize, usize) {
     let completed = app.scan_progress.targets_completed;
-    let total = app.total_targets.max(completed);
+    let total = app
+        .total_targets
+        .max(app.scan_progress.targets_total.unwrap_or(0))
+        .max(completed);
     (completed.min(total), total)
 }
 
@@ -820,18 +821,16 @@ fn unique_ip_counts(app: &App) -> (usize, usize, usize, usize) {
     // partial result must remain unresolved until the whole scan completes.
     let has_pending_ip_work =
         app.config.ports.len() > 1 || !app.config.health_checks.is_empty() || app.config.two_phase;
-    let mut statuses: HashMap<&str, bool> = HashMap::new();
-    for result in &app.results {
-        let status = statuses.entry(result.ip.as_str()).or_insert(false);
-        *status |= result.ok > 0;
-    }
-    let succeeded = statuses.values().filter(|&&ok| ok).count();
+    let succeeded = app.scan_succeeded_ips.len();
     let failed = if has_pending_ip_work && !app.scan_complete {
         0
     } else {
-        statuses.len().saturating_sub(succeeded)
+        app.scan_result_ips.len().saturating_sub(succeeded)
     };
-    let waiting = app.total_targets.saturating_sub(app.scan_started_ips.len());
+    let total = app
+        .total_targets
+        .max(app.scan_progress.targets_total.unwrap_or(0));
+    let waiting = total.saturating_sub(app.scan_started_ips.len());
     // "Scanned" means work has started for the unique IP, including active
     // and warmup work. This keeps scanned + waiting == total.
     (app.scan_started_ips.len(), succeeded, failed, waiting)
@@ -1650,13 +1649,13 @@ mod tests {
         app.total_targets = 3;
         app.scan_started_ips
             .extend(["192.0.2.1".to_string(), "192.0.2.2".to_string()]);
-        app.results.push(result("192.0.2.1", 1.0, &[0.1]));
+        app.add_result(result("192.0.2.1", 1.0, &[0.1]));
         let mut failed = result("192.0.2.2", 0.0, &[]);
         failed.ok = 0;
         failed.fail = 1;
         failed.completed = 1;
         failed.health_ok = false;
-        app.results.push(failed);
+        app.add_result(failed);
 
         assert_eq!(unique_ip_counts(&app), (2, 1, 0, 1));
 
@@ -1682,7 +1681,32 @@ mod tests {
         failed.fail = 1;
         failed.completed = 1;
         failed.health_ok = false;
-        app.results.push(failed);
+        app.add_result(failed);
         assert_eq!(unique_ip_counts(&app), (1, 0, 1, 0));
+    }
+
+    #[test]
+    fn unique_ip_success_wins_over_failure_across_ports() {
+        let mut app = App::new(
+            AppConfig {
+                ports: vec![443, 8443],
+                ..AppConfig::default()
+            },
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.total_targets = 1;
+        app.scan_started_ips.insert("192.0.2.10".to_string());
+        let mut failed = result("192.0.2.10", 0.0, &[]);
+        failed.ok = 0;
+        failed.fail = 1;
+        failed.completed = 1;
+        failed.health_ok = false;
+        app.add_result(failed);
+        app.add_result(result("192.0.2.10", 1.0, &[0.1]));
+        app.scan_complete = true;
+        app.scan_lifecycle = ScanLifecycle::Completed;
+
+        assert_eq!(unique_ip_counts(&app), (1, 1, 0, 0));
     }
 }

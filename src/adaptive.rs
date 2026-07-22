@@ -356,7 +356,11 @@ impl AdaptivePolicy {
     /// burst of same-timestamp synthetic events as an infinite rate makes the
     /// plateau detector permanently over-optimistic.
     fn throughput_per_second(&self, now: Instant) -> Option<f64> {
-        let observations = self.observations_at(now);
+        let observations: Vec<_> = self
+            .observations_at(now)
+            .into_iter()
+            .filter(|observation| observation.kind != ObservationKind::Cancelled)
+            .collect();
         let first = observations.first()?.at;
         let last = observations.last()?.at;
         let elapsed = elapsed_since(last, first).as_secs_f64();
@@ -379,7 +383,9 @@ impl AdaptivePolicy {
     fn observations_since(&self, now: Instant, anchor: Instant) -> usize {
         self.observations_at(now)
             .into_iter()
-            .filter(|observation| observation.at > anchor)
+            .filter(|observation| {
+                observation.at > anchor && observation.kind != ObservationKind::Cancelled
+            })
             .count()
     }
 
@@ -1033,5 +1039,24 @@ mod tests {
                 .resized
         );
         assert_eq!(policy.workers, 7);
+    }
+
+    #[test]
+    fn cancelled_observations_do_not_inflate_throughput() {
+        let start = Instant::now();
+        let mut policy = AdaptivePolicy::with_params(5, 1, 6, params());
+        for millis in [0, 200, 400, 600] {
+            policy.record(success(start + Duration::from_millis(millis), Some(10.0)));
+        }
+        policy.record(ProbeObservation {
+            kind: ObservationKind::Cancelled,
+            latency: None,
+            at: start + Duration::from_millis(800),
+        });
+
+        // Four real completions over 600ms is the rate; the cancelled task is
+        // not a completed probe and must not make this look like five.
+        let rate = policy.throughput_per_second(start + Duration::from_secs(1));
+        assert_eq!(rate, Some(4.0 / 0.6));
     }
 }

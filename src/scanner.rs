@@ -40,8 +40,13 @@ pub struct ScanProgress {
     pub current_workers: Option<usize>,
     #[serde(default)]
     pub adaptive_reason: Option<String>,
+    /// Authoritative unique-target total when the scanner discovers targets
+    /// dynamically, such as during a two-phase focus pass.
+    #[serde(default)]
+    pub targets_total: Option<usize>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_progress(
     progress: Option<&std::sync::mpsc::Sender<ScanProgress>>,
     phase: ScanPhase,
@@ -50,6 +55,7 @@ fn send_progress(
     active_probes: usize,
     targets_completed: usize,
     latest_target: Option<String>,
+    targets_total: Option<usize>,
 ) {
     if let Some(tx) = progress {
         let _ = tx.send(ScanProgress {
@@ -61,6 +67,7 @@ fn send_progress(
             latest_target,
             current_workers: None,
             adaptive_reason: None,
+            targets_total,
         });
     }
 }
@@ -87,6 +94,7 @@ fn send_progress_with_workers(
             latest_target,
             current_workers: Some(current_workers),
             adaptive_reason: adaptive_reason.map(str::to_string),
+            targets_total: None,
         });
     }
 }
@@ -934,8 +942,11 @@ struct TargetState {
 impl TargetState {
     fn new(ip: String, args: &AppConfig, probe_count: usize, port: u16) -> Self {
         let url = format!("https://{}{}", https_authority(&args.host, port), args.path);
-        let client = client_for_ip(&args.host, &ip, args, port).ok();
-        let client_ok = client.is_some();
+        // Client construction is deferred until the target is actually
+        // scheduled. This keeps large target sets from blocking scanner
+        // startup before the first warmup can be dispatched.
+        let client = None;
+        let client_ok = ip.parse::<IpAddr>().is_ok();
         let (fail, loss, scheduled, completed) = if client_ok {
             (0, 0, 0, 0)
         } else {
@@ -1331,12 +1342,92 @@ fn record_best(best: &mut Vec<(f64, f64)>, result: &ProbeResult, top: usize) {
 enum ProbeOutcome {
     Warmup {
         index: usize,
+        client: Option<Client>,
         sample: Result<(f64, String, Option<String>), ProbeDiagnostic>,
     },
     Measured {
         index: usize,
+        client: Option<Client>,
         sample: Result<(f64, String, Option<String>), ProbeDiagnostic>,
     },
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn probe_with_lazy_client(
+    client: Option<Client>,
+    host: String,
+    ip: String,
+    port: u16,
+    url: String,
+    args: Arc<AppConfig>,
+    sem: Arc<Semaphore>,
+    cancel: Arc<AtomicBool>,
+) -> (
+    Option<Client>,
+    Result<(f64, String, Option<String>), ProbeDiagnostic>,
+) {
+    let permit = tokio::select! {
+        biased;
+        permit = sem.acquire_owned() => permit.ok(),
+        _ = async {
+            while !cancel.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        } => None,
+    };
+    let Some(_permit) = permit else {
+        return (
+            client,
+            Err(ProbeDiagnostic {
+                category: DiagnosticCategory::Cancelled,
+                phase: DiagnosticPhase::Cancellation,
+                message: "cancelled".to_string(),
+                status: None,
+                location: None,
+                elapsed_ms: None,
+            }),
+        );
+    };
+
+    let client = match client {
+        Some(client) => client,
+        None => {
+            let build_args = args.clone();
+            match tokio::task::spawn_blocking(move || client_for_ip(&host, &ip, &build_args, port))
+                .await
+            {
+                Ok(Ok(client)) => client,
+                Ok(Err(error)) => {
+                    return (
+                        None,
+                        Err(ProbeDiagnostic {
+                            category: DiagnosticCategory::ClientSetup,
+                            phase: DiagnosticPhase::ClientConstruction,
+                            message: error.to_string(),
+                            status: None,
+                            location: None,
+                            elapsed_ms: None,
+                        }),
+                    );
+                }
+                Err(error) => {
+                    return (
+                        None,
+                        Err(ProbeDiagnostic {
+                            category: DiagnosticCategory::ClientSetup,
+                            phase: DiagnosticPhase::ClientConstruction,
+                            message: error.to_string(),
+                            status: None,
+                            location: None,
+                            elapsed_ms: None,
+                        }),
+                    );
+                }
+            }
+        }
+    };
+    let sample = probe_once(&client, &url, &args).await;
+    (Some(client), sample)
 }
 
 fn remaining_measured_work(states: &[TargetState], probe_count: usize) -> usize {
@@ -1484,11 +1575,10 @@ async fn run_scan_port(
                         .position(|s| !s.warmup_done && !s.warmup_in_flight && !s.in_flight);
                     let Some(index) = warmup_index else { break };
                     let state = &mut states[index];
-                    let client = state
-                        .client
-                        .as_ref()
-                        .expect("targets without clients are completed during initialization")
-                        .clone();
+                    let client = state.client.clone();
+                    let host = args.host.clone();
+                    let ip = state.ip.clone();
+                    let port = state.port;
                     let url = state.url.clone();
                     let probe_args = args.clone();
                     state.warmup_in_flight = true;
@@ -1507,38 +1597,25 @@ async fn run_scan_port(
                     let sem = sem.clone();
                     let cancel = cancel.clone();
                     futs.push(tokio::spawn(async move {
-                        let permit = tokio::select! {
-                            biased;
-                            permit = sem.acquire_owned() => permit.ok(),
-                            _ = async {
-                                while !cancel.load(Ordering::Relaxed) {
-                                    tokio::time::sleep(Duration::from_millis(25)).await;
-                                }
-                            } => None,
-                        };
-                        let sample = match permit {
-                            Some(_permit) => probe_once(&client, &url, &probe_args).await,
-                            None => Err(ProbeDiagnostic {
-                                category: DiagnosticCategory::Cancelled,
-                                phase: DiagnosticPhase::Cancellation,
-                                message: "cancelled".to_string(),
-                                status: None,
-                                location: None,
-                                elapsed_ms: None,
-                            }),
-                        };
-                        ProbeOutcome::Warmup { index, sample }
+                        let (client, sample) = probe_with_lazy_client(
+                            client, host, ip, port, url, probe_args, sem, cancel,
+                        )
+                        .await;
+                        ProbeOutcome::Warmup {
+                            index,
+                            client,
+                            sample,
+                        }
                     }));
                     continue;
                 }
                 break;
             };
             let state = &mut states[index];
-            let client = state
-                .client
-                .as_ref()
-                .expect("targets without clients are completed during initialization")
-                .clone();
+            let client = state.client.clone();
+            let host = args.host.clone();
+            let ip = state.ip.clone();
+            let port = state.port;
             let url = state.url.clone();
             let probe_args = args.clone();
             state.scheduled += 1;
@@ -1559,27 +1636,14 @@ async fn run_scan_port(
             let cancel = cancel.clone();
 
             futs.push(tokio::spawn(async move {
-                let permit = tokio::select! {
-                    biased;
-                    permit = sem.acquire_owned() => permit.ok(),
-                    _ = async {
-                        while !cancel.load(Ordering::Relaxed) {
-                            tokio::time::sleep(Duration::from_millis(25)).await;
-                        }
-                    } => None,
-                };
-                let sample = match permit {
-                    Some(_permit) => probe_once(&client, &url, &probe_args).await,
-                    None => Err(ProbeDiagnostic {
-                        category: DiagnosticCategory::Cancelled,
-                        phase: DiagnosticPhase::Cancellation,
-                        message: "cancelled".to_string(),
-                        status: None,
-                        location: None,
-                        elapsed_ms: None,
-                    }),
-                };
-                ProbeOutcome::Measured { index, sample }
+                let (client, sample) =
+                    probe_with_lazy_client(client, host, ip, port, url, probe_args, sem, cancel)
+                        .await;
+                ProbeOutcome::Measured {
+                    index,
+                    client,
+                    sample,
+                }
             }));
         }
 
@@ -1599,10 +1663,17 @@ async fn run_scan_port(
             joined = futs.next() => {
                 let Some(Ok(outcome)) = joined else { continue };
                 match outcome {
-                    ProbeOutcome::Warmup { index, sample } => {
+                    ProbeOutcome::Warmup {
+                        index,
+                        client,
+                        sample,
+                    } => {
                         probes_completed += 1;
                         let state = &mut states[index];
                         state.warmup_in_flight = false;
+                        if client.is_some() {
+                            state.client = client;
+                        }
                         match sample {
                             Ok((value, _protocol, colo)) => {
                                 state.warmup_done = true;
@@ -1624,9 +1695,16 @@ async fn run_scan_port(
                             }
                         }
                     }
-                    ProbeOutcome::Measured { index, sample } => {
+                    ProbeOutcome::Measured {
+                        index,
+                        client,
+                        sample,
+                    } => {
                         let state = &mut states[index];
                         state.in_flight = false;
+                        if client.is_some() {
+                            state.client = client;
+                        }
                         probes_completed += 1;
                         state.completed += 1;
                         let fallback_cold = sample.is_ok() && state.warmup_discard_first;
@@ -1868,6 +1946,7 @@ async fn run_scan_with_progress_from_offsets(
         0,
         progress_offsets.2,
         None,
+        None,
     );
     for (_, results) in by_ip {
         if let Some(result) = merge_port_results(&results) {
@@ -2020,6 +2099,7 @@ async fn run_profile_scan_with_progress_from_offsets(
         progress_offsets.1,
         0,
         progress_offsets.2,
+        None,
         None,
     );
     progress_offsets
@@ -2319,7 +2399,16 @@ pub async fn run_scan_two_phase_with_progress(
     };
 
     // Discovery pass.
-    send_progress(progress.as_ref(), ScanPhase::Discovery, 0, 0, 0, 0, None);
+    send_progress(
+        progress.as_ref(),
+        ScanPhase::Discovery,
+        0,
+        0,
+        0,
+        0,
+        None,
+        None,
+    );
     let (p1_tx, p1_rx) = std::sync::mpsc::channel();
     let targets1 = collect_from_cidrs_with_seed(&selected_cidrs, discover_per, base_seed)?;
     let mut actual_targets: BTreeSet<String> = targets1.iter().cloned().collect();
@@ -2379,9 +2468,23 @@ pub async fn run_scan_two_phase_with_progress(
         }
     }
 
+    // Discovery and focus represent one unique-IP workload. A random sample
+    // can overlap the discovery set, so remove those IPs before scheduling the
+    // focus pass; otherwise target-completion progress counts a repeated IP as
+    // a new target even though the dashboard correctly deduplicates it.
+    targets2.retain(|ip| !actual_targets.contains(ip));
     if !targets2.is_empty() {
         actual_targets.extend(targets2.iter().cloned());
-        send_progress(progress.as_ref(), ScanPhase::Focus, 0, 0, 0, 0, None);
+        send_progress(
+            progress.as_ref(),
+            ScanPhase::Focus,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Some(actual_targets.len()),
+        );
         run_scan_with_progress_from_offsets(
             targets2.into_iter().collect(),
             config,

@@ -64,6 +64,7 @@ pub struct ScanProgressState {
     pub latest_target: Option<String>,
     pub current_workers: Option<usize>,
     pub adaptive_reason: Option<String>,
+    pub targets_total: Option<usize>,
 }
 
 impl Default for ScanProgressState {
@@ -77,6 +78,7 @@ impl Default for ScanProgressState {
             latest_target: None,
             current_workers: None,
             adaptive_reason: None,
+            targets_total: None,
         }
     }
 }
@@ -285,6 +287,10 @@ pub struct App {
     pub results: Vec<ProbeResult>,
     pub total_targets: usize,
     pub scan_started_ips: HashSet<String>,
+    /// Unique IPs with at least one emitted result in the current scan.
+    pub scan_result_ips: HashSet<String>,
+    /// Unique IPs with at least one successful emitted result.
+    pub scan_succeeded_ips: HashSet<String>,
     pub scan_progress: ScanProgressState,
     /// Exact sampled targets shown in the review screen and used for the run.
     pub preview_targets: Vec<String>,
@@ -687,6 +693,8 @@ impl App {
             results: Vec::new(),
             total_targets: 0,
             scan_started_ips: HashSet::new(),
+            scan_result_ips: HashSet::new(),
+            scan_succeeded_ips: HashSet::new(),
             scan_progress: ScanProgressState::default(),
             preview_targets: Vec::new(),
             last_targets: Vec::new(),
@@ -861,6 +869,8 @@ impl App {
         self.detail_tab = 0;
         self.total_targets = total;
         self.scan_started_ips.clear();
+        self.scan_result_ips.clear();
+        self.scan_succeeded_ips.clear();
         self.scan_progress = ScanProgressState::default();
         self.scan_complete = false;
         self.scan_lifecycle = ScanLifecycle::Running;
@@ -1010,6 +1020,10 @@ impl App {
     }
 
     pub fn add_result(&mut self, result: ProbeResult) {
+        self.scan_result_ips.insert(result.ip.clone());
+        if result.ok > 0 {
+            self.scan_succeeded_ips.insert(result.ip.clone());
+        }
         self.results.push(result);
     }
 
@@ -1039,6 +1053,7 @@ impl App {
             adaptive_reason: progress
                 .adaptive_reason
                 .or(self.scan_progress.adaptive_reason.clone()),
+            targets_total: progress.targets_total.or(self.scan_progress.targets_total),
         };
     }
 
@@ -4121,6 +4136,7 @@ mod tests {
             latest_target: Some("192.0.2.1".to_string()),
             current_workers: None,
             adaptive_reason: None,
+            targets_total: None,
         });
         assert!(app.results.is_empty());
         assert_eq!(app.total_targets, 500);
