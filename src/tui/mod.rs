@@ -1971,7 +1971,10 @@ pub fn run_tui(
 
             if let Some(receiver) = update_receiver.as_ref() {
                 if let Ok(notice) = receiver.try_recv() {
-                    app.toast_info(notice);
+                    // Keep update availability visible until acknowledged by
+                    // another message; the background check may finish after
+                    // the user has already entered the wizard.
+                    app.toast_warn(notice);
                     update_receiver = None;
                 }
             }
