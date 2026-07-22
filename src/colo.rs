@@ -34,6 +34,7 @@ mod tests {
         assert_eq!(lookup_country("fra"), Some("Germany"));
         assert_eq!(lookup_country("FRA"), Some("Germany"));
         assert_eq!(lookup_country("AMS"), Some("Netherlands"));
+        assert_eq!(lookup_country("IAD"), Some("United States"));
     }
 
     #[test]
