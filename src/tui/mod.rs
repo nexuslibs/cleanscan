@@ -302,6 +302,7 @@ pub struct App {
     pub preview_targets: Vec<String>,
     preview_rx: Option<std::sync::mpsc::Receiver<Result<Vec<String>, String>>>,
     preview_pending: bool,
+    preview_failed: bool,
     pub last_targets: Vec<String>,
     pub scan_seed: u64,
     pub scan_complete: bool,
@@ -715,6 +716,7 @@ impl App {
             preview_targets: Vec::new(),
             preview_rx: None,
             preview_pending: false,
+            preview_failed: false,
             last_targets: Vec::new(),
             scan_seed,
             scan_complete: false,
@@ -933,14 +935,16 @@ impl App {
     pub fn set_scan_targets(&mut self, targets: Vec<String>) {
         self.last_targets = targets.clone();
         self.preview_targets = targets;
+        self.preview_failed = false;
     }
 
     pub fn invalidate_preview(&mut self) {
         self.preview_targets.clear();
+        self.preview_failed = false;
     }
 
     pub fn refresh_preview(&mut self) {
-        if self.preview_pending {
+        if self.preview_pending || self.preview_failed {
             return;
         }
         let seed = self.scan_seed;
@@ -977,9 +981,13 @@ impl App {
         match result {
             Ok(targets) => {
                 self.preview_targets = targets;
+                self.preview_failed = false;
                 self.toast_success(format!("Generated {} targets", self.preview_targets.len()));
             }
-            Err(error) => self.toast_error(format!("Preview failed: {error}")),
+            Err(error) => {
+                self.preview_failed = true;
+                self.toast_error(format!("Preview failed: {error}"));
+            }
         }
     }
 
@@ -998,16 +1006,19 @@ impl App {
     }
 
     pub fn regenerate_preview(&mut self) -> bool {
+        self.preview_failed = false;
         let seed = rand::random();
         match self.collect_preview(seed) {
             Ok(targets) => {
                 self.scan_seed = seed;
                 self.config.seed = seed;
                 self.preview_targets = targets;
+                self.preview_failed = false;
                 self.toast_success(format!("Generated {} targets", self.preview_targets.len()));
                 true
             }
             Err(error) => {
+                self.preview_failed = true;
                 self.toast_error(format!("Preview failed: {error}"));
                 false
             }
@@ -1016,22 +1027,26 @@ impl App {
 
     pub fn set_explicit_target_source(&mut self, cidrs: Vec<String>, ips: Option<String>) {
         self.explicit_target_source = Some((cidrs, ips));
+        self.preview_failed = false;
     }
 
     fn regenerate_explicit_preview(&mut self) -> bool {
         if self.explicit_target_source.is_none() {
             return false;
         }
+        self.preview_failed = false;
         let seed = rand::random();
         match self.collect_preview(seed) {
             Ok(targets) => {
                 self.scan_seed = seed;
                 self.config.seed = seed;
                 self.preview_targets = targets;
+                self.preview_failed = false;
                 self.toast_success(format!("Generated {} targets", self.preview_targets.len()));
                 true
             }
             Err(error) => {
+                self.preview_failed = true;
                 self.toast_error(format!("Preview failed: {error}"));
                 false
             }
@@ -1344,85 +1359,6 @@ impl App {
             .into_iter()
             .map(|index| &self.results[index])
             .collect()
-        /*
-        let mut v: Vec<&ProbeResult> = self
-            .results
-            .iter()
-            .filter(|r| self.show_failures || r.ok > 0)
-            .filter(|r| match &self.colo_filter {
-                Some(want) => r
-                    .colo
-                    .as_deref()
-                    .is_some_and(|c| c.eq_ignore_ascii_case(want)),
-                None => true,
-            })
-            .filter(|r| match &self.country_filter {
-                Some(want) => r
-                    .country
-                    .as_deref()
-                    .is_some_and(|c| c.to_lowercase().contains(&want.to_lowercase())),
-                None => true,
-            })
-            .collect();
-        if self.sort_col == 0 {
-            v.sort_by(|a, b| {
-                let ord = Self::natural_cmp(a, b);
-                if self.sort_asc {
-                    ord
-                } else {
-                    ord.reverse()
-                }
-            });
-            return v;
-        }
-        let cmp = |a: &&ProbeResult, b: &&ProbeResult| -> std::cmp::Ordering {
-            let (a, b) = (*a, *b);
-            let ord = match self.sort_col {
-                1 => a.ip.cmp(&b.ip),
-                2 => a.protocol.cmp(&b.protocol),
-                3 => a.ok.cmp(&b.ok),
-                4 => a.fail.cmp(&b.fail),
-                5 => a
-                    .avg
-                    .partial_cmp(&b.avg)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                6 => a
-                    .p50
-                    .partial_cmp(&b.p50)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                7 => a
-                    .p90
-                    .partial_cmp(&b.p90)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                8 => a
-                    .p95
-                    .partial_cmp(&b.p95)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                9 => a
-                    .max
-                    .partial_cmp(&b.max)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                10 => a.colo.cmp(&b.colo),
-                11 => a.country.cmp(&b.country),
-                12 => a
-                    .jitter
-                    .partial_cmp(&b.jitter)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                13 => a
-                    .packet_loss
-                    .partial_cmp(&b.packet_loss)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                _ => std::cmp::Ordering::Equal,
-            };
-            if self.sort_asc {
-                ord
-            } else {
-                ord.reverse()
-            }
-        };
-        v.sort_by(cmp);
-        v
-        */
     }
 
     // --- shared rendering helpers (also record mouse hit regions) ---

@@ -263,50 +263,37 @@ fn render_failure_summary(app: &App, frame: &mut Frame, area: Rect) {
     } else {
         " • details pending"
     };
-    let wide = format!(
-        "Probe failures: Request timeout {} • Connect timeout {} • Connection/TLS {} • General errors {}{}",
-        counts.request_timeout, counts.connect_timeout, counts.connection_tls, counts.general_errors, suffix
-    );
-    let compact = format!(
-        "Failures: Req TO {} • Conn TO {} • Conn/TLS {} • Errors {}{}",
-        counts.request_timeout,
-        counts.connect_timeout,
-        counts.connection_tls,
-        counts.general_errors,
-        suffix
-    );
     let narrow_suffix = if has_failures && inspectable && !app.show_failures {
         " • f"
     } else {
         ""
     };
-    let narrow = format!(
-        "F rTO:{} cTO:{} net:{} err:{}{}",
-        counts.request_timeout,
-        counts.connect_timeout,
-        counts.connection_tls,
-        counts.general_errors,
-        narrow_suffix
-    );
-    let (text, mode) = if wide.chars().count() <= area.width as usize {
-        (wide, FailureSummaryMode::Wide)
-    } else if compact.chars().count() <= area.width as usize {
-        (compact, FailureSummaryMode::Compact)
-    } else if narrow.chars().count() <= area.width as usize {
-        (narrow, FailureSummaryMode::Narrow)
+    let mode = if failure_summary_text(counts, FailureSummaryMode::Wide, suffix).len()
+        <= area.width as usize
+    {
+        FailureSummaryMode::Wide
+    } else if failure_summary_text(counts, FailureSummaryMode::Compact, suffix).len()
+        <= area.width as usize
+    {
+        FailureSummaryMode::Compact
+    } else if failure_summary_text(counts, FailureSummaryMode::Narrow, narrow_suffix).len()
+        <= area.width as usize
+    {
+        FailureSummaryMode::Narrow
     } else {
-        (
-            format!(
-                "F r:{} c:{} n:{} e:{}",
-                counts.request_timeout,
-                counts.connect_timeout,
-                counts.connection_tls,
-                counts.general_errors
-            ),
-            FailureSummaryMode::Shortest,
-        )
+        FailureSummaryMode::Shortest
     };
-    let line = failure_summary_line(&text, counts, mode);
+    let line = failure_summary_line(
+        counts,
+        mode,
+        if matches!(mode, FailureSummaryMode::Narrow) {
+            narrow_suffix
+        } else if matches!(mode, FailureSummaryMode::Shortest) {
+            ""
+        } else {
+            suffix
+        },
+    );
     frame.render_widget(Paragraph::new(line), area);
 }
 
@@ -319,59 +306,100 @@ enum FailureSummaryMode {
 }
 
 fn failure_summary_line(
-    text: &str,
     counts: ProbeFailureCounts,
     mode: FailureSummaryMode,
+    suffix: &str,
 ) -> Line<'static> {
-    let prefix_len = match mode {
-        FailureSummaryMode::Wide => "Probe failures:".len(),
-        FailureSummaryMode::Compact => "Failures:".len(),
-        FailureSummaryMode::Narrow | FailureSummaryMode::Shortest => 1,
-    };
-    let mut spans = vec![Span::styled(
-        text[..prefix_len].to_string(),
-        theme::title_style(),
-    )];
-    let rest = &text[prefix_len..];
-    let styles = [
-        theme::warn_style(),
-        theme::warn_style(),
-        theme::bad_style(),
-        theme::bad_style(),
-    ];
-    let values = [
-        counts.request_timeout.to_string(),
-        counts.connect_timeout.to_string(),
-        counts.connection_tls.to_string(),
-        counts.general_errors.to_string(),
-    ];
-    let mut cursor = 0;
-    for value in values {
-        let Some(offset) = rest[cursor..].find(&value) else {
-            continue;
+    let mut spans = Vec::new();
+    macro_rules! label {
+        ($text:expr) => {
+            spans.push(Span::styled($text.to_string(), theme::hint_style()))
         };
-        let offset = cursor + offset;
-        if offset > cursor {
-            spans.push(Span::styled(
-                rest[cursor..offset].to_string(),
-                theme::hint_style(),
-            ));
-        }
-        let index = spans
-            .iter()
-            .filter(|span| span.style == theme::warn_style() || span.style == theme::bad_style())
-            .count()
-            .min(3);
-        spans.push(Span::styled(value.clone(), styles[index]));
-        cursor = offset + value.len();
     }
-    if cursor < rest.len() {
-        spans.push(Span::styled(
-            rest[cursor..].to_string(),
-            theme::hint_style(),
-        ));
+    macro_rules! count {
+        ($value:expr, $style:expr) => {
+            spans.push(Span::styled($value.to_string(), $style))
+        };
+    }
+    match mode {
+        FailureSummaryMode::Wide => {
+            spans.push(Span::styled(
+                "Probe failures:".to_string(),
+                theme::title_style(),
+            ));
+            label!(" Request timeout ");
+            count!(counts.request_timeout, theme::warn_style());
+            label!(" • Connect timeout ");
+            count!(counts.connect_timeout, theme::warn_style());
+            label!(" • Connection/TLS ");
+            count!(counts.connection_tls, theme::bad_style());
+            label!(" • General errors ");
+            count!(counts.general_errors, theme::bad_style());
+        }
+        FailureSummaryMode::Compact => {
+            spans.push(Span::styled("Failures:".to_string(), theme::title_style()));
+            label!(" Req TO ");
+            count!(counts.request_timeout, theme::warn_style());
+            label!(" • Conn TO ");
+            count!(counts.connect_timeout, theme::warn_style());
+            label!(" • Conn/TLS ");
+            count!(counts.connection_tls, theme::bad_style());
+            label!(" • Errors ");
+            count!(counts.general_errors, theme::bad_style());
+        }
+        FailureSummaryMode::Narrow => {
+            spans.push(Span::styled("F".to_string(), theme::title_style()));
+            label!(" rTO:");
+            count!(counts.request_timeout, theme::warn_style());
+            label!(" cTO:");
+            count!(counts.connect_timeout, theme::warn_style());
+            label!(" net:");
+            count!(counts.connection_tls, theme::bad_style());
+            label!(" err:");
+            count!(counts.general_errors, theme::bad_style());
+        }
+        FailureSummaryMode::Shortest => {
+            spans.push(Span::styled("F".to_string(), theme::title_style()));
+            label!(" r:");
+            count!(counts.request_timeout, theme::warn_style());
+            label!(" c:");
+            count!(counts.connect_timeout, theme::warn_style());
+            label!(" n:");
+            count!(counts.connection_tls, theme::bad_style());
+            label!(" e:");
+            count!(counts.general_errors, theme::bad_style());
+        }
+    }
+    if !suffix.is_empty() {
+        label!(suffix);
     }
     Line::from(spans)
+}
+
+fn failure_summary_text(
+    counts: ProbeFailureCounts,
+    mode: FailureSummaryMode,
+    suffix: &str,
+) -> String {
+    let text = match mode {
+        FailureSummaryMode::Wide => format!(
+            "Probe failures: Request timeout {} • Connect timeout {} • Connection/TLS {} • General errors {}",
+            counts.request_timeout, counts.connect_timeout, counts.connection_tls, counts.general_errors
+        ),
+        FailureSummaryMode::Compact => format!(
+            "Failures: Req TO {} • Conn TO {} • Conn/TLS {} • Errors {}",
+            counts.request_timeout, counts.connect_timeout, counts.connection_tls, counts.general_errors
+        ),
+        FailureSummaryMode::Narrow => format!(
+            "F rTO:{} cTO:{} net:{} err:{}",
+            counts.request_timeout, counts.connect_timeout, counts.connection_tls, counts.general_errors
+        ),
+        FailureSummaryMode::Shortest => format!(
+            "F r:{} c:{} n:{} e:{}",
+            counts.request_timeout, counts.connect_timeout, counts.connection_tls, counts.general_errors
+        ),
+    };
+    format!("{text}{suffix}")
 }
 
 fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -1707,7 +1735,7 @@ mod tests {
             general_errors: 4,
         };
         let text = "Probe failures: Request timeout 12 • Connect timeout 3 • Connection/TLS 2 • General errors 4";
-        let line = failure_summary_line(text, counts, FailureSummaryMode::Wide);
+        let line = failure_summary_line(counts, FailureSummaryMode::Wide, "");
         let rendered = line
             .spans
             .iter()

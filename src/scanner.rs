@@ -1734,6 +1734,11 @@ async fn run_scan_port(
     let mut probes_completed = progress_offsets.probes_completed;
     let mut targets_completed = progress_offsets.targets_completed;
     let mut failure_counts = progress_offsets.failure_counts;
+    for state in &states {
+        for diagnostic in &state.diagnostics {
+            failure_counts.record(diagnostic);
+        }
+    }
 
     let warming_phase = progress_phase.unwrap_or(if args.warmup {
         ScanPhase::WarmingUp
@@ -1933,6 +1938,7 @@ async fn run_scan_port(
                                 }
                             }
                             Err(diagnostic) => {
+                                failure_counts.record(&diagnostic);
                                 // The warmup could not establish the connection,
                                 // so it is not ready for steady-state timing. End
                                 // the warmup phase but flag the first successful
