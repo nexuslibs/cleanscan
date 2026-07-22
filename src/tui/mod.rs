@@ -334,6 +334,8 @@ pub struct App {
     pub last_tp_instant: Instant,
     /// Result count at the last throughput sample.
     pub last_tp_count: usize,
+    /// Probe-completion snapshots used for the rolling dashboard rate.
+    pub probe_rate_history: Vec<(Instant, usize)>,
     // --- mouse hit-testing regions (recomputed every render) ---
     pub buttons: Vec<(Rect, ButtonAction)>,
     pub ranges_inner: Option<Rect>,
@@ -718,6 +720,7 @@ impl App {
             throughput: Vec::new(),
             last_tp_instant: Instant::now(),
             last_tp_count: 0,
+            probe_rate_history: Vec::new(),
             buttons: Vec::new(),
             ranges_inner: None,
             settings_inner: None,
@@ -871,6 +874,7 @@ impl App {
         self.throughput.clear();
         self.last_tp_instant = Instant::now();
         self.last_tp_count = 0;
+        self.probe_rate_history.clear();
     }
 
     pub fn set_cancel_token(&mut self, cancel: Arc<AtomicBool>) {
@@ -1994,6 +1998,13 @@ pub fn run_tui(
                 }
                 app.last_tp_count = now_count;
                 app.last_tp_instant = Instant::now();
+                let now = Instant::now();
+                app.probe_rate_history
+                    .push((now, app.scan_progress.probes_completed));
+                app.probe_rate_history.retain(|(at, _)| {
+                    now.checked_duration_since(*at)
+                        .is_some_and(|age| age <= Duration::from_secs(15))
+                });
             }
 
             if app.screen == Screen::Wizard

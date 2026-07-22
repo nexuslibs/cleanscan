@@ -14,7 +14,7 @@ use ratatui::{
 use crate::scanner::{result_confidence, result_status, ProbeResult};
 use crate::tui::theme;
 use crate::tui::{modal_overlay, widgets, App, ButtonAction, ButtonKind, ScanLifecycle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const RESULT_COLUMNS: [&str; 14] = [
     "#",
@@ -849,8 +849,21 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
     let mut rate_str = "calculating".to_string();
     let mut eta_str = "--:--".to_string();
     if !app.scan_complete && total > 0 && app.scan_progress.probes_completed > 0 {
-        let elapsed = app.start_time.elapsed().as_secs_f64();
-        let rate = app.scan_progress.probes_completed as f64 / elapsed.max(0.001);
+        let now = Instant::now();
+        let (first_at, first_count) = app
+            .probe_rate_history
+            .first()
+            .copied()
+            .unwrap_or((app.start_time, 0));
+        let elapsed = now
+            .checked_duration_since(first_at)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let rate = app
+            .scan_progress
+            .probes_completed
+            .saturating_sub(first_count) as f64
+            / elapsed.max(0.001);
         let remaining = total.saturating_sub(passed);
         let target_rate = passed as f64 / elapsed.max(0.001);
         rate_str = format!("{:.1} probes/s", rate);
