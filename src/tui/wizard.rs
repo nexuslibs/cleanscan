@@ -891,6 +891,22 @@ fn ip_label(count: u128) -> String {
     )
 }
 
+fn selected_cidrs_and_workload(app: &App) -> (Vec<String>, crate::scanner::CidrWorkloadSummary) {
+    let selected_cidrs: Vec<String> = app
+        .cidr_candidates
+        .iter()
+        .filter(|entry| entry.selected)
+        .map(|entry| entry.cidr.clone())
+        .collect();
+    let workload = crate::scanner::workload_for_cidrs(
+        &selected_cidrs,
+        app.config.sample_per_cidr,
+        app.config.probes,
+        app.config.ports.len(),
+    );
+    (selected_cidrs, workload)
+}
+
 fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
     // On tall terminals, lead with a compact brand banner.
     let body = if area.height >= 16 {
@@ -1032,18 +1048,7 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
 
     // Right Side Info Panel
     let selected_count = app.cidr_candidates.iter().filter(|e| e.selected).count();
-    let selected_cidrs: Vec<String> = app
-        .cidr_candidates
-        .iter()
-        .filter(|e| e.selected)
-        .map(|e| e.cidr.clone())
-        .collect();
-    let workload = crate::scanner::workload_for_cidrs(
-        &selected_cidrs,
-        app.config.sample_per_cidr,
-        app.config.probes,
-        app.config.ports.len(),
-    );
+    let (_, workload) = selected_cidrs_and_workload(app);
 
     let info_text = vec![
         Line::from(vec![Span::styled(" RANGE SUMMARY ", theme::header_style())]),
@@ -1303,18 +1308,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         desc_para_lines.push(Line::from("  Use j/k to move between fields."));
     }
 
-    let selected_cidrs: Vec<String> = app
-        .cidr_candidates
-        .iter()
-        .filter(|entry| entry.selected)
-        .map(|entry| entry.cidr.clone())
-        .collect();
-    let workload = crate::scanner::workload_for_cidrs(
-        &selected_cidrs,
-        app.config.sample_per_cidr,
-        app.config.probes,
-        app.config.ports.len(),
-    );
+    let (_, workload) = selected_cidrs_and_workload(app);
     desc_para_lines.insert(
         1,
         Line::from(Span::styled(
@@ -1395,21 +1389,10 @@ fn numeric_slider_bounds(field: SettingField) -> (f64, f64) {
 }
 
 fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
-    let selected: Vec<String> = app
-        .cidr_candidates
-        .iter()
-        .filter(|e| e.selected)
-        .map(|e| e.cidr.clone())
-        .collect();
+    let (selected, workload) = selected_cidrs_and_workload(app);
 
     let selected_count = selected.len();
     let preview_ready = !app.preview_targets.is_empty();
-    let workload = crate::scanner::workload_for_cidrs(
-        &selected,
-        app.config.sample_per_cidr,
-        app.config.probes,
-        app.config.ports.len(),
-    );
     // A generated preview is deduplicated by the scanner and is therefore
     // authoritative for the actual target workload. Before generation, the
     // deterministic per-CIDR cap is the stable upper-bound estimate.
