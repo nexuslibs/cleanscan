@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.17.0](https://github.com/nexuslibs/cleanscan/compare/v0.16.0...v0.17.0) (2026-07-21)
+
+
+### Features
+
+* add proxy transport survivability checks and system network info display ([6b93635](https://github.com/nexuslibs/cleanscan/commit/6b936351e2939e3a0178b3154bf48750807f8253))
+* enhance scan progress feedback and system network info handling ([1f6fd88](https://github.com/nexuslibs/cleanscan/commit/1f6fd88c9ec543df02df4b08dad1118e0f77f1a6))
+* **tui:** show live scan progress ([2d32a62](https://github.com/nexuslibs/cleanscan/commit/2d32a628ac648d68311b98cfd3288c111c0e0649))
+* **tui:** show live scan progress ([67d5552](https://github.com/nexuslibs/cleanscan/commit/67d5552b1337c8d8c6e013364ad4ca75ace32b7b))
+
+
+### Bug Fixes
+
+* **proxy:** enhance error handling for non-TLS WebSocket proxies and improve TLS configuration ([8a5deb2](https://github.com/nexuslibs/cleanscan/commit/8a5deb241f53aff0576a360a8db8283f021e0106))
+* **tui:** refactor progress counting logic for compact stats rendering ([8fc78e8](https://github.com/nexuslibs/cleanscan/commit/8fc78e824b13642bd943f2240f8a77d5f191d9c3))
+* **tui:** use saturating_sub for remaining probes calculation to prevent underflow ([dd061b9](https://github.com/nexuslibs/cleanscan/commit/dd061b95c74883e3b6dc2f6a404522add0dcb8d9))
+
 ## [0.16.0](https://github.com/nexuslibs/cleanscan/compare/v0.15.1...v0.16.0) (2026-07-21)
 
 
