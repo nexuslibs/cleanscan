@@ -813,28 +813,39 @@ impl SettingField {
         Ok(())
     }
 
-    /// Ranking and adaptive probing are useful for expert tuning but should
-    /// not compete with the common scan setup path.
+    /// Ranking-quality tuning remains advanced; adaptive scan controls are
+    /// intentionally visible because they change core scan behavior.
     pub fn is_advanced(self) -> bool {
         matches!(
             self,
-            SettingField::StabilityWeight
-                | SettingField::LossWeight
-                | SettingField::EarlyStop
-                | SettingField::EarlyStopLossStreak
-                | SettingField::EarlyStopMinSamples
-                | SettingField::EarlyStopPrune
-                | SettingField::EarlyStopPruneMargin
-                | SettingField::TwoPhase
-                | SettingField::DiscoverFraction
-                | SettingField::AdaptiveProbing
-                | SettingField::MinProbes
-                | SettingField::MaxProbes
-                | SettingField::AdaptiveConcurrency
-                | SettingField::MinConcurrency
-                | SettingField::MaxConcurrency
-                | SettingField::Confidence
+            SettingField::StabilityWeight | SettingField::LossWeight
         )
+    }
+
+    pub fn is_toggle(self) -> bool {
+        matches!(
+            self,
+            SettingField::Warmup
+                | SettingField::EarlyStop
+                | SettingField::EarlyStopPrune
+                | SettingField::TwoPhase
+                | SettingField::AdaptiveProbing
+                | SettingField::AdaptiveConcurrency
+        )
+    }
+
+    pub fn toggle(self, args: &mut AppConfig) {
+        match self {
+            SettingField::Warmup => args.warmup = !args.warmup,
+            SettingField::EarlyStop => args.early_stop = !args.early_stop,
+            SettingField::EarlyStopPrune => args.early_stop_prune = !args.early_stop_prune,
+            SettingField::TwoPhase => args.two_phase = !args.two_phase,
+            SettingField::AdaptiveProbing => args.adaptive_probing = !args.adaptive_probing,
+            SettingField::AdaptiveConcurrency => {
+                args.adaptive_concurrency = !args.adaptive_concurrency
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1186,7 +1197,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(chunks[1]);
 
-    let block = widgets::panel_block("Scan parameters (Enter edit, ↑/↓ step numeric)", true);
+    let block = widgets::panel_block("Scan parameters (Space toggle, Enter edit)", true);
     let inner = block.inner(main_layout[0]);
     app.settings_inner = Some(inner);
 
@@ -1252,6 +1263,20 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
                     .edit_buffer
                     .split_at(app.edit_caret.min(app.edit_buffer.len()));
                 format!("{}{}_", before, after)
+            } else if f.is_toggle() {
+                format!(
+                    "{} {}",
+                    if f.value_string(&app.config) == "On" {
+                        widgets::checkbox_checked_symbol()
+                    } else {
+                        widgets::checkbox_unchecked_symbol()
+                    },
+                    if f.value_string(&app.config) == "On" {
+                        "Enabled"
+                    } else {
+                        "Disabled"
+                    }
+                )
             } else {
                 f.value_string(&app.config)
             };
@@ -1643,7 +1668,8 @@ fn render_hint(app: &App, frame: &mut Frame, area: Rect) {
             } else {
                 &[
                     ("Tab", "focus"),
-                    (widgets::enter_key(), "edit/next"),
+                    ("Space", "toggle"),
+                    (widgets::enter_key(), "toggle/edit/next"),
                     ("↑/↓", "move"),
                     ("x", "advanced"),
                     ("/", "commands"),
@@ -1880,6 +1906,11 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             }
             app.settings_scroll = 0;
         }
+        KeyCode::Char(' ') if SettingField::ALL[app.cursor].is_toggle() => {
+            SettingField::ALL[app.cursor].toggle(&mut app.config);
+            app.invalidate_preview();
+            app.save_config();
+        }
         KeyCode::Char('k') if app.cursor > 0 => {
             app.cursor = previous_visible_setting(app.cursor, app.show_advanced_settings);
         }
@@ -1908,6 +1939,11 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             2 => {
                 app.wizard_step = WizardStep::Review;
                 app.cursor = 0;
+            }
+            _ if SettingField::ALL[app.cursor].is_toggle() => {
+                SettingField::ALL[app.cursor].toggle(&mut app.config);
+                app.invalidate_preview();
+                app.save_config();
             }
             _ => app.start_edit(app.cursor),
         },
@@ -2151,7 +2187,7 @@ mod tests {
         let mut app = settings_app();
         app.cursor = 14; // last regular latency field
         handle_settings_key(&mut app, crossterm::event::KeyCode::Down);
-        assert_eq!(app.cursor, 31); // collapsed advanced group is skipped
+        assert_eq!(app.cursor, 17); // adaptive controls remain visible
 
         handle_settings_key(&mut app, crossterm::event::KeyCode::Char('x'));
         app.cursor = 15;
@@ -2160,6 +2196,22 @@ mod tests {
 
         handle_settings_key(&mut app, crossterm::event::KeyCode::Char('x'));
         assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn adaptive_controls_toggle_without_text_editing() {
+        let mut app = settings_app();
+        app.config.adaptive_concurrency = false;
+        app.cursor = SettingField::ALL
+            .iter()
+            .position(|field| *field == SettingField::AdaptiveConcurrency)
+            .unwrap();
+
+        handle_settings_key(&mut app, crossterm::event::KeyCode::Char(' '));
+        assert!(app.config.adaptive_concurrency);
+        handle_settings_key(&mut app, crossterm::event::KeyCode::Enter);
+        assert!(!app.config.adaptive_concurrency);
+        assert!(app.edit_field.is_none());
     }
 
     #[test]

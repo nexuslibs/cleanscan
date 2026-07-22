@@ -3213,7 +3213,14 @@ impl App {
                                         return;
                                     }
                                     self.cursor = idx;
-                                    self.start_edit(idx);
+                                    let field = SettingField::ALL[idx];
+                                    if field.is_toggle() {
+                                        field.toggle(&mut self.config);
+                                        self.invalidate_preview();
+                                        self.save_config();
+                                    } else {
+                                        self.start_edit(idx);
+                                    }
                                 }
                             }
                         }
