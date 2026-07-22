@@ -180,6 +180,9 @@ pub struct AppConfig {
     /// Live adaptive floor shared between the wizard and an active scanner.
     #[serde(skip, default = "default_runtime_min_concurrency")]
     pub runtime_min_concurrency: Arc<AtomicUsize>,
+    /// Live worker override. Zero means adaptive/automatic control.
+    #[serde(skip, default = "default_runtime_worker_override")]
+    pub runtime_worker_override: Arc<AtomicUsize>,
     #[serde(default = "default_confidence")]
     pub confidence: f64,
     pub custom_cidrs: Vec<String>,
@@ -268,6 +271,9 @@ fn default_max_concurrency() -> usize {
 fn default_runtime_min_concurrency() -> Arc<AtomicUsize> {
     Arc::new(AtomicUsize::new(default_min_concurrency()))
 }
+fn default_runtime_worker_override() -> Arc<AtomicUsize> {
+    Arc::new(AtomicUsize::new(0))
+}
 fn default_confidence() -> f64 {
     0.95
 }
@@ -314,6 +320,7 @@ impl Default for AppConfig {
             min_concurrency: default_min_concurrency(),
             max_concurrency: default_max_concurrency(),
             runtime_min_concurrency: default_runtime_min_concurrency(),
+            runtime_worker_override: default_runtime_worker_override(),
             confidence: default_confidence(),
             custom_cidrs: Vec::new(),
             selected_cidrs: crate::scanner::DEFAULT_CLOUDFLARE_CIDRS

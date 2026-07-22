@@ -291,6 +291,31 @@ impl AdaptivePolicy {
         }
     }
 
+    /// Set the live worker count from an explicit runtime override. Manual
+    /// changes invalidate measurements and hysteresis accumulated for the old
+    /// worker count, so automatic control resumes from a clean baseline.
+    pub fn set_workers(&mut self, requested: usize) -> ApplyResult {
+        let workers = requested.max(self.min_workers).min(self.max_workers);
+        if workers == self.workers {
+            return ApplyResult {
+                resized: false,
+                workers,
+            };
+        }
+        self.workers = workers;
+        self.last_resize = None;
+        self.last_scale_down = None;
+        self.scale_up_reference = None;
+        self.scale_up_blocked = false;
+        self.up_streak = 0;
+        self.down_streak = 0;
+        self.healthy_streak = 0;
+        ApplyResult {
+            resized: true,
+            workers,
+        }
+    }
+
     pub fn record(&mut self, observation: ProbeObservation) {
         self.window.record(observation);
         if self.baseline.is_none()

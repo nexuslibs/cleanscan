@@ -869,6 +869,9 @@ impl App {
         self.detail_tab = 0;
         self.total_targets = total;
         self.scan_started_ips.clear();
+        self.config
+            .runtime_worker_override
+            .store(0, Ordering::Relaxed);
         self.scan_result_ips.clear();
         self.scan_succeeded_ips.clear();
         self.scan_progress = ScanProgressState::default();
@@ -2751,8 +2754,11 @@ impl App {
 
     fn handle_scan_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Char('[') => self.adjust_runtime_min_concurrency(-8),
-            KeyCode::Char(']') => self.adjust_runtime_min_concurrency(8),
+            KeyCode::Char(',') => self.adjust_runtime_worker_override(-1),
+            KeyCode::Char('.') => self.adjust_runtime_worker_override(1),
+            KeyCode::Char('[') => self.adjust_runtime_worker_override(-8),
+            KeyCode::Char(']') => self.adjust_runtime_worker_override(8),
+            KeyCode::Char('0') => self.clear_runtime_worker_override(),
             KeyCode::Char('r') if self.scan_complete => self.activate_action(Action::RepeatTargets),
             KeyCode::Char('n') if self.scan_complete => self.activate_action(Action::NewSample),
             KeyCode::Char('m') if self.scan_complete => {
@@ -2808,16 +2814,22 @@ impl App {
         }
     }
 
-    fn adjust_runtime_min_concurrency(&mut self, delta: i32) {
-        if !self.config.adaptive_concurrency {
-            self.toast_warn("Enable adaptive concurrency before changing its live floor");
-            return;
-        }
+    fn adjust_runtime_worker_override(&mut self, delta: i32) {
         let current = self
             .config
-            .runtime_min_concurrency
+            .runtime_worker_override
             .load(Ordering::Relaxed)
             .max(1);
+        let current_workers = self
+            .scan_progress
+            .current_workers
+            .unwrap_or(self.config.concurrency)
+            .max(1);
+        let current = if self.config.runtime_worker_override.load(Ordering::Relaxed) == 0 {
+            current_workers
+        } else {
+            current
+        };
         let next = if delta.is_negative() {
             current.saturating_sub(delta.unsigned_abs() as usize).max(1)
         } else {
@@ -2825,11 +2837,17 @@ impl App {
                 .saturating_add(delta as usize)
                 .min(self.config.max_concurrency.max(1))
         };
-        self.config.min_concurrency = next;
         self.config
-            .runtime_min_concurrency
+            .runtime_worker_override
             .store(next, Ordering::Relaxed);
-        self.toast_info(format!("Adaptive minimum workers: {next}"));
+        self.toast_info(format!("Manual workers: {next} (0 = automatic)"));
+    }
+
+    fn clear_runtime_worker_override(&mut self) {
+        self.config
+            .runtime_worker_override
+            .store(0, Ordering::Relaxed);
+        self.toast_info("Worker count returned to automatic control");
     }
 
     fn toggle_failure_filter(&mut self) {
@@ -3477,7 +3495,7 @@ mod tests {
     use crate::watch::{WatchPolicy, WatchState};
     use crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::{backend::TestBackend, Terminal};
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -4165,6 +4183,34 @@ mod tests {
         assert_eq!(app.scan_progress.phase, ScanPhase::Starting);
         assert_eq!(app.scan_progress.probes_started, 0);
         assert_eq!(app.scan_progress.targets_completed, 0);
+    }
+
+    #[test]
+    fn live_worker_override_changes_in_steps_and_clears_for_new_scan() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(10);
+        app.scan_progress.current_workers = Some(5);
+
+        app.adjust_runtime_worker_override(1);
+        assert_eq!(
+            app.config.runtime_worker_override.load(Ordering::Relaxed),
+            6
+        );
+        app.adjust_runtime_worker_override(-8);
+        assert_eq!(
+            app.config.runtime_worker_override.load(Ordering::Relaxed),
+            1
+        );
+
+        app.begin_scan(10);
+        assert_eq!(
+            app.config.runtime_worker_override.load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]

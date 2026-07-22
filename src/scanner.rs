@@ -1438,6 +1438,46 @@ fn select_next_warmup(states: &[TargetState]) -> Option<usize> {
         .position(|state| !state.warmup_done && !state.warmup_in_flight && !state.in_flight)
 }
 
+fn select_next_scan_index(
+    states: &mut [TargetState],
+    probe_count: usize,
+    min_probes: usize,
+    adaptive: bool,
+    warmup: bool,
+    prefer_warmup: bool,
+) -> (Option<usize>, bool) {
+    let warmup_index = warmup.then(|| select_next_warmup(states)).flatten();
+    let measured_index = if adaptive {
+        select_next_target_adaptive(states, probe_count, min_probes)
+    } else {
+        select_next_target(states, probe_count)
+    };
+    let next = if prefer_warmup {
+        warmup_index.or(measured_index)
+    } else {
+        measured_index.or(warmup_index)
+    };
+    let Some(index) = next else {
+        return (None, false);
+    };
+    let is_warmup = !states[index].warmup_done;
+    let next_prefer_warmup = if is_warmup {
+        false
+    } else {
+        warmup_index.is_some()
+    };
+    (Some(index), next_prefer_warmup)
+}
+
+fn manual_worker_override(args: &AppConfig) -> Option<usize> {
+    let requested = args.runtime_worker_override.load(Ordering::Relaxed);
+    (requested > 0).then(|| {
+        requested
+            .max(args.min_concurrency.max(1))
+            .min(args.max_concurrency.max(1))
+    })
+}
+
 /// Keep the semaphore's idle permits consistent with the scheduler's current
 /// worker target. A downscale never interrupts a probe that already acquired
 /// a permit; those probes drain naturally, while excess idle permits are
@@ -1508,6 +1548,9 @@ async fn run_scan_port(
         .map(|ip| TargetState::new(ip, &args, probe_count, port))
         .collect();
     let mut futs = FuturesUnordered::new();
+    // Prefer the first ready measured probe, then alternate with pending
+    // warmups so a fast target cannot monopolize the scheduler forever.
+    let mut prefer_warmup = false;
     let (mut probes_started, mut probes_completed, mut targets_completed) = progress_offsets;
 
     let warming_phase = progress_phase.unwrap_or(if args.warmup {
@@ -1552,6 +1595,14 @@ async fn run_scan_port(
     });
 
     loop {
+        if let Some(manual_workers) = manual_worker_override(&args) {
+            workers = manual_workers;
+            if let Some(controller) = controller.as_mut() {
+                controller.set_workers(manual_workers);
+            }
+            adaptive_reason = Some(format!("manual worker override: {workers}"));
+            reconcile_worker_permits(&sem, workers, futs.len());
+        }
         while !cancel.load(Ordering::Relaxed) && futs.len() < workers {
             while paused.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1560,55 +1611,53 @@ async fn run_scan_port(
                 break;
             }
 
-            // Measured work always wins once a target's warmup has finished.
-            // If no measured target is ready, dispatch one pending warmup.
-            // Reserving a slot for warmup here would recreate a global
-            // warmup barrier: a slow pending warmup could occupy the last
-            // slot while ready targets wait indefinitely for measurement.
-            let next = if args.adaptive_probing {
-                select_next_target_adaptive(&mut states, probe_count, args.min_probes)
-            } else {
-                select_next_target(&states, probe_count)
-            };
-            let Some(index) = next else {
-                if let Some(index) = args.warmup.then(|| select_next_warmup(&states)).flatten() {
-                    let state = &mut states[index];
-                    let client = state.client.clone();
-                    let host = args.host.clone();
-                    let ip = state.ip.clone();
-                    let port = state.port;
-                    let url = state.url.clone();
-                    let probe_args = args.clone();
-                    state.warmup_in_flight = true;
-                    probes_started += 1;
-                    send_progress_with_workers(
-                        progress.as_ref(),
-                        warming_phase,
-                        probes_started,
-                        probes_completed,
-                        futs.len() + 1,
-                        targets_completed,
-                        Some(state.ip.clone()),
-                        workers,
-                        adaptive_reason.as_deref(),
-                    );
-                    let sem = sem.clone();
-                    let cancel = cancel.clone();
-                    futs.push(tokio::spawn(async move {
-                        let (client, sample) = probe_with_lazy_client(
-                            client, host, ip, port, url, probe_args, sem, cancel,
-                        )
-                        .await;
-                        ProbeOutcome::Warmup {
-                            index,
-                            client,
-                            sample,
-                        }
-                    }));
-                    continue;
-                }
-                break;
-            };
+            let (next, next_prefer_warmup) = select_next_scan_index(
+                &mut states,
+                probe_count,
+                args.min_probes,
+                args.adaptive_probing,
+                args.warmup,
+                prefer_warmup,
+            );
+            let Some(index) = next else { break };
+            prefer_warmup = next_prefer_warmup;
+            let is_warmup = !states[index].warmup_done;
+            if is_warmup {
+                let state = &mut states[index];
+                let client = state.client.clone();
+                let host = args.host.clone();
+                let ip = state.ip.clone();
+                let port = state.port;
+                let url = state.url.clone();
+                let probe_args = args.clone();
+                state.warmup_in_flight = true;
+                probes_started += 1;
+                send_progress_with_workers(
+                    progress.as_ref(),
+                    warming_phase,
+                    probes_started,
+                    probes_completed,
+                    futs.len() + 1,
+                    targets_completed,
+                    Some(state.ip.clone()),
+                    workers,
+                    adaptive_reason.as_deref(),
+                );
+                let sem = sem.clone();
+                let cancel = cancel.clone();
+                futs.push(tokio::spawn(async move {
+                    let (client, sample) = probe_with_lazy_client(
+                        client, host, ip, port, url, probe_args, sem, cancel,
+                    )
+                    .await;
+                    ProbeOutcome::Warmup {
+                        index,
+                        client,
+                        sample,
+                    }
+                }));
+                continue;
+            }
             let state = &mut states[index];
             let client = state.client.clone();
             let host = args.host.clone();
@@ -1837,7 +1886,14 @@ async fn run_scan_port(
                                 completed_target = Some(state.ip.clone());
                             }
                         }
-                        if let Some(controller) = controller.as_mut() {
+                        if let Some(manual_workers) = manual_worker_override(&args) {
+                            workers = manual_workers;
+                            if let Some(controller) = controller.as_mut() {
+                                controller.set_workers(manual_workers);
+                            }
+                            adaptive_reason =
+                                Some(format!("manual worker override: {workers}"));
+                        } else if let Some(controller) = controller.as_mut() {
                             let now = adaptive_now.expect("adaptive timestamp exists");
                             let floor = args
                                 .runtime_min_concurrency
@@ -2536,8 +2592,9 @@ mod tests {
         collect_from_cidrs_with_seed, https_authority, merge_port_results, merge_profile_results,
         parse_colo, reconcile_worker_permits, record_best, remaining_measured_work,
         resolve_host_for_ip, result_confidence, result_status, score_from_samples,
-        select_focus_cidrs, select_next_target, select_next_warmup, should_stop_early,
-        validate_response, wilson_interval, DiagnosticCategory, ProbeResult, TargetState,
+        select_focus_cidrs, select_next_scan_index, select_next_target, select_next_warmup,
+        should_stop_early, validate_response, wilson_interval, DiagnosticCategory, ProbeResult,
+        TargetState,
     };
     use crate::adaptive::{Action, ApplyResult, Decision, SignalDirection};
     use crate::config::{AppConfig, HealthCheck};
@@ -2816,6 +2873,25 @@ mod tests {
             select_next_warmup(&[completed, in_flight, pending]),
             Some(2)
         );
+    }
+
+    #[test]
+    fn scan_selection_alternates_measured_work_and_pending_warmups() {
+        let mut measured = state("192.0.2.1", 1, 1, &[0.01], 0);
+        measured.warmup_done = true;
+        let mut pending = state("192.0.2.2", 0, 0, &[], 0);
+        pending.warmup_done = false;
+        let mut states = vec![measured, pending];
+
+        let (first, prefer_warmup) = select_next_scan_index(&mut states, 2, 1, false, true, false);
+        assert_eq!(first, Some(0));
+        assert!(prefer_warmup);
+
+        states[0].in_flight = true;
+        let (second, prefer_warmup) =
+            select_next_scan_index(&mut states, 2, 1, false, true, prefer_warmup);
+        assert_eq!(second, Some(1));
+        assert!(!prefer_warmup);
     }
 
     #[test]
