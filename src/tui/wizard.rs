@@ -142,7 +142,7 @@ impl SettingField {
             SettingField::SpeedTimeoutMs => "Speed timeout (ms)",
             SettingField::SamplePerCidr => "Sample per CIDR",
             SettingField::Probes => "Probes",
-            SettingField::Concurrency => "Concurrency",
+            SettingField::Concurrency => "Starting workers",
             SettingField::TimeoutMs => "Timeout (ms)",
             SettingField::ConnectTimeoutMs => "Connect timeout (ms)",
             SettingField::Top => "Top results",
@@ -183,7 +183,7 @@ impl SettingField {
             SettingField::SpeedTimeoutMs => "Maximum total time for one upload/download transfer, separate from the normal latency probe timeout.",
             SettingField::SamplePerCidr => "Number of random IPs sampled from each selected CIDR. Higher values increase coverage across the edge network, but increase total targets.",
             SettingField::Probes => "Number of requests sent to each IP to probe latency. More probes filter out transient noise and establish a highly accurate latency percentile.",
-            SettingField::Concurrency => "Maximum number of simultaneous request workers. Higher concurrency speeds up scanning but may trigger rate limiting or CPU bottlenecks.",
+            SettingField::Concurrency => "Initial number of simultaneous request workers. With adaptive concurrency enabled, the scanner adjusts this at runtime within the configured minimum and maximum bounds.",
             SettingField::TimeoutMs => "Max time (in ms) allowed for an HTTP request to finish. Probes exceeding this threshold are treated as errors/failures.",
             SettingField::ConnectTimeoutMs => "Max time (in ms) to establish a TCP socket connection. Lower values skip dead, blacklisted, or blocked IPs more rapidly.",
             SettingField::Top => "Number of fastest, zero-fail IP addresses to show in the final dashboard results table and export to files.",
@@ -902,6 +902,17 @@ fn ip_label(count: u128) -> String {
     )
 }
 
+fn worker_summary(app: &App) -> String {
+    if app.config.adaptive_concurrency {
+        format!(
+            "{} start; {}–{} adaptive",
+            app.config.concurrency, app.config.min_concurrency, app.config.max_concurrency
+        )
+    } else {
+        format!("{} fixed", app.config.concurrency)
+    }
+}
+
 fn selected_cidrs_and_workload(app: &App) -> (Vec<String>, crate::scanner::CidrWorkloadSummary) {
     let selected_cidrs: Vec<String> = app
         .cidr_candidates
@@ -1506,8 +1517,8 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
             Span::raw(format_ip_count(app.config.probes as u128)),
         ]),
         Line::from(vec![
-            Span::styled("Concurrency : ", theme::title_style()),
-            Span::raw(app.config.concurrency.to_string()),
+            Span::styled("Workers     : ", theme::title_style()),
+            Span::raw(worker_summary(app)),
         ]),
         Line::from(vec![
             Span::styled("Timeout     : ", theme::title_style()),
