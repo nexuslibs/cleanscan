@@ -1,4 +1,4 @@
-use crate::scanner::{result_confidence, result_status, ProbeResult};
+use crate::scanner::{result_confidence, result_status, ProbeFailureCounts, ProbeResult};
 use crate::tui::theme;
 use crate::tui::{modal_overlay, widgets, App, ButtonAction, ButtonKind, ScanLifecycle};
 use ratatui::{
@@ -73,7 +73,7 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) {
 fn render_micro(app: &mut App, frame: &mut Frame, area: Rect) {
     let chunks = Layout::vertical([
         Constraint::Length(2),
-        Constraint::Length(2),
+        Constraint::Length(4),
         Constraint::Min(1),
         Constraint::Length(2),
     ])
@@ -175,14 +175,16 @@ fn render_wide(app: &mut App, frame: &mut Frame, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Header
-            Constraint::Length(6), // Stats panel
+            Constraint::Length(7), // Stats panel + failure summary
             Constraint::Min(1),    // Results table
             Constraint::Length(3), // Footer
         ])
         .split(area);
 
     render_header(app, frame, chunks[0]);
-    render_stats_panel(app, frame, chunks[1]);
+    let stats = Layout::vertical([Constraint::Length(6), Constraint::Length(1)]).split(chunks[1]);
+    render_stats_panel(app, frame, stats[0]);
+    render_failure_summary(app, frame, stats[1]);
     render_table(app, frame, chunks[2]);
     render_footer(app, frame, chunks[3]);
 }
@@ -214,10 +216,11 @@ fn render_compact_stats(app: &App, frame: &mut Frame, area: Rect) {
     let block = widgets::panel_block("Scan status", false);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(inner);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-        .split(inner);
+        .split(rows[0]);
     frame.render_widget(
         ratatui::widgets::LineGauge::default()
             .ratio(ratio.clamp(0.0, 1.0))
@@ -236,6 +239,139 @@ fn render_compact_stats(app: &App, frame: &mut Frame, area: Rect) {
         .style(theme::hint_style()),
         cols[1],
     );
+    render_failure_summary(app, frame, rows[1]);
+}
+
+fn render_failure_summary(app: &App, frame: &mut Frame, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let counts = app.scan_progress.failure_counts;
+    let has_failures = counts.request_timeout > 0
+        || counts.connect_timeout > 0
+        || counts.connection_tls > 0
+        || counts.general_errors > 0;
+    let inspectable = app.results.iter().any(|result| {
+        result.fail > 0 || !result.failures.is_empty() || !result.diagnostics.is_empty()
+    });
+    let suffix = if !has_failures {
+        ""
+    } else if app.show_failures {
+        " • Enter details"
+    } else if inspectable {
+        " • f inspect"
+    } else {
+        " • details pending"
+    };
+    let wide = format!(
+        "Probe failures: Request timeout {} • Connect timeout {} • Connection/TLS {} • General errors {}{}",
+        counts.request_timeout, counts.connect_timeout, counts.connection_tls, counts.general_errors, suffix
+    );
+    let compact = format!(
+        "Failures: Req TO {} • Conn TO {} • Conn/TLS {} • Errors {}{}",
+        counts.request_timeout,
+        counts.connect_timeout,
+        counts.connection_tls,
+        counts.general_errors,
+        suffix
+    );
+    let narrow_suffix = if has_failures && inspectable && !app.show_failures {
+        " • f"
+    } else {
+        ""
+    };
+    let narrow = format!(
+        "F rTO:{} cTO:{} net:{} err:{}{}",
+        counts.request_timeout,
+        counts.connect_timeout,
+        counts.connection_tls,
+        counts.general_errors,
+        narrow_suffix
+    );
+    let (text, mode) = if wide.chars().count() <= area.width as usize {
+        (wide, FailureSummaryMode::Wide)
+    } else if compact.chars().count() <= area.width as usize {
+        (compact, FailureSummaryMode::Compact)
+    } else if narrow.chars().count() <= area.width as usize {
+        (narrow, FailureSummaryMode::Narrow)
+    } else {
+        (
+            format!(
+                "F r:{} c:{} n:{} e:{}",
+                counts.request_timeout,
+                counts.connect_timeout,
+                counts.connection_tls,
+                counts.general_errors
+            ),
+            FailureSummaryMode::Shortest,
+        )
+    };
+    let line = failure_summary_line(&text, counts, mode);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+#[derive(Clone, Copy)]
+enum FailureSummaryMode {
+    Wide,
+    Compact,
+    Narrow,
+    Shortest,
+}
+
+fn failure_summary_line(
+    text: &str,
+    counts: ProbeFailureCounts,
+    mode: FailureSummaryMode,
+) -> Line<'static> {
+    let prefix_len = match mode {
+        FailureSummaryMode::Wide => "Probe failures:".len(),
+        FailureSummaryMode::Compact => "Failures:".len(),
+        FailureSummaryMode::Narrow | FailureSummaryMode::Shortest => 1,
+    };
+    let mut spans = vec![Span::styled(
+        text[..prefix_len].to_string(),
+        theme::title_style(),
+    )];
+    let rest = &text[prefix_len..];
+    let styles = [
+        theme::warn_style(),
+        theme::warn_style(),
+        theme::bad_style(),
+        theme::bad_style(),
+    ];
+    let values = [
+        counts.request_timeout.to_string(),
+        counts.connect_timeout.to_string(),
+        counts.connection_tls.to_string(),
+        counts.general_errors.to_string(),
+    ];
+    let mut cursor = 0;
+    for value in values {
+        let Some(offset) = rest[cursor..].find(&value) else {
+            continue;
+        };
+        let offset = cursor + offset;
+        if offset > cursor {
+            spans.push(Span::styled(
+                rest[cursor..offset].to_string(),
+                theme::hint_style(),
+            ));
+        }
+        let index = spans
+            .iter()
+            .filter(|span| span.style == theme::warn_style() || span.style == theme::bad_style())
+            .count()
+            .min(3);
+        spans.push(Span::styled(value.clone(), styles[index]));
+        cursor = offset + value.len();
+    }
+    if cursor < rest.len() {
+        spans.push(Span::styled(
+            rest[cursor..].to_string(),
+            theme::hint_style(),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -1554,13 +1690,31 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::{
-        latency_bucket, latency_summary, median, recommendation_ip, selected_latency_index,
-        unique_ip_counts,
+        failure_summary_line, latency_bucket, latency_summary, median, recommendation_ip,
+        selected_latency_index, unique_ip_counts, FailureSummaryMode,
     };
     use crate::config::AppConfig;
-    use crate::scanner::ProbeResult;
+    use crate::scanner::{ProbeFailureCounts, ProbeResult};
     use crate::tui::{App, ScanLifecycle};
     use std::sync::{atomic::AtomicBool, Arc};
+
+    #[test]
+    fn failure_summary_uses_explicit_labels_and_exact_counts() {
+        let counts = ProbeFailureCounts {
+            request_timeout: 12,
+            connect_timeout: 3,
+            connection_tls: 2,
+            general_errors: 4,
+        };
+        let text = "Probe failures: Request timeout 12 • Connect timeout 3 • Connection/TLS 2 • General errors 4";
+        let line = failure_summary_line(text, counts, FailureSummaryMode::Wide);
+        let rendered = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(rendered, text);
+    }
 
     fn result(ip: &str, score: f64, samples: &[f64]) -> ProbeResult {
         ProbeResult {

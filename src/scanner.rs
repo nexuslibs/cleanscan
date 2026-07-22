@@ -1,5 +1,6 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    cmp::Ordering as CmpOrdering,
+    collections::{BTreeMap, BTreeSet, BinaryHeap},
     fmt::Display,
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -15,6 +16,8 @@ use ipnet::IpNet;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use reqwest::Client;
 use tokio::sync::Semaphore;
+
+type ProgressSender = std::sync::mpsc::SyncSender<ScanProgress>;
 
 use crate::adaptive::{AdaptivePolicy, ObservationKind, ProbeObservation};
 use crate::config::{AppConfig, HealthCheck};
@@ -45,11 +48,51 @@ pub struct ScanProgress {
     /// dynamically, such as during a two-phase focus pass.
     #[serde(default)]
     pub targets_total: Option<usize>,
+    #[serde(default)]
+    pub failure_counts: ProbeFailureCounts,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ProbeFailureCounts {
+    pub request_timeout: usize,
+    pub connect_timeout: usize,
+    pub connection_tls: usize,
+    pub general_errors: usize,
+}
+
+impl ProbeFailureCounts {
+    fn record(&mut self, diagnostic: &ProbeDiagnostic) {
+        if diagnostic.category == DiagnosticCategory::Cancelled {
+            return;
+        }
+        if diagnostic.category == DiagnosticCategory::Timeout {
+            if diagnostic.phase == DiagnosticPhase::ConnectionTls {
+                self.connect_timeout = self.connect_timeout.saturating_add(1);
+            } else {
+                self.request_timeout = self.request_timeout.saturating_add(1);
+            }
+        } else if matches!(
+            diagnostic.category,
+            DiagnosticCategory::Connect | DiagnosticCategory::Tls
+        ) {
+            self.connection_tls = self.connection_tls.saturating_add(1);
+        } else {
+            self.general_errors = self.general_errors.saturating_add(1);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ProgressOffsets {
+    probes_started: usize,
+    probes_completed: usize,
+    targets_completed: usize,
+    failure_counts: ProbeFailureCounts,
 }
 
 #[allow(clippy::too_many_arguments)]
 fn send_progress(
-    progress: Option<&std::sync::mpsc::Sender<ScanProgress>>,
+    progress: Option<&ProgressSender>,
     phase: ScanPhase,
     probes_started: usize,
     probes_completed: usize,
@@ -57,9 +100,11 @@ fn send_progress(
     targets_completed: usize,
     latest_target: Option<String>,
     targets_total: Option<usize>,
+    failure_counts: ProbeFailureCounts,
+    reliable: bool,
 ) {
     if let Some(tx) = progress {
-        let _ = tx.send(ScanProgress {
+        let snapshot = ScanProgress {
             phase,
             probes_started,
             probes_completed,
@@ -69,13 +114,19 @@ fn send_progress(
             current_workers: None,
             adaptive_reason: None,
             targets_total,
-        });
+            failure_counts,
+        };
+        if reliable {
+            let _ = tx.send(snapshot);
+        } else {
+            let _ = tx.try_send(snapshot);
+        }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn send_progress_with_workers(
-    progress: Option<&std::sync::mpsc::Sender<ScanProgress>>,
+    progress: Option<&ProgressSender>,
     phase: ScanPhase,
     probes_started: usize,
     probes_completed: usize,
@@ -84,9 +135,10 @@ fn send_progress_with_workers(
     latest_target: Option<String>,
     current_workers: usize,
     adaptive_reason: Option<&str>,
+    failure_counts: ProbeFailureCounts,
 ) {
     if let Some(tx) = progress {
-        let _ = tx.send(ScanProgress {
+        let _ = tx.try_send(ScanProgress {
             phase,
             probes_started,
             probes_completed,
@@ -96,6 +148,7 @@ fn send_progress_with_workers(
             current_workers: Some(current_workers),
             adaptive_reason: adaptive_reason.map(str::to_string),
             targets_total: None,
+            failure_counts,
         });
     }
 }
@@ -782,7 +835,11 @@ async fn probe_once(
         .map(str::to_string);
     let headers = resp.headers().clone();
     let body = resp.text().await.map_err(|error| ProbeDiagnostic {
-        category: DiagnosticCategory::BodyRead,
+        category: if error.is_timeout() {
+            DiagnosticCategory::Timeout
+        } else {
+            DiagnosticCategory::BodyRead
+        },
         phase: DiagnosticPhase::ResponseBody,
         message: error.to_string(),
         status: None,
@@ -894,11 +951,9 @@ fn parse_colo(body: &str) -> Option<String> {
 fn is_loss_reason(reason: &ProbeDiagnostic) -> bool {
     matches!(
         reason.category,
-        DiagnosticCategory::Timeout
-            | DiagnosticCategory::Connect
-            | DiagnosticCategory::Tls
-            | DiagnosticCategory::Cancelled
-    )
+        DiagnosticCategory::Connect | DiagnosticCategory::Tls | DiagnosticCategory::Cancelled
+    ) || (reason.category == DiagnosticCategory::Timeout
+        && reason.phase == DiagnosticPhase::ConnectionTls)
 }
 
 struct TargetState {
@@ -939,6 +994,124 @@ struct TargetState {
     /// Whether this target was stopped before exhausting its probe budget.
     stopped_early: bool,
     bootstrap_interval: Option<(f64, f64)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReadyEntry {
+    index: usize,
+    generation: u64,
+    /// Fixed mode: lower tier, higher success rate/count, lower average.
+    /// Adaptive mode: targets below min probes first, then wider intervals and
+    /// lower current scores (all represented through the ordering below).
+    tier: u8,
+    primary: f64,
+    secondary: f64,
+    tertiary: f64,
+}
+
+impl PartialEq for ReadyEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index && self.generation == other.generation
+    }
+}
+impl Eq for ReadyEntry {}
+
+impl Ord for ReadyEntry {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        // BinaryHeap is a max-heap. Reverse the fields where the scheduler
+        // wants the smaller value first, while keeping deterministic indexes.
+        other
+            .tier
+            .cmp(&self.tier)
+            .then_with(|| self.primary.total_cmp(&other.primary))
+            .then_with(|| self.secondary.total_cmp(&other.secondary))
+            .then_with(|| other.tertiary.total_cmp(&self.tertiary))
+            .then_with(|| other.index.cmp(&self.index))
+    }
+}
+impl PartialOrd for ReadyEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct ReadyQueue {
+    heap: BinaryHeap<ReadyEntry>,
+    generations: Vec<u64>,
+    adaptive: bool,
+    min_probes: usize,
+}
+
+impl ReadyQueue {
+    fn new(states: &mut [TargetState], adaptive: bool, min_probes: usize) -> Self {
+        let mut queue = Self {
+            heap: BinaryHeap::new(),
+            generations: vec![0; states.len()],
+            adaptive,
+            min_probes,
+        };
+        for (index, state) in states.iter_mut().enumerate() {
+            queue.push(index, state);
+        }
+        queue
+    }
+
+    fn push(&mut self, index: usize, state: &mut TargetState) {
+        self.generations[index] = self.generations[index].wrapping_add(1);
+        let generation = self.generations[index];
+        let entry = if self.adaptive {
+            let interval = state.cached_bootstrap_interval();
+            ReadyEntry {
+                index,
+                generation,
+                tier: u8::from(state.completed >= self.min_probes),
+                primary: interval.1 - interval.0,
+                secondary: state.current_score(),
+                tertiary: state.completed as f64,
+            }
+        } else {
+            let success = state.samples.len();
+            let tier = if success > 0 {
+                0
+            } else if state.completed == 0 {
+                1
+            } else {
+                2
+            };
+            let rate = if state.completed == 0 {
+                0.0
+            } else {
+                success as f64 / state.completed as f64
+            };
+            let average = if success == 0 {
+                f64::INFINITY
+            } else {
+                state.samples.iter().sum::<f64>() / success as f64
+            };
+            ReadyEntry {
+                index,
+                generation,
+                tier,
+                primary: rate,
+                secondary: success as f64,
+                tertiary: average,
+            }
+        };
+        self.heap.push(entry);
+    }
+
+    fn next(&mut self, states: &mut [TargetState], probe_count: usize) -> Option<usize> {
+        while let Some(entry) = self.heap.pop() {
+            if self.generations[entry.index] != entry.generation {
+                continue;
+            }
+            let state = &states[entry.index];
+            if state.has_remaining_probe(probe_count) {
+                return Some(entry.index);
+            }
+        }
+        None
+    }
 }
 
 impl TargetState {
@@ -1157,6 +1330,7 @@ fn summarize_protocols(protocols: &[String]) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn select_next_target(states: &[TargetState], probe_count: usize) -> Option<usize> {
     states
         .iter()
@@ -1219,6 +1393,7 @@ fn select_next_target(states: &[TargetState], probe_count: usize) -> Option<usiz
         .map(|(index, _)| index)
 }
 
+#[allow(dead_code)]
 fn select_next_target_adaptive(
     states: &mut [TargetState],
     probe_count: usize,
@@ -1432,12 +1607,14 @@ fn remaining_measured_work(states: &[TargetState], probe_count: usize) -> usize 
         .fold(0usize, usize::saturating_add)
 }
 
+#[allow(dead_code)]
 fn select_next_warmup(states: &[TargetState]) -> Option<usize> {
     states
         .iter()
         .position(|state| !state.warmup_done && !state.warmup_in_flight && !state.in_flight)
 }
 
+#[allow(dead_code)]
 fn select_next_scan_index(
     states: &mut [TargetState],
     probe_count: usize,
@@ -1513,14 +1690,14 @@ async fn run_scan_port(
     targets: Vec<String>,
     args: Arc<AppConfig>,
     tx: std::sync::mpsc::Sender<ProbeResult>,
-    progress: Option<std::sync::mpsc::Sender<ScanProgress>>,
+    progress: Option<ProgressSender>,
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     port: u16,
     include_port_details: bool,
-    progress_offsets: (usize, usize, usize),
+    progress_offsets: ProgressOffsets,
     progress_phase: Option<ScanPhase>,
-) -> (usize, usize, usize) {
+) -> ProgressOffsets {
     let probe_count = if args.adaptive_probing {
         args.max_probes.max(args.min_probes).max(1)
     } else {
@@ -1547,11 +1724,16 @@ async fn run_scan_port(
         .into_iter()
         .map(|ip| TargetState::new(ip, &args, probe_count, port))
         .collect();
+    let mut ready = ReadyQueue::new(&mut states, args.adaptive_probing, args.min_probes);
+    let mut warmup_cursor = 0usize;
     let mut futs = FuturesUnordered::new();
     // Prefer the first ready measured probe, then alternate with pending
     // warmups so a fast target cannot monopolize the scheduler forever.
     let mut prefer_warmup = false;
-    let (mut probes_started, mut probes_completed, mut targets_completed) = progress_offsets;
+    let mut probes_started = progress_offsets.probes_started;
+    let mut probes_completed = progress_offsets.probes_completed;
+    let mut targets_completed = progress_offsets.targets_completed;
+    let mut failure_counts = progress_offsets.failure_counts;
 
     let warming_phase = progress_phase.unwrap_or(if args.warmup {
         ScanPhase::WarmingUp
@@ -1569,6 +1751,7 @@ async fn run_scan_port(
         None,
         workers,
         adaptive_reason.as_deref(),
+        failure_counts,
     );
 
     for state in &mut states {
@@ -1611,17 +1794,35 @@ async fn run_scan_port(
                 break;
             }
 
-            let (next, next_prefer_warmup) = select_next_scan_index(
-                &mut states,
-                probe_count,
-                args.min_probes,
-                args.adaptive_probing,
-                args.warmup,
-                prefer_warmup,
-            );
-            let Some(index) = next else { break };
-            prefer_warmup = next_prefer_warmup;
-            let is_warmup = !states[index].warmup_done;
+            while warmup_cursor < states.len()
+                && (states[warmup_cursor].warmup_done
+                    || states[warmup_cursor].warmup_in_flight
+                    || states[warmup_cursor].in_flight)
+            {
+                warmup_cursor += 1;
+            }
+            let warmup_index = args
+                .warmup
+                .then_some(warmup_cursor)
+                .filter(|index| *index < states.len());
+            let (index, is_warmup) = if prefer_warmup {
+                if let Some(index) = warmup_index {
+                    warmup_cursor += 1;
+                    (index, true)
+                } else if let Some(index) = ready.next(&mut states, probe_count) {
+                    (index, false)
+                } else {
+                    break;
+                }
+            } else if let Some(index) = ready.next(&mut states, probe_count) {
+                (index, false)
+            } else if let Some(index) = warmup_index {
+                warmup_cursor += 1;
+                (index, true)
+            } else {
+                break;
+            };
+            prefer_warmup = !is_warmup && warmup_cursor < states.len();
             if is_warmup {
                 let state = &mut states[index];
                 let client = state.client.clone();
@@ -1642,6 +1843,7 @@ async fn run_scan_port(
                     Some(state.ip.clone()),
                     workers,
                     adaptive_reason.as_deref(),
+                    failure_counts,
                 );
                 let sem = sem.clone();
                 let cancel = cancel.clone();
@@ -1678,6 +1880,7 @@ async fn run_scan_port(
                 Some(state.ip.clone()),
                 workers,
                 adaptive_reason.as_deref(),
+                failure_counts,
             );
             let sem = sem.clone();
             let cancel = cancel.clone();
@@ -1753,9 +1956,12 @@ async fn run_scan_port(
                                         result.port_results = vec![port_result(&result)];
                                     }
                                     let _ = tx.send(result);
+                                    state.client = None;
                                     if include_port_details {
                                         targets_completed += 1;
                                     }
+                                } else {
+                                    ready.push(index, state);
                                 }
                             }
                         }
@@ -1792,7 +1998,9 @@ async fn run_scan_port(
                                 },
                                 Err(diagnostic) => ProbeObservation {
                                     kind: match diagnostic.category {
-                                        DiagnosticCategory::Timeout => ObservationKind::Timeout,
+                                        DiagnosticCategory::Timeout
+                                            if diagnostic.phase == DiagnosticPhase::ConnectionTls => ObservationKind::Timeout,
+                                        DiagnosticCategory::Timeout => ObservationKind::OtherFailure,
                                         DiagnosticCategory::Connect | DiagnosticCategory::Tls => {
                                             ObservationKind::ConnectionFailure
                                         }
@@ -1840,6 +2048,7 @@ async fn run_scan_port(
                                     state.loss += 1;
                                     state.loss_streak += 1;
                                 }
+                                failure_counts.record(&diagnostic);
                                 state.failures.push(diagnostic.message.clone());
                                 state.diagnostics.push(diagnostic);
                             }
@@ -1869,6 +2078,7 @@ async fn run_scan_port(
                             }
                             record_best(&mut best, &result, args.top);
                             let _ = tx.send(result);
+                            state.client = None;
                             if include_port_details {
                                 targets_completed += 1;
                                 completed_target = Some(state.ip.clone());
@@ -1881,6 +2091,7 @@ async fn run_scan_port(
                             }
                             record_best(&mut best, &result, args.top);
                             let _ = tx.send(result);
+                            state.client = None;
                             if include_port_details {
                                 targets_completed += 1;
                                 completed_target = Some(state.ip.clone());
@@ -1916,6 +2127,9 @@ async fn run_scan_port(
                             });
                         }
                         reconcile_worker_permits(&sem, workers, futs.len());
+                        if states[index].has_remaining_probe(probe_count) {
+                            ready.push(index, &mut states[index]);
+                        }
                         send_progress_with_workers(
                             progress.as_ref(),
                             probing_phase,
@@ -1926,13 +2140,31 @@ async fn run_scan_port(
                             completed_target,
                             workers,
                             adaptive_reason.as_deref(),
+                            failure_counts,
                         );
                     }
                 }
             }
         }
     }
-    (probes_started, probes_completed, targets_completed)
+    send_progress(
+        progress.as_ref(),
+        probing_phase,
+        probes_started,
+        probes_completed,
+        0,
+        targets_completed,
+        None,
+        None,
+        failure_counts,
+        true,
+    );
+    ProgressOffsets {
+        probes_started,
+        probes_completed,
+        targets_completed,
+        failure_counts,
+    }
 }
 
 pub async fn run_scan_with_progress(
@@ -1941,7 +2173,7 @@ pub async fn run_scan_with_progress(
     tx: std::sync::mpsc::Sender<ProbeResult>,
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
-    progress: Option<std::sync::mpsc::Sender<ScanProgress>>,
+    progress: Option<ProgressSender>,
 ) {
     run_scan_with_progress_from_offsets(
         targets,
@@ -1950,7 +2182,7 @@ pub async fn run_scan_with_progress(
         cancel,
         paused,
         progress,
-        (0, 0, 0),
+        ProgressOffsets::default(),
         None,
     )
     .await;
@@ -1963,10 +2195,10 @@ async fn run_scan_with_progress_from_offsets(
     tx: std::sync::mpsc::Sender<ProbeResult>,
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
-    progress: Option<std::sync::mpsc::Sender<ScanProgress>>,
-    mut progress_offsets: (usize, usize, usize),
+    progress: Option<ProgressSender>,
+    mut progress_offsets: ProgressOffsets,
     progress_phase: Option<ScanPhase>,
-) -> (usize, usize, usize) {
+) -> ProgressOffsets {
     let ports = if args.ports.is_empty() {
         vec![443]
     } else {
@@ -1996,7 +2228,7 @@ async fn run_scan_with_progress_from_offsets(
         let mut port_args = (*args).clone();
         port_args.ports = vec![port];
         let (port_tx, port_rx) = std::sync::mpsc::channel();
-        let (probes_started, probes_completed, _) = run_scan_port(
+        progress_offsets = run_scan_port(
             targets.clone(),
             Arc::new(port_args),
             port_tx,
@@ -2009,8 +2241,6 @@ async fn run_scan_with_progress_from_offsets(
             progress_phase,
         )
         .await;
-        progress_offsets.0 = probes_started;
-        progress_offsets.1 = probes_completed;
         for result in port_rx {
             let _ = tx.send(result.clone());
             by_ip.entry(result.ip.clone()).or_default().push(result);
@@ -2022,16 +2252,18 @@ async fn run_scan_with_progress_from_offsets(
             merged_targets += 1;
         }
     }
-    progress_offsets.2 += merged_targets;
+    progress_offsets.targets_completed += merged_targets;
     send_progress(
         progress.as_ref(),
         progress_phase.unwrap_or(ScanPhase::Finalizing),
-        progress_offsets.0,
-        progress_offsets.1,
+        progress_offsets.probes_started,
+        progress_offsets.probes_completed,
         0,
-        progress_offsets.2,
+        progress_offsets.targets_completed,
         None,
         None,
+        progress_offsets.failure_counts,
+        true,
     );
     for (_, results) in by_ip {
         if let Some(result) = merge_port_results(&results) {
@@ -2089,8 +2321,16 @@ pub async fn run_profile_scan(
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
 ) {
-    run_profile_scan_with_progress_from_offsets(targets, args, tx, cancel, paused, None, (0, 0, 0))
-        .await;
+    run_profile_scan_with_progress_from_offsets(
+        targets,
+        args,
+        tx,
+        cancel,
+        paused,
+        None,
+        ProgressOffsets::default(),
+    )
+    .await;
 }
 
 async fn run_profile_scan_with_progress_from_offsets(
@@ -2099,9 +2339,9 @@ async fn run_profile_scan_with_progress_from_offsets(
     tx: std::sync::mpsc::Sender<ProbeResult>,
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
-    progress: Option<std::sync::mpsc::Sender<ScanProgress>>,
-    mut progress_offsets: (usize, usize, usize),
-) -> (usize, usize, usize) {
+    progress: Option<ProgressSender>,
+    mut progress_offsets: ProgressOffsets,
+) -> ProgressOffsets {
     let checks = effective_health_checks(&args);
     if args.health_checks.is_empty() {
         return run_scan_with_progress_from_offsets(
@@ -2171,7 +2411,7 @@ async fn run_profile_scan_with_progress_from_offsets(
             break 'ports;
         }
     }
-    progress_offsets.2 += all_by_ip.len();
+    progress_offsets.targets_completed += all_by_ip.len();
     for (_, results) in all_by_ip {
         if let Some(result) = merge_port_results(&results) {
             let _ = tx.send(result);
@@ -2180,12 +2420,14 @@ async fn run_profile_scan_with_progress_from_offsets(
     send_progress(
         progress.as_ref(),
         ScanPhase::Finalizing,
-        progress_offsets.0,
-        progress_offsets.1,
+        progress_offsets.probes_started,
+        progress_offsets.probes_completed,
         0,
-        progress_offsets.2,
+        progress_offsets.targets_completed,
         None,
         None,
+        progress_offsets.failure_counts,
+        true,
     );
     progress_offsets
 }
@@ -2196,7 +2438,7 @@ pub async fn run_profile_scan_with_progress(
     tx: std::sync::mpsc::Sender<ProbeResult>,
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
-    progress: Option<std::sync::mpsc::Sender<ScanProgress>>,
+    progress: Option<ProgressSender>,
 ) {
     run_profile_scan_with_progress_from_offsets(
         targets,
@@ -2205,7 +2447,7 @@ pub async fn run_profile_scan_with_progress(
         cancel,
         paused,
         progress,
-        (0, 0, 0),
+        ProgressOffsets::default(),
     )
     .await;
 }
@@ -2456,7 +2698,7 @@ pub async fn run_scan_two_phase_with_progress(
     tx: std::sync::mpsc::Sender<ProbeResult>,
     cancel: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
-    progress: Option<std::sync::mpsc::Sender<ScanProgress>>,
+    progress: Option<ProgressSender>,
 ) -> Result<Vec<String>> {
     if !config.two_phase || selected_cidrs.is_empty() {
         let targets = collect_from_cidrs_with_seed(
@@ -2493,6 +2735,8 @@ pub async fn run_scan_two_phase_with_progress(
         0,
         None,
         None,
+        ProbeFailureCounts::default(),
+        true,
     );
     let (p1_tx, p1_rx) = std::sync::mpsc::channel();
     let targets1 = collect_from_cidrs_with_seed(&selected_cidrs, discover_per, base_seed)?;
@@ -2504,7 +2748,7 @@ pub async fn run_scan_two_phase_with_progress(
         cancel.clone(),
         paused.clone(),
         progress.clone(),
-        (0, 0, 0),
+        ProgressOffsets::default(),
         Some(ScanPhase::Discovery),
     )
     .await;
@@ -2569,6 +2813,8 @@ pub async fn run_scan_two_phase_with_progress(
             0,
             None,
             Some(actual_targets.len()),
+            progress_offsets.failure_counts,
+            true,
         );
         run_scan_with_progress_from_offsets(
             targets2.into_iter().collect(),
@@ -2593,12 +2839,62 @@ mod tests {
         parse_colo, reconcile_worker_permits, record_best, remaining_measured_work,
         resolve_host_for_ip, result_confidence, result_status, score_from_samples,
         select_focus_cidrs, select_next_scan_index, select_next_target, select_next_warmup,
-        should_stop_early, validate_response, wilson_interval, DiagnosticCategory, ProbeResult,
-        TargetState,
+        should_stop_early, validate_response, wilson_interval, DiagnosticCategory, DiagnosticPhase,
+        ProbeDiagnostic, ProbeFailureCounts, ProbeResult, ReadyQueue, TargetState,
     };
     use crate::adaptive::{Action, ApplyResult, Decision, SignalDirection};
     use crate::config::{AppConfig, HealthCheck};
     use tokio::sync::Semaphore;
+
+    fn diagnostic(category: DiagnosticCategory, phase: DiagnosticPhase) -> ProbeDiagnostic {
+        ProbeDiagnostic {
+            category,
+            phase,
+            message: "test failure".to_string(),
+            status: None,
+            location: None,
+            elapsed_ms: None,
+        }
+    }
+
+    #[test]
+    fn failure_counts_keep_timeout_categories_disjoint() {
+        let mut counts = ProbeFailureCounts::default();
+        counts.record(&diagnostic(
+            DiagnosticCategory::Timeout,
+            DiagnosticPhase::ConnectionTls,
+        ));
+        counts.record(&diagnostic(
+            DiagnosticCategory::Timeout,
+            DiagnosticPhase::ResponseHeaders,
+        ));
+        counts.record(&diagnostic(
+            DiagnosticCategory::Connect,
+            DiagnosticPhase::ConnectionTls,
+        ));
+        counts.record(&diagnostic(
+            DiagnosticCategory::Tls,
+            DiagnosticPhase::ConnectionTls,
+        ));
+        counts.record(&diagnostic(
+            DiagnosticCategory::HttpStatus,
+            DiagnosticPhase::ResponseBody,
+        ));
+        counts.record(&diagnostic(
+            DiagnosticCategory::Cancelled,
+            DiagnosticPhase::Cancellation,
+        ));
+
+        assert_eq!(
+            counts,
+            ProbeFailureCounts {
+                request_timeout: 1,
+                connect_timeout: 1,
+                connection_tls: 2,
+                general_errors: 1,
+            }
+        );
+    }
 
     fn state(
         ip: &str,
@@ -2643,6 +2939,20 @@ mod tests {
         assert_eq!(cidr_valid("2001:db8::1").unwrap().prefix_len(), 128);
         assert!(cidr_valid("192.0.2.0/24").is_ok());
         assert!(cidr_valid("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn ready_queue_prioritizes_targets_without_scanning_all_states() {
+        let mut states = vec![
+            state("192.0.2.1", 0, 0, &[], 0),
+            state("192.0.2.2", 1, 1, &[0.01], 0),
+        ];
+        let mut queue = ReadyQueue::new(&mut states, false, 1);
+        assert_eq!(queue.next(&mut states, 3), Some(1));
+        states[1].scheduled = 2;
+        states[1].completed = 2;
+        queue.push(1, &mut states[1]);
+        assert_eq!(queue.next(&mut states, 3), Some(1));
     }
 
     #[test]
