@@ -1432,6 +1432,12 @@ fn remaining_measured_work(states: &[TargetState], probe_count: usize) -> usize 
         .fold(0usize, usize::saturating_add)
 }
 
+fn select_next_warmup(states: &[TargetState]) -> Option<usize> {
+    states
+        .iter()
+        .position(|state| !state.warmup_done && !state.warmup_in_flight && !state.in_flight)
+}
+
 /// Keep the semaphore's idle permits consistent with the scheduler's current
 /// worker target. A downscale never interrupts a probe that already acquired
 /// a permit; those probes drain naturally, while excess idle permits are
@@ -1554,27 +1560,18 @@ async fn run_scan_port(
                 break;
             }
 
-            // Prefer measured work, but reserve the last open slot (and the
-            // first slot when idle) for a pending warmup so cold targets do
-            // not starve behind an endless stream of measured probes.
-            let warmup_index = if args.warmup {
-                states
-                    .iter()
-                    .position(|s| !s.warmup_done && !s.warmup_in_flight && !s.in_flight)
-            } else {
-                None
-            };
-            let reserve_warmup = warmup_index.is_some()
-                && (futs.is_empty() || futs.len().saturating_add(1) >= workers);
-            let next = if reserve_warmup {
-                None
-            } else if args.adaptive_probing {
+            // Measured work always wins once a target's warmup has finished.
+            // If no measured target is ready, dispatch one pending warmup.
+            // Reserving a slot for warmup here would recreate a global
+            // warmup barrier: a slow pending warmup could occupy the last
+            // slot while ready targets wait indefinitely for measurement.
+            let next = if args.adaptive_probing {
                 select_next_target_adaptive(&mut states, probe_count, args.min_probes)
             } else {
                 select_next_target(&states, probe_count)
             };
             let Some(index) = next else {
-                if let Some(index) = warmup_index {
+                if let Some(index) = args.warmup.then(|| select_next_warmup(&states)).flatten() {
                     let state = &mut states[index];
                     let client = state.client.clone();
                     let host = args.host.clone();
@@ -2539,8 +2536,8 @@ mod tests {
         collect_from_cidrs_with_seed, https_authority, merge_port_results, merge_profile_results,
         parse_colo, reconcile_worker_permits, record_best, remaining_measured_work,
         resolve_host_for_ip, result_confidence, result_status, score_from_samples,
-        select_focus_cidrs, select_next_target, should_stop_early, validate_response,
-        wilson_interval, DiagnosticCategory, ProbeResult, TargetState,
+        select_focus_cidrs, select_next_target, select_next_warmup, should_stop_early,
+        validate_response, wilson_interval, DiagnosticCategory, ProbeResult, TargetState,
     };
     use crate::adaptive::{Action, ApplyResult, Decision, SignalDirection};
     use crate::config::{AppConfig, HealthCheck};
@@ -2803,6 +2800,22 @@ mod tests {
         let states = vec![in_flight, state("192.0.2.2", 0, 0, &[], 0)];
 
         assert_eq!(select_next_target(&states, 3), Some(1));
+    }
+
+    #[test]
+    fn warmup_selection_skips_completed_and_in_flight_targets() {
+        let mut completed = state("192.0.2.1", 0, 0, &[], 0);
+        completed.warmup_done = true;
+        let mut in_flight = state("192.0.2.2", 0, 0, &[], 0);
+        in_flight.warmup_done = false;
+        in_flight.warmup_in_flight = true;
+        let mut pending = state("192.0.2.3", 0, 0, &[], 0);
+        pending.warmup_done = false;
+
+        assert_eq!(
+            select_next_warmup(&[completed, in_flight, pending]),
+            Some(2)
+        );
     }
 
     #[test]
