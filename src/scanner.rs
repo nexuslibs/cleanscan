@@ -946,7 +946,7 @@ fn parse_colo(body: &str) -> Option<String> {
 fn is_loss_reason(reason: &ProbeDiagnostic) -> bool {
     matches!(
         reason.category,
-        DiagnosticCategory::Connect | DiagnosticCategory::Tls | DiagnosticCategory::Cancelled
+        DiagnosticCategory::Connect | DiagnosticCategory::Tls
     ) || (reason.category == DiagnosticCategory::Timeout
         && reason.phase == DiagnosticPhase::ConnectionTls)
 }
