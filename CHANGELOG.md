@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.18.0](https://github.com/nexuslibs/cleanscan/compare/v0.17.0...v0.18.0) (2026-07-22)
+
+
+### Features
+
+* **update:** add safe CLI self-updates ([efff080](https://github.com/nexuslibs/cleanscan/commit/efff08010be0b9bd12c76827e16e72d98a547ace))
+* **update:** add safe CLI self-updates ([6bf6cd9](https://github.com/nexuslibs/cleanscan/commit/6bf6cd9227f76ce375ef570a83fde8615631a01f))
+
+
+### Bug Fixes
+
+* **release:** improve checksum validation by trimming whitespace ([75ea7a1](https://github.com/nexuslibs/cleanscan/commit/75ea7a1dd477976f6bcc786ca47d6cbed92e0fce))
+* **updater:** adjust client timeout handling and update metadata download timeout ([aa413e3](https://github.com/nexuslibs/cleanscan/commit/aa413e3f51916520115799d3f7fcd89f016d070b))
+* **updater:** change redirect policy to limit redirects to 10 ([5fbe105](https://github.com/nexuslibs/cleanscan/commit/5fbe10576de3fe17ee826229e112852f273ce3b4))
+
 ## [0.17.0](https://github.com/nexuslibs/cleanscan/compare/v0.16.0...v0.17.0) (2026-07-21)
 
 
