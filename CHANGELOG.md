@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.0](https://github.com/nexuslibs/cleanscan/compare/v0.22.0...v0.23.0) (2026-07-22)
+
+
+### Features
+
+* **adaptive:** add manual worker override functionality and update related configurations ([df232cf](https://github.com/nexuslibs/cleanscan/commit/df232cfef51cbf02c33805767ddfbd1d0507b854))
+
 ## [0.22.0](https://github.com/nexuslibs/cleanscan/compare/v0.21.0...v0.22.0) (2026-07-22)
 
 
