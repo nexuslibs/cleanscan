@@ -166,6 +166,15 @@ pub struct AppConfig {
     pub min_probes: usize,
     #[serde(default = "default_max_probes")]
     pub max_probes: usize,
+    /// Adapt the number of concurrent workers to recent probe health.
+    #[serde(default)]
+    pub adaptive_concurrency: bool,
+    /// Minimum worker count used by adaptive concurrency.
+    #[serde(default = "default_min_concurrency")]
+    pub min_concurrency: usize,
+    /// Maximum worker count used by adaptive concurrency.
+    #[serde(default = "default_max_concurrency")]
+    pub max_concurrency: usize,
     #[serde(default = "default_confidence")]
     pub confidence: f64,
     pub custom_cidrs: Vec<String>,
@@ -245,6 +254,12 @@ fn default_min_probes() -> usize {
 fn default_max_probes() -> usize {
     40
 }
+fn default_min_concurrency() -> usize {
+    1
+}
+fn default_max_concurrency() -> usize {
+    240
+}
 fn default_confidence() -> f64 {
     0.95
 }
@@ -287,6 +302,9 @@ impl Default for AppConfig {
             adaptive_probing: false,
             min_probes: default_min_probes(),
             max_probes: default_max_probes(),
+            adaptive_concurrency: false,
+            min_concurrency: default_min_concurrency(),
+            max_concurrency: default_max_concurrency(),
             confidence: default_confidence(),
             custom_cidrs: Vec::new(),
             selected_cidrs: crate::scanner::DEFAULT_CLOUDFLARE_CIDRS

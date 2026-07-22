@@ -1,3 +1,4 @@
+mod adaptive;
 mod colo;
 mod config;
 mod proxy;
@@ -196,6 +197,18 @@ pub struct Args {
     #[arg(long)]
     pub max_probes: Option<usize>,
 
+    /// Enable adaptive worker concurrency.
+    #[arg(long)]
+    pub adaptive_concurrency: bool,
+
+    /// Minimum workers in adaptive concurrency mode.
+    #[arg(long)]
+    pub min_concurrency: Option<usize>,
+
+    /// Maximum workers in adaptive concurrency mode.
+    #[arg(long)]
+    pub max_concurrency: Option<usize>,
+
     /// Confidence level for adaptive intervals (0.90, 0.95, or 0.99).
     #[arg(long, value_parser = ["0.90", "0.95", "0.99"])]
     pub confidence: Option<String>,
@@ -382,6 +395,20 @@ fn main() -> Result<()> {
     if let Some(max) = args.max_probes {
         config.max_probes = max;
     }
+    if args.min_concurrency == Some(0) || args.max_concurrency == Some(0) {
+        anyhow::bail!(
+            "adaptive concurrency bounds are invalid: max must be >= min and both must be non-zero"
+        );
+    }
+    if args.adaptive_concurrency {
+        config.adaptive_concurrency = true;
+    }
+    if let Some(min) = args.min_concurrency {
+        config.min_concurrency = min;
+    }
+    if let Some(max) = args.max_concurrency {
+        config.max_concurrency = max;
+    }
     if let Some(confidence) = args.confidence.as_deref() {
         config.confidence = confidence.parse()?;
     }
@@ -418,6 +445,12 @@ fn main() -> Result<()> {
             "adaptive probe bounds are invalid: max must be >= min and both must be non-zero"
         );
     }
+    normalize_config(&mut config);
+    if config.max_concurrency < config.min_concurrency {
+        anyhow::bail!(
+            "adaptive concurrency bounds are invalid: max must be >= min and both must be non-zero"
+        );
+    }
     if args.watch.is_some() && config.two_phase {
         anyhow::bail!("--watch cannot be combined with --two-phase");
     }
@@ -448,8 +481,6 @@ fn main() -> Result<()> {
     {
         anyhow::bail!("required headers must use name=value form");
     }
-
-    normalize_config(&mut config);
 
     if let Some(min) = args.min_success_rate {
         if !min.is_finite() || !(0.0..=1.0).contains(&min) {
@@ -567,6 +598,12 @@ fn normalize_config(config: &mut AppConfig) {
     }
     if config.concurrency == 0 {
         config.concurrency = 1;
+    }
+    if config.min_concurrency == 0 {
+        config.min_concurrency = 1;
+    }
+    if config.max_concurrency == 0 {
+        config.max_concurrency = 1;
     }
     if config.probes == 0 {
         config.probes = 1;

@@ -49,6 +49,9 @@ pub enum SettingField {
     AdaptiveProbing,
     MinProbes,
     MaxProbes,
+    AdaptiveConcurrency,
+    MinConcurrency,
+    MaxConcurrency,
     Confidence,
 }
 
@@ -67,7 +70,7 @@ const MAX_SPEED_TIMEOUT_MS: u64 = 3_600_000;
 impl SettingField {
     /// All settings fields in display order, grouped by concern. Group
     /// boundaries are described by [`SettingField::GROUPS`].
-    pub const ALL: [SettingField; 33] = [
+    pub const ALL: [SettingField; 36] = [
         // Target
         SettingField::Host,
         SettingField::Path,
@@ -99,6 +102,9 @@ impl SettingField {
         SettingField::AdaptiveProbing,
         SettingField::MinProbes,
         SettingField::MaxProbes,
+        SettingField::AdaptiveConcurrency,
+        SettingField::MinConcurrency,
+        SettingField::MaxConcurrency,
         SettingField::Confidence,
         // Speed test
         SettingField::DownloadPath,
@@ -115,7 +121,7 @@ impl SettingField {
         ("Validation", 6),
         ("Latency scan", 6),
         ("Ranking quality", 2),
-        ("Adaptive scan", 11),
+        ("Adaptive scan", 14),
         ("Speed test", 5),
     ];
 
@@ -153,6 +159,9 @@ impl SettingField {
             SettingField::AdaptiveProbing => "Adaptive probing",
             SettingField::MinProbes => "Minimum probes",
             SettingField::MaxProbes => "Maximum probes",
+            SettingField::AdaptiveConcurrency => "Adaptive concurrency",
+            SettingField::MinConcurrency => "Minimum concurrency",
+            SettingField::MaxConcurrency => "Maximum concurrency",
             SettingField::Confidence => "Confidence",
         }
     }
@@ -191,6 +200,9 @@ impl SettingField {
             SettingField::AdaptiveProbing => "Allocate probes adaptively using confidence intervals instead of probing every target equally.",
             SettingField::MinProbes => "Minimum measured probes before adaptive stopping can occur.",
             SettingField::MaxProbes => "Maximum measured probes per target in adaptive mode.",
+            SettingField::AdaptiveConcurrency => "Adjust worker concurrency from recent timeout, failure, and latency signals; fixed concurrency remains the default.",
+            SettingField::MinConcurrency => "Lower worker bound used by adaptive concurrency.",
+            SettingField::MaxConcurrency => "Upper worker bound used by adaptive concurrency.",
             SettingField::Confidence => "Confidence level used by adaptive score intervals, from 0 to 1.",
         }
     }
@@ -289,6 +301,15 @@ impl SettingField {
             }
             SettingField::MinProbes => args.min_probes.to_string(),
             SettingField::MaxProbes => args.max_probes.to_string(),
+            SettingField::AdaptiveConcurrency => {
+                if args.adaptive_concurrency {
+                    "On".to_string()
+                } else {
+                    "Off".to_string()
+                }
+            }
+            SettingField::MinConcurrency => args.min_concurrency.to_string(),
+            SettingField::MaxConcurrency => args.max_concurrency.to_string(),
             SettingField::Confidence => args.confidence.to_string(),
         }
     }
@@ -311,6 +332,7 @@ impl SettingField {
                 | SettingField::TwoPhase
                 | SettingField::Warmup
                 | SettingField::AdaptiveProbing
+                | SettingField::AdaptiveConcurrency
         )
     }
 
@@ -392,6 +414,7 @@ impl SettingField {
             SettingField::EarlyStopPruneMargin => i64::MAX,
             SettingField::DiscoverFraction => i64::MAX,
             SettingField::MinProbes | SettingField::MaxProbes => MAX_PROBES as i64,
+            SettingField::MinConcurrency | SettingField::MaxConcurrency => MAX_CONCURRENCY as i64,
             SettingField::Host
             | SettingField::Path
             | SettingField::Ports
@@ -407,6 +430,7 @@ impl SettingField {
             | SettingField::TwoPhase
             | SettingField::Warmup
             | SettingField::AdaptiveProbing
+            | SettingField::AdaptiveConcurrency
             | SettingField::StabilityWeight
             | SettingField::LossWeight
             | SettingField::Confidence => i64::MAX,
@@ -752,6 +776,31 @@ impl SettingField {
                 }
                 args.max_probes = v;
             }
+            SettingField::AdaptiveConcurrency => {
+                args.adaptive_concurrency = match raw.to_lowercase().as_str() {
+                    "on" | "true" | "1" | "yes" => true,
+                    "off" | "false" | "0" | "no" => false,
+                    _ => return Err("enter on or off".to_string()),
+                };
+            }
+            SettingField::MinConcurrency => {
+                let v = raw
+                    .parse::<usize>()
+                    .map_err(|_| "invalid number".to_string())?;
+                if !(1..=MAX_CONCURRENCY).contains(&v) {
+                    return Err(format!("must be between 1 and {MAX_CONCURRENCY}"));
+                }
+                args.min_concurrency = v;
+            }
+            SettingField::MaxConcurrency => {
+                let v = raw
+                    .parse::<usize>()
+                    .map_err(|_| "invalid number".to_string())?;
+                if !(1..=MAX_CONCURRENCY).contains(&v) {
+                    return Err(format!("must be between 1 and {MAX_CONCURRENCY}"));
+                }
+                args.max_concurrency = v;
+            }
             SettingField::Confidence => {
                 let v = raw
                     .parse::<f64>()
@@ -782,6 +831,9 @@ impl SettingField {
                 | SettingField::AdaptiveProbing
                 | SettingField::MinProbes
                 | SettingField::MaxProbes
+                | SettingField::AdaptiveConcurrency
+                | SettingField::MinConcurrency
+                | SettingField::MaxConcurrency
                 | SettingField::Confidence
         )
     }
@@ -1918,6 +1970,14 @@ impl App {
                     self.toast_error("Minimum probes cannot exceed maximum probes");
                     return false;
                 }
+                if matches!(
+                    field,
+                    SettingField::MinConcurrency | SettingField::MaxConcurrency
+                ) && updated_config.min_concurrency > updated_config.max_concurrency
+                {
+                    self.toast_error("Minimum concurrency cannot exceed maximum concurrency");
+                    return false;
+                }
                 self.config = updated_config;
                 self.edit_field = None;
                 self.edit_buffer.clear();
@@ -2030,7 +2090,7 @@ mod tests {
         let mut app = settings_app();
         app.cursor = 14; // last regular latency field
         handle_settings_key(&mut app, crossterm::event::KeyCode::Down);
-        assert_eq!(app.cursor, 28); // collapsed advanced group is skipped
+        assert_eq!(app.cursor, 31); // collapsed advanced group is skipped
 
         handle_settings_key(&mut app, crossterm::event::KeyCode::Char('x'));
         app.cursor = 15;

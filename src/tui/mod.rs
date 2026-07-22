@@ -62,6 +62,8 @@ pub struct ScanProgressState {
     pub active_probes: usize,
     pub targets_completed: usize,
     pub latest_target: Option<String>,
+    pub current_workers: Option<usize>,
+    pub adaptive_reason: Option<String>,
 }
 
 impl Default for ScanProgressState {
@@ -73,6 +75,8 @@ impl Default for ScanProgressState {
             active_probes: 0,
             targets_completed: 0,
             latest_target: None,
+            current_workers: None,
+            adaptive_reason: None,
         }
     }
 }
@@ -1019,6 +1023,12 @@ impl App {
                 .targets_completed
                 .max(progress.targets_completed),
             latest_target: progress.latest_target,
+            current_workers: progress
+                .current_workers
+                .or(self.scan_progress.current_workers),
+            adaptive_reason: progress
+                .adaptive_reason
+                .or(self.scan_progress.adaptive_reason.clone()),
         };
     }
 
@@ -4055,6 +4065,8 @@ mod tests {
             active_probes: 8,
             targets_completed: 0,
             latest_target: Some("192.0.2.1".to_string()),
+            current_workers: None,
+            adaptive_reason: None,
         });
         assert!(app.results.is_empty());
         assert_eq!(app.total_targets, 500);

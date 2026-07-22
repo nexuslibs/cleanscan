@@ -313,6 +313,9 @@ latency dashboard.
 | `--sample-per-cidr`    | `100`            | Random IPs sampled from each CIDR                |
 | `--probes`             | `8`              | Repeated probes per IP                           |
 | `--concurrency`        | `120`            | Max concurrent HTTP probes                       |
+| `--adaptive-concurrency` | off             | Adapt worker concurrency from recent probe health |
+| `--min-concurrency`    | `1`              | Minimum workers in adaptive mode                 |
+| `--max-concurrency`    | `240`            | Maximum workers in adaptive mode                 |
 | `--timeout-ms`         | `2500`           | Request timeout (ms)                             |
 | `--connect-timeout-ms` | `1000`           | Connect timeout (ms)                             |
 | `--top`                | `50`             | Number of top results to display                 |

@@ -15,6 +15,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use reqwest::Client;
 use tokio::sync::Semaphore;
 
+use crate::adaptive::{AdaptivePolicy, ObservationKind, ProbeObservation};
 use crate::config::{AppConfig, HealthCheck};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -35,6 +36,10 @@ pub struct ScanProgress {
     pub active_probes: usize,
     pub targets_completed: usize,
     pub latest_target: Option<String>,
+    #[serde(default)]
+    pub current_workers: Option<usize>,
+    #[serde(default)]
+    pub adaptive_reason: Option<String>,
 }
 
 fn send_progress(
@@ -54,6 +59,34 @@ fn send_progress(
             active_probes,
             targets_completed,
             latest_target,
+            current_workers: None,
+            adaptive_reason: None,
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_progress_with_workers(
+    progress: Option<&std::sync::mpsc::Sender<ScanProgress>>,
+    phase: ScanPhase,
+    probes_started: usize,
+    probes_completed: usize,
+    active_probes: usize,
+    targets_completed: usize,
+    latest_target: Option<String>,
+    current_workers: usize,
+    adaptive_reason: Option<&str>,
+) {
+    if let Some(tx) = progress {
+        let _ = tx.send(ScanProgress {
+            phase,
+            probes_started,
+            probes_completed,
+            active_probes,
+            targets_completed,
+            latest_target,
+            current_workers: Some(current_workers),
+            adaptive_reason: adaptive_reason.map(str::to_string),
         });
     }
 }
@@ -1248,6 +1281,41 @@ enum ProbeOutcome {
     },
 }
 
+fn remaining_measured_work(states: &[TargetState], probe_count: usize) -> usize {
+    states
+        .iter()
+        .filter(|state| state.warmup_done && !state.stopped_early)
+        .map(|state| probe_count.saturating_sub(state.scheduled))
+        .fold(0usize, usize::saturating_add)
+}
+
+/// Keep the semaphore's idle permits consistent with the scheduler's current
+/// worker target. A downscale never interrupts a probe that already acquired
+/// a permit; those probes drain naturally, while excess idle permits are
+/// removed so newly scheduled work cannot exceed the target.
+fn reconcile_worker_permits(sem: &Semaphore, workers: usize, active_futures: usize) {
+    let desired_available = workers.saturating_sub(active_futures);
+    let available = sem.available_permits();
+    if available > desired_available {
+        sem.forget_permits(available - desired_available);
+    } else if available < desired_available {
+        sem.add_permits(desired_available - available);
+    }
+}
+
+fn adaptive_progress_reason(
+    decision: &crate::adaptive::Decision,
+    applied: crate::adaptive::ApplyResult,
+) -> String {
+    if applied.resized {
+        decision.reason.clone()
+    } else if !matches!(decision.action, crate::adaptive::Action::NoChange) {
+        format!("{}; awaiting hysteresis", decision.reason)
+    } else {
+        decision.reason.clone()
+    }
+}
+
 /// Run the full scan over `targets`, sending each result through `tx`.
 /// `cancel` stops scheduling new probes/targets, and `paused` halts probe
 /// scheduling until cleared.
@@ -1264,14 +1332,28 @@ async fn run_scan_port(
     progress_offsets: (usize, usize, usize),
     progress_phase: Option<ScanPhase>,
 ) -> (usize, usize, usize) {
-    let sem = Arc::new(Semaphore::new(args.concurrency.max(1)));
-
     let probe_count = if args.adaptive_probing {
         args.max_probes.max(args.min_probes).max(1)
     } else {
         args.probes.max(1)
     };
-    let workers = args.concurrency.max(1);
+    let initial_workers = if args.adaptive_concurrency {
+        args.concurrency
+            .max(1)
+            .clamp(args.min_concurrency.max(1), args.max_concurrency.max(1))
+    } else {
+        args.concurrency.max(1)
+    };
+    let sem = Arc::new(Semaphore::new(initial_workers));
+    let mut workers = initial_workers;
+    let mut controller = args.adaptive_concurrency.then(|| {
+        AdaptivePolicy::new(
+            initial_workers,
+            args.min_concurrency.max(1),
+            args.max_concurrency.max(args.min_concurrency).max(1),
+        )
+    });
+    let mut adaptive_reason: Option<String> = None;
     let mut states: Vec<TargetState> = targets
         .into_iter()
         .map(|ip| TargetState::new(ip, &args, probe_count, port))
@@ -1285,7 +1367,7 @@ async fn run_scan_port(
         ScanPhase::Probing
     });
     let probing_phase = progress_phase.unwrap_or(ScanPhase::Probing);
-    send_progress(
+    send_progress_with_workers(
         progress.as_ref(),
         warming_phase,
         probes_started,
@@ -1293,6 +1375,8 @@ async fn run_scan_port(
         futs.len(),
         targets_completed,
         None,
+        workers,
+        adaptive_reason.as_deref(),
     );
 
     for state in &mut states {
@@ -1345,7 +1429,7 @@ async fn run_scan_port(
                     let probe_args = args.clone();
                     state.warmup_in_flight = true;
                     probes_started += 1;
-                    send_progress(
+                    send_progress_with_workers(
                         progress.as_ref(),
                         warming_phase,
                         probes_started,
@@ -1353,6 +1437,8 @@ async fn run_scan_port(
                         futs.len() + 1,
                         targets_completed,
                         Some(state.ip.clone()),
+                        workers,
+                        adaptive_reason.as_deref(),
                     );
                     let sem = sem.clone();
                     let cancel = cancel.clone();
@@ -1401,7 +1487,7 @@ async fn run_scan_port(
             state.scheduled += 1;
             state.in_flight = true;
             probes_started += 1;
-            send_progress(
+            send_progress_with_workers(
                 progress.as_ref(),
                 probing_phase,
                 probes_started,
@@ -1409,6 +1495,8 @@ async fn run_scan_port(
                 futs.len() + 1,
                 targets_completed,
                 Some(state.ip.clone()),
+                workers,
+                adaptive_reason.as_deref(),
             );
             let sem = sem.clone();
             let cancel = cancel.clone();
@@ -1484,6 +1572,37 @@ async fn run_scan_port(
                         state.in_flight = false;
                         probes_completed += 1;
                         state.completed += 1;
+                        let fallback_cold = sample.is_ok() && state.warmup_discard_first;
+                        let adaptive_now = controller.as_ref().map(|_| Instant::now());
+                        if let Some(controller) = controller.as_mut() {
+                            let now = adaptive_now.expect("adaptive timestamp exists");
+                            let observation = match &sample {
+                                Ok((value, _, _)) => ProbeObservation {
+                                    kind: ObservationKind::Success,
+                                    latency: (!fallback_cold).then_some(*value),
+                                    at: now,
+                                },
+                                Err(diagnostic) => ProbeObservation {
+                                    kind: match diagnostic.category {
+                                        DiagnosticCategory::Timeout => ObservationKind::Timeout,
+                                        DiagnosticCategory::Connect | DiagnosticCategory::Tls => {
+                                            ObservationKind::ConnectionFailure
+                                        }
+                                        DiagnosticCategory::Cancelled => ObservationKind::Cancelled,
+                                        DiagnosticCategory::HttpStatus
+                                        | DiagnosticCategory::Redirect
+                                        | DiagnosticCategory::ValidationBody
+                                        | DiagnosticCategory::ValidationHeader
+                                        | DiagnosticCategory::BodyRead
+                                        | DiagnosticCategory::ClientSetup
+                                        | DiagnosticCategory::Unknown => ObservationKind::OtherFailure,
+                                    },
+                                    latency: None,
+                                    at: now,
+                                },
+                            };
+                            controller.record(observation);
+                        }
                         match sample {
                             Ok((value, protocol, colo)) => {
                                 state.ok += 1;
@@ -1554,7 +1673,18 @@ async fn run_scan_port(
                                 completed_target = Some(state.ip.clone());
                             }
                         }
-                        send_progress(
+                        if let Some(controller) = controller.as_mut() {
+                            let now = adaptive_now.expect("adaptive timestamp exists");
+                            let remaining_work = remaining_measured_work(&states, probe_count);
+                            let decision = controller.evaluate(now, remaining_work);
+                            let applied = controller.apply(&decision, now);
+                            if applied.resized {
+                                workers = applied.workers;
+                            }
+                            adaptive_reason = Some(adaptive_progress_reason(&decision, applied));
+                        }
+                        reconcile_worker_permits(&sem, workers, futs.len());
+                        send_progress_with_workers(
                             progress.as_ref(),
                             probing_phase,
                             probes_started,
@@ -1562,6 +1692,8 @@ async fn run_scan_port(
                             futs.len(),
                             targets_completed,
                             completed_target,
+                            workers,
+                            adaptive_reason.as_deref(),
                         );
                     }
                 }
@@ -2199,13 +2331,16 @@ pub async fn run_scan_two_phase_with_progress(
 #[cfg(test)]
 mod tests {
     use super::{
-        bootstrap_score_interval, cidr_valid, collect_from_cidrs_with_seed, https_authority,
-        merge_port_results, merge_profile_results, parse_colo, record_best, resolve_host_for_ip,
-        result_confidence, result_status, score_from_samples, select_focus_cidrs,
-        select_next_target, should_stop_early, validate_response, wilson_interval,
-        DiagnosticCategory, ProbeResult, TargetState,
+        adaptive_progress_reason, bootstrap_score_interval, cidr_valid,
+        collect_from_cidrs_with_seed, https_authority, merge_port_results, merge_profile_results,
+        parse_colo, reconcile_worker_permits, record_best, remaining_measured_work,
+        resolve_host_for_ip, result_confidence, result_status, score_from_samples,
+        select_focus_cidrs, select_next_target, should_stop_early, validate_response,
+        wilson_interval, DiagnosticCategory, ProbeResult, TargetState,
     };
+    use crate::adaptive::{Action, ApplyResult, Decision, SignalDirection};
     use crate::config::{AppConfig, HealthCheck};
+    use tokio::sync::Semaphore;
 
     fn state(
         ip: &str,
@@ -2256,6 +2391,53 @@ mod tests {
         assert_eq!(resolve_host_for_ip("example.test:443"), "example.test");
         assert_eq!(resolve_host_for_ip("[2001:db8::1]:443"), "2001:db8::1");
         assert_eq!(resolve_host_for_ip("2001:db8::1"), "2001:db8::1");
+    }
+
+    #[test]
+    fn adaptive_progress_reason_distinguishes_pending_resize() {
+        let decision = Decision {
+            action: Action::ScaleDown(1),
+            signal: SignalDirection::Down,
+            reason: "failure pressure is sustained".to_string(),
+        };
+        assert_eq!(
+            adaptive_progress_reason(
+                &decision,
+                ApplyResult {
+                    resized: false,
+                    workers: 3,
+                }
+            ),
+            "failure pressure is sustained; awaiting hysteresis"
+        );
+        assert_eq!(
+            adaptive_progress_reason(
+                &decision,
+                ApplyResult {
+                    resized: true,
+                    workers: 2,
+                }
+            ),
+            "failure pressure is sustained"
+        );
+    }
+
+    #[test]
+    fn worker_permits_follow_target_without_reclaiming_active_probes() {
+        let sem = Semaphore::new(4);
+        let first = sem.try_acquire().expect("first permit");
+        let second = sem.try_acquire().expect("second permit");
+
+        reconcile_worker_permits(&sem, 2, 2);
+        assert_eq!(sem.available_permits(), 0);
+
+        drop(first);
+        reconcile_worker_permits(&sem, 2, 1);
+        assert_eq!(sem.available_permits(), 1);
+
+        reconcile_worker_permits(&sem, 4, 1);
+        assert_eq!(sem.available_permits(), 3);
+        drop(second);
     }
 
     #[test]
@@ -2326,6 +2508,19 @@ mod tests {
         ];
 
         assert_eq!(select_next_target(&states, 3), Some(0));
+    }
+
+    #[test]
+    fn remaining_work_excludes_pending_warmups_and_stopped_targets() {
+        let mut pending_warmup = state("192.0.2.1", 0, 0, &[], 0);
+        pending_warmup.warmup_done = false;
+        let ready = state("192.0.2.2", 1, 1, &[0.1], 0);
+        let mut stopped = state("192.0.2.3", 0, 0, &[], 0);
+        stopped.stopped_early = true;
+        assert_eq!(
+            remaining_measured_work(&[pending_warmup, ready, stopped], 3),
+            2
+        );
     }
 
     #[test]
