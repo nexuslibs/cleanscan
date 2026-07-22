@@ -5,9 +5,10 @@ mod scanner;
 mod speed;
 mod system_info;
 mod tui;
+mod updater;
 mod watch;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -18,6 +19,9 @@ use futures::StreamExt;
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Cloudflare IP scanner / latency prober")]
 pub struct Args {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Use CLI output mode (tab-separated) instead of TUI
     #[arg(long)]
     pub cli: bool,
@@ -247,10 +251,33 @@ pub struct Args {
     /// Discard persisted watch targets and start a fresh random sample.
     #[arg(long)]
     pub watch_new_sample: bool,
+
+    /// Disable the best-effort release check performed on normal runs.
+    #[arg(long)]
+    pub no_update_check: bool,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Check for and install the latest compatible release.
+    Update {
+        /// Check for an update without installing it.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(Command::Update { check }) = args.command.clone() {
+        return updater::run_explicit(check);
+    }
+    let mut update_receiver =
+        if args.no_update_check || std::env::var_os("CLEANSCAN_NO_UPDATE_CHECK").is_some() {
+            None
+        } else {
+            Some(updater::start_background_check())
+        };
     let mut config = config::load_config();
 
     if let Some(host) = args.host {
@@ -457,6 +484,18 @@ fn main() -> Result<()> {
 
     let system_network = system_info::lookup_sync(!args.no_network_info);
 
+    let update_notice = if args.cli {
+        update_receiver.take().map(|receiver| {
+            std::thread::spawn(move || {
+                if let Ok(notice) = receiver.recv() {
+                    eprintln!("{notice}");
+                }
+            })
+        })
+    } else {
+        None
+    };
+
     let watch_policy = watch::WatchPolicy {
         promote_after: args.watch_promote_after,
         demote_after: args.watch_demote_after,
@@ -471,7 +510,7 @@ fn main() -> Result<()> {
             system_network.asn_display(),
             system_network.isp_display()
         );
-        cli_mode(
+        let result = cli_mode(
             config,
             args.cidr,
             args.ips,
@@ -496,7 +535,11 @@ fn main() -> Result<()> {
             watch_policy,
             args.watch_state.as_deref(),
             args.watch_new_sample,
-        )
+        );
+        if let Some(handle) = update_notice {
+            let _ = handle.join();
+        }
+        result
     } else {
         tui::run_tui(
             config,
@@ -512,6 +555,7 @@ fn main() -> Result<()> {
             watch_policy,
             args.watch_state.as_deref(),
             args.watch_new_sample,
+            update_receiver,
             system_network,
         )
     }
@@ -1219,10 +1263,27 @@ fn cli_watch(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_manifest, healthy_result, normalize_config, write_manifest, HealthThresholds,
+        build_manifest, healthy_result, normalize_config, write_manifest, Args, Command,
+        HealthThresholds,
     };
     use crate::config::AppConfig;
     use crate::scanner;
+    use clap::Parser;
+
+    #[test]
+    fn update_subcommands_parse_without_scan_arguments() {
+        let args = Args::try_parse_from(["cleanscan", "update", "--check"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::Update { check: true })
+        ));
+    }
+
+    #[test]
+    fn update_check_opt_out_flag_parses() {
+        let args = Args::try_parse_from(["cleanscan", "--no-update-check"]).unwrap();
+        assert!(args.no_update_check);
+    }
 
     #[test]
     fn zero_numeric_values_are_normalized() {

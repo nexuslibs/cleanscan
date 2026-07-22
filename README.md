@@ -14,6 +14,8 @@ the best Cloudflare edge IPs to reach a given origin host.
   gauge and a results table that updates as each IP is probed.
 - **CLI mode** — drop-in tab-separated table output for piping / scripting via
   the `--cli` flag.
+- **Safe self-updates** — `cleanscan update` verifies release checksums before
+  atomically replacing the running binary; normal runs report newer releases.
 - Custom DNS resolution per IP, HTTP/2 adaptive windows, configurable
   concurrency, probes, and timeouts.
 - Cloudflare HTTPS port selection across 443, 2053, 2083, 2087, 2096, and 8443.
@@ -81,6 +83,28 @@ build automatically, and no custom GitHub secret is required.
 
 The installer continues to support the latest release and pinned versions via
 `CLEANSCAN_VERSION=vX.Y.Z`.
+
+### Updating cleanscan
+
+Normal runs make one best-effort HTTPS request to the fixed GitHub release API.
+The request has a short timeout, performs no retries, and any offline,
+restricted, or failed connection is ignored so scans continue normally. A
+newer release is reported on stderr in CLI mode or as a TUI notification.
+
+```sh
+# Check without changing the installed binary
+cleanscan update --check
+
+# Download and install the latest release for this platform
+cleanscan update
+```
+
+The updater accepts only the published GitHub archive and SHA-256 checksum for
+the current supported target. It validates the archive contents and performs
+an atomic replacement; it never invokes a shell installer or `sudo`. Use
+`--no-update-check` or `CLEANSCAN_NO_UPDATE_CHECK=1` when a normal scan must not
+attempt the release check at all. Supported targets are Linux x86_64, ARM64,
+ARMv7, and i686, plus macOS Intel and Apple Silicon.
 
 ### Termux (Android terminal)
 
@@ -319,6 +343,11 @@ latency dashboard.
 | `--watch-cooldown-cycles` | `2`            | Minimum cycles between recommendation changes    |
 | `--watch-state`         | config directory | Restart-safe watch state path                    |
 | `--watch-new-sample`    | off              | Discard persisted watch targets and resample     |
+| `--no-update-check`     | off              | Disable the best-effort release check             |
+
+The update subcommand is separate from scan options: `cleanscan update` installs
+the latest compatible release, while `cleanscan update --check` only reports
+whether one is available.
 
 ## Output
 

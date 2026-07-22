@@ -1474,6 +1474,7 @@ pub fn run_tui(
     watch_policy: crate::watch::WatchPolicy,
     watch_state_path: Option<&str>,
     watch_new_sample: bool,
+    mut update_receiver: Option<crate::updater::UpdateReceiver>,
     system_network: crate::system_info::SystemNetworkInfo,
 ) -> anyhow::Result<()> {
     let has_cli_targets = cli_ips.is_some() || !cli_cidr.is_empty();
@@ -1958,6 +1959,12 @@ pub fn run_tui(
                 }
             }
 
+            if let Some(receiver) = update_receiver.as_ref() {
+                if let Ok(notice) = receiver.try_recv() {
+                    app.toast_info(notice);
+                    update_receiver = None;
+                }
+            }
             app.tick_message();
             app.tick = app.tick.wrapping_add(1);
 
