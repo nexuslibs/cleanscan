@@ -231,6 +231,17 @@ pub fn row_selected_style() -> Style {
     style
 }
 
+/// Secondary row metadata keeps the selected range as the strongest signal.
+/// It still carries the selected row background so it never becomes a visual
+/// hole when the row is focused or checked.
+pub fn row_metadata_style(selected: bool) -> Style {
+    if selected {
+        Style::default().fg(palette().subtitle).bg(palette().sel_bg)
+    } else {
+        hint_style()
+    }
+}
+
 /// Subtle alternating (zebra) row fill for even rows in dense tables.
 pub fn row_alt_style() -> Style {
     Style::default().bg(palette().row_alt)

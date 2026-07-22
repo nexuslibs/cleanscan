@@ -927,8 +927,19 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
         Paragraph::new(Line::from(vec![
             Span::styled("Workers  : ", theme::title_style()),
             Span::raw(format!(
-                "{} concurrent • {} probes/IP",
-                app.config.concurrency, app.config.probes
+                "{}{} concurrent • {} probes/IP",
+                app.scan_progress
+                    .current_workers
+                    .unwrap_or(app.config.concurrency),
+                if app.config.adaptive_concurrency {
+                    format!(
+                        " [{}–{}] adaptive",
+                        app.config.min_concurrency, app.config.max_concurrency
+                    )
+                } else {
+                    String::new()
+                },
+                app.config.probes
             )),
         ])),
         p1_rows[3],
