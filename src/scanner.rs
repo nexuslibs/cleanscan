@@ -1733,13 +1733,25 @@ async fn run_scan_port(
                         }
                         if let Some(controller) = controller.as_mut() {
                             let now = adaptive_now.expect("adaptive timestamp exists");
+                            let floor = args
+                                .runtime_min_concurrency
+                                .load(Ordering::Relaxed)
+                                .max(1);
+                            let floor_update = controller.set_min_workers(floor);
+                            if floor_update.resized {
+                                workers = floor_update.workers;
+                            }
                             let remaining_work = remaining_measured_work(&states, probe_count);
                             let decision = controller.evaluate(now, remaining_work);
                             let applied = controller.apply(&decision, now);
                             if applied.resized {
                                 workers = applied.workers;
                             }
-                            adaptive_reason = Some(adaptive_progress_reason(&decision, applied));
+                            adaptive_reason = Some(if floor_update.resized {
+                                format!("minimum concurrency raised to {workers}")
+                            } else {
+                                adaptive_progress_reason(&decision, applied)
+                            });
                         }
                         reconcile_worker_permits(&sem, workers, futs.len());
                         send_progress_with_workers(

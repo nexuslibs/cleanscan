@@ -413,6 +413,7 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
             ("Tab", "focus"),
             (widgets::enter_key(), "details"),
             ("p", "pause"),
+            ("[ / ]", "min workers"),
             ("c", "copy"),
             ("/", "commands"),
             ("?", "help"),

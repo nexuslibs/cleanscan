@@ -790,6 +790,8 @@ impl SettingField {
                     return Err(format!("must be between 1 and {MAX_CONCURRENCY}"));
                 }
                 args.min_concurrency = v;
+                args.runtime_min_concurrency
+                    .store(v, std::sync::atomic::Ordering::Relaxed);
             }
             SettingField::MaxConcurrency => {
                 let v = raw

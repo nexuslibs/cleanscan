@@ -255,6 +255,23 @@ impl AdaptivePolicy {
         }
     }
 
+    /// Update the live lower bound without resetting adaptive history.
+    pub fn set_min_workers(&mut self, requested: usize) -> ApplyResult {
+        self.min_workers = requested.max(1).min(self.max_workers);
+        if self.workers < self.min_workers {
+            self.workers = self.min_workers;
+            ApplyResult {
+                resized: true,
+                workers: self.workers,
+            }
+        } else {
+            ApplyResult {
+                resized: false,
+                workers: self.workers,
+            }
+        }
+    }
+
     pub fn record(&mut self, observation: ProbeObservation) {
         self.window.record(observation);
         if self.baseline.is_none()

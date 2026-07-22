@@ -602,6 +602,9 @@ fn normalize_config(config: &mut AppConfig) {
     if config.min_concurrency == 0 {
         config.min_concurrency = 1;
     }
+    config
+        .runtime_min_concurrency
+        .store(config.min_concurrency, std::sync::atomic::Ordering::Relaxed);
     if config.max_concurrency == 0 {
         config.max_concurrency = 1;
     }

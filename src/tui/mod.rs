@@ -2727,6 +2727,8 @@ impl App {
 
     fn handle_scan_key(&mut self, code: KeyCode) {
         match code {
+            KeyCode::Char('[') => self.adjust_runtime_min_concurrency(-8),
+            KeyCode::Char(']') => self.adjust_runtime_min_concurrency(8),
             KeyCode::Char('r') if self.scan_complete => self.activate_action(Action::RepeatTargets),
             KeyCode::Char('n') if self.scan_complete => self.activate_action(Action::NewSample),
             KeyCode::Char('m') if self.scan_complete => {
@@ -2780,6 +2782,30 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn adjust_runtime_min_concurrency(&mut self, delta: i32) {
+        if !self.config.adaptive_concurrency {
+            self.toast_warn("Enable adaptive concurrency before changing its live floor");
+            return;
+        }
+        let current = self
+            .config
+            .runtime_min_concurrency
+            .load(Ordering::Relaxed)
+            .max(1);
+        let next = if delta.is_negative() {
+            current.saturating_sub(delta.unsigned_abs() as usize).max(1)
+        } else {
+            current
+                .saturating_add(delta as usize)
+                .min(self.config.max_concurrency.max(1))
+        };
+        self.config.min_concurrency = next;
+        self.config
+            .runtime_min_concurrency
+            .store(next, Ordering::Relaxed);
+        self.toast_info(format!("Adaptive minimum workers: {next}"));
     }
 
     fn toggle_failure_filter(&mut self) {

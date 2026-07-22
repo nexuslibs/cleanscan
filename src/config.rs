@@ -2,6 +2,8 @@ use anyhow::Result;
 use reqwest::header::HeaderName;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 use std::{fs, io::Write};
 
 pub const CLOUDFLARE_HTTPS_PORTS: &[u16] = &[443, 2053, 2083, 2087, 2096, 8443];
@@ -175,6 +177,9 @@ pub struct AppConfig {
     /// Maximum worker count used by adaptive concurrency.
     #[serde(default = "default_max_concurrency")]
     pub max_concurrency: usize,
+    /// Live adaptive floor shared between the wizard and an active scanner.
+    #[serde(skip, default = "default_runtime_min_concurrency")]
+    pub runtime_min_concurrency: Arc<AtomicUsize>,
     #[serde(default = "default_confidence")]
     pub confidence: f64,
     pub custom_cidrs: Vec<String>,
@@ -260,6 +265,9 @@ fn default_min_concurrency() -> usize {
 fn default_max_concurrency() -> usize {
     240
 }
+fn default_runtime_min_concurrency() -> Arc<AtomicUsize> {
+    Arc::new(AtomicUsize::new(default_min_concurrency()))
+}
 fn default_confidence() -> f64 {
     0.95
 }
@@ -305,6 +313,7 @@ impl Default for AppConfig {
             adaptive_concurrency: false,
             min_concurrency: default_min_concurrency(),
             max_concurrency: default_max_concurrency(),
+            runtime_min_concurrency: default_runtime_min_concurrency(),
             confidence: default_confidence(),
             custom_cidrs: Vec::new(),
             selected_cidrs: crate::scanner::DEFAULT_CLOUDFLARE_CIDRS
