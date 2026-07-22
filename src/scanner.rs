@@ -101,7 +101,6 @@ fn send_progress(
     latest_target: Option<String>,
     targets_total: Option<usize>,
     failure_counts: ProbeFailureCounts,
-    reliable: bool,
 ) {
     if let Some(tx) = progress {
         let snapshot = ScanProgress {
@@ -116,11 +115,7 @@ fn send_progress(
             targets_total,
             failure_counts,
         };
-        if reliable {
-            let _ = tx.send(snapshot);
-        } else {
-            let _ = tx.try_send(snapshot);
-        }
+        let _ = tx.try_send(snapshot);
     }
 }
 
@@ -2163,7 +2158,6 @@ async fn run_scan_port(
         None,
         None,
         failure_counts,
-        true,
     );
     ProgressOffsets {
         probes_started,
@@ -2269,7 +2263,6 @@ async fn run_scan_with_progress_from_offsets(
         None,
         None,
         progress_offsets.failure_counts,
-        true,
     );
     for (_, results) in by_ip {
         if let Some(result) = merge_port_results(&results) {
@@ -2433,7 +2426,6 @@ async fn run_profile_scan_with_progress_from_offsets(
         None,
         None,
         progress_offsets.failure_counts,
-        true,
     );
     progress_offsets
 }
@@ -2742,7 +2734,6 @@ pub async fn run_scan_two_phase_with_progress(
         None,
         None,
         ProbeFailureCounts::default(),
-        true,
     );
     let (p1_tx, p1_rx) = std::sync::mpsc::channel();
     let targets1 = collect_from_cidrs_with_seed(&selected_cidrs, discover_per, base_seed)?;
@@ -2820,7 +2811,6 @@ pub async fn run_scan_two_phase_with_progress(
             None,
             Some(actual_targets.len()),
             progress_offsets.failure_counts,
-            true,
         );
         run_scan_with_progress_from_offsets(
             targets2.into_iter().collect(),
