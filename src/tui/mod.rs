@@ -4139,11 +4139,13 @@ mod tests {
             targets_total: None,
         });
         assert!(app.results.is_empty());
+        assert!(app.scan_started_ips.contains("192.0.2.1"));
         assert_eq!(app.total_targets, 500);
         assert_eq!(app.scan_progress.probes_completed, 4);
         assert_eq!(app.scan_progress.active_probes, 8);
 
         app.begin_scan(3);
+        assert!(app.scan_started_ips.is_empty());
         assert_eq!(app.scan_progress.phase, ScanPhase::Starting);
         assert_eq!(app.scan_progress.probes_started, 0);
         assert_eq!(app.scan_progress.targets_completed, 0);

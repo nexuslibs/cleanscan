@@ -274,6 +274,11 @@ impl AdaptivePolicy {
         self.min_workers = requested.max(1).min(self.max_workers);
         if self.workers < self.min_workers {
             self.workers = self.min_workers;
+            // The runtime floor changed the worker count outside the normal
+            // throughput-controlled resize path. Any prior reference belongs
+            // to the old worker count and must not gate the next scale-up.
+            self.scale_up_reference = None;
+            self.scale_up_blocked = false;
             ApplyResult {
                 resized: true,
                 workers: self.workers,
@@ -1058,5 +1063,32 @@ mod tests {
         // not a completed probe and must not make this look like five.
         let rate = policy.throughput_per_second(start + Duration::from_secs(1));
         assert_eq!(rate, Some(4.0 / 0.6));
+    }
+
+    #[test]
+    fn floor_resize_resets_scale_up_measurement_gate() {
+        let start = Instant::now();
+        let mut tuning = params();
+        tuning.cooldown = Duration::ZERO;
+        tuning.hysteresis_streak = 1;
+        tuning.recovery_streak = 1;
+        let mut policy = AdaptivePolicy::with_params(2, 1, 5, tuning);
+        for millis in [0, 200, 400, 600] {
+            policy.record(success(start + Duration::from_millis(millis), Some(10.0)));
+        }
+        scale_once(&mut policy, start + Duration::from_secs(1));
+        assert!(policy.scale_up_reference.is_some());
+        policy.scale_up_blocked = true;
+
+        let update = policy.set_min_workers(4);
+        assert!(update.resized);
+        assert_eq!(policy.scale_up_reference, None);
+        assert!(!policy.scale_up_blocked);
+
+        let reference = policy.scale_up_reference;
+        let blocked = policy.scale_up_blocked;
+        assert!(!policy.set_min_workers(3).resized);
+        assert_eq!(policy.scale_up_reference, reference);
+        assert_eq!(policy.scale_up_blocked, blocked);
     }
 }

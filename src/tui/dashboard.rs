@@ -1650,6 +1650,9 @@ mod tests {
         app.scan_started_ips
             .extend(["192.0.2.1".to_string(), "192.0.2.2".to_string()]);
         app.add_result(result("192.0.2.1", 1.0, &[0.1]));
+        let mut second_port_success = result("192.0.2.1", 0.9, &[0.2]);
+        second_port_success.port = 8443;
+        app.add_result(second_port_success);
         let mut failed = result("192.0.2.2", 0.0, &[]);
         failed.ok = 0;
         failed.fail = 1;
