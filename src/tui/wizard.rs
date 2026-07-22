@@ -54,7 +54,9 @@ pub enum SettingField {
     Confidence,
 }
 
-const MAX_SAMPLE_PER_CIDR: usize = 10_000;
+// Keep this high enough to sample a substantial fraction of a /15 while
+// retaining a finite guard against accidental unbounded target generation.
+const MAX_SAMPLE_PER_CIDR: usize = 1_000_000;
 const MAX_PROBES: usize = 1_000;
 const MAX_CONCURRENCY: usize = 10_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -2412,6 +2414,20 @@ mod tests {
         assert!(!app.commit_edit());
         assert_eq!(app.edit_field, Some(1));
         assert_eq!(app.config.path, "/cdn-cgi/trace");
+    }
+
+    #[test]
+    fn sample_per_cidr_accepts_large_explicit_workloads() {
+        let mut app = settings_app();
+        let sample_index = SettingField::ALL
+            .iter()
+            .position(|field| *field == SettingField::SamplePerCidr)
+            .unwrap();
+        app.start_edit(sample_index);
+        app.edit_buffer = "1000000".to_string();
+
+        assert!(app.commit_edit());
+        assert_eq!(app.config.sample_per_cidr, 1_000_000);
     }
 
     #[test]
