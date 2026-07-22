@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.1](https://github.com/nexuslibs/cleanscan/compare/v0.19.0...v0.19.1) (2026-07-22)
+
+
+### Bug Fixes
+
+* **wizard:** enhance toggle functionality for advanced settings in the TUI ([ae077bc](https://github.com/nexuslibs/cleanscan/commit/ae077bc164479a4757272b8dc1ed4d2dc3c91063))
+
 ## [0.19.0](https://github.com/nexuslibs/cleanscan/compare/v0.18.1...v0.19.0) (2026-07-22)
 
 
