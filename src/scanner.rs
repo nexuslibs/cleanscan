@@ -581,6 +581,64 @@ pub fn cidr_valid(s: &str) -> Result<IpNet> {
     IpNet::from_str(trimmed).map_err(|_| anyhow!("invalid IP/CIDR: {}", s))
 }
 
+/// Return the number of addresses represented by an IP or CIDR, saturating
+/// when the mathematical count cannot fit in `u128` (IPv6 `/0`).
+pub fn cidr_address_count(s: &str) -> Option<u128> {
+    let net = cidr_valid(s).ok()?;
+    let host_bits = match net {
+        IpNet::V4(net) => 32u32.saturating_sub(net.prefix_len() as u32),
+        IpNet::V6(net) => 128u32.saturating_sub(net.prefix_len() as u32),
+    };
+    Some(if host_bits == 128 {
+        u128::MAX
+    } else {
+        1u128 << host_bits
+    })
+}
+
+/// The deterministic workload contribution of one selected range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CidrWorkload {
+    pub capacity: u128,
+    pub estimated_ips: u128,
+}
+
+/// The single source of truth for CIDR review and selection summaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CidrWorkloadSummary {
+    pub ranges: Vec<CidrWorkload>,
+    pub total_ips: u128,
+    pub total_probes: u128,
+}
+
+pub fn workload_for_cidrs(
+    cidrs: &[String],
+    samples_per_cidr: usize,
+    probes_per_ip: usize,
+    selected_ports: usize,
+) -> CidrWorkloadSummary {
+    let mut ranges = Vec::with_capacity(cidrs.len());
+    let mut total_ips = 0u128;
+    for cidr in cidrs {
+        if let Some(capacity) = cidr_address_count(cidr) {
+            let estimated_ips = capacity.min(samples_per_cidr as u128);
+            ranges.push(CidrWorkload {
+                capacity,
+                estimated_ips,
+            });
+            total_ips = total_ips.saturating_add(estimated_ips);
+        }
+    }
+    let total_probes = total_ips
+        .saturating_mul(probes_per_ip as u128)
+        .saturating_mul(selected_ports.max(1) as u128);
+    CidrWorkloadSummary {
+        ranges,
+        total_ips,
+        total_probes,
+    }
+}
+
 /// Build a target set from an explicit list of CIDR strings (used by the TUI
 /// CIDR selection screen). Each CIDR is sampled as in `collect_targets`.
 pub fn collect_from_cidrs_with_seed(
@@ -2384,6 +2442,54 @@ mod tests {
         assert_eq!(cidr_valid("2001:db8::1").unwrap().prefix_len(), 128);
         assert!(cidr_valid("192.0.2.0/24").is_ok());
         assert!(cidr_valid("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn cidr_address_count_handles_ipv4_ipv6_and_saturation() {
+        assert_eq!(super::cidr_address_count("192.0.2.1"), Some(1));
+        assert_eq!(super::cidr_address_count("192.0.2.0/31"), Some(2));
+        assert_eq!(super::cidr_address_count("192.0.2.0/24"), Some(256));
+        assert_eq!(super::cidr_address_count("2001:db8::1"), Some(1));
+        assert_eq!(super::cidr_address_count("2001:db8::/120"), Some(256));
+        assert_eq!(super::cidr_address_count("::/0"), Some(u128::MAX));
+        assert_eq!(super::cidr_address_count("invalid"), None);
+    }
+
+    #[test]
+    fn estimated_targets_cap_each_cidr_by_capacity() {
+        let cidrs = vec![
+            "192.0.2.1/32".to_string(),
+            "192.0.2.0/24".to_string(),
+            "2001:db8::/126".to_string(),
+        ];
+        assert_eq!(super::workload_for_cidrs(&cidrs, 4096, 1, 1).total_ips, 261);
+    }
+
+    #[test]
+    fn workload_summary_caps_each_range_and_saturates_probe_math() {
+        let cidrs = vec![
+            "192.0.2.1/32".to_string(),
+            "192.0.2.0/24".to_string(),
+            "188.114.96.0/20".to_string(),
+            "2001:db8::1/128".to_string(),
+            "2001:db8::/64".to_string(),
+        ];
+        let summary = super::workload_for_cidrs(&cidrs, 4096, 3, 2);
+        assert_eq!(summary.total_ips, 1 + 256 + 4096 + 1 + 4096);
+        assert_eq!(summary.total_probes, summary.total_ips * 6);
+        assert_eq!(summary.ranges[0].capacity, 1);
+        assert_eq!(summary.ranges[1].capacity, 256);
+        assert_eq!(summary.ranges[2].capacity, 4096);
+        assert_eq!(summary.ranges[4].estimated_ips, 4096);
+
+        let saturated = super::workload_for_cidrs(
+            &["::/0".to_string(), "::/0".to_string()],
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+        );
+        assert_eq!(saturated.total_ips, (usize::MAX as u128).saturating_mul(2));
+        assert_eq!(saturated.total_probes, u128::MAX);
     }
 
     #[test]

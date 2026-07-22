@@ -3947,6 +3947,7 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("[✓]") || rendered.contains("[x]"));
         assert!(rendered.contains("[ ]"));
+        assert!(rendered.contains("(4,096 IPs)"));
 
         assert!(terminal.backend().buffer().content().iter().any(|cell| {
             (cell.symbol() == "✓" || cell.symbol() == "x")

@@ -11,7 +11,6 @@ use std::collections::HashSet;
 use crate::config::{validate_ports, AppConfig, HealthCheck, CLOUDFLARE_HTTPS_PORTS};
 use crate::tui::theme;
 use crate::tui::{widgets, App, ButtonAction, ButtonKind, WizardStep};
-use tui_checkbox::Checkbox;
 use tui_slider::{Slider, SliderState};
 
 /// Identifies an editable scan parameter on the settings step.
@@ -872,6 +871,26 @@ fn render_step_bar(app: &App, frame: &mut Frame, area: Rect) {
     );
 }
 
+fn format_ip_count(count: u128) -> String {
+    let digits = count.to_string();
+    let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            formatted.push(',');
+        }
+        formatted.push(character);
+    }
+    formatted
+}
+
+fn ip_label(count: u128) -> String {
+    format!(
+        "{} {}",
+        format_ip_count(count),
+        if count == 1 { "IP" } else { "IPs" }
+    )
+}
+
 fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
     // On tall terminals, lead with a compact brand banner.
     let body = if area.height >= 16 {
@@ -953,28 +972,48 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
                 },
             );
         }
-        let checkbox = Checkbox::new(e.cidr.clone(), e.selected)
-            .checked_symbol(widgets::checkbox_checked_symbol())
-            .unchecked_symbol(widgets::checkbox_unchecked_symbol())
-            .style(if idx == app.cursor || e.selected {
-                theme::row_selected_style()
+        let selected_row = idx == app.cursor || e.selected;
+        let label_style = if selected_row {
+            theme::row_selected_style()
+        } else {
+            theme::hint_style()
+        };
+        let count = crate::scanner::cidr_address_count(&e.cidr)
+            .map(|count| format!("({})", ip_label(count)))
+            .unwrap_or_else(|| "(invalid)".to_string());
+        let checkbox = format!(
+            "{} ",
+            if e.selected {
+                widgets::checkbox_checked_symbol()
             } else {
-                theme::hint_style()
-            })
-            .label_style(if idx == app.cursor || e.selected {
-                theme::row_selected_style()
-            } else {
-                theme::hint_style()
-            })
-            .checkbox_style(if e.selected {
-                Style::default()
-                    .fg(theme::palette().success)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme::palette().subtitle)
-            });
+                widgets::checkbox_unchecked_symbol()
+            }
+        );
+        let primary = format!("{checkbox}{}", e.cidr);
+        let row_width = inner.width.saturating_sub(2) as usize;
+        let metadata_width = count.chars().count();
+        let primary_width = primary.chars().count();
+        let right_aligned = row_width >= primary_width + metadata_width + 3;
+        let inline = !right_aligned && row_width >= primary_width + metadata_width + 2;
+        let row = if right_aligned {
+            Line::from(vec![
+                Span::styled(primary, label_style),
+                Span::raw(" ".repeat(row_width - primary_width - metadata_width)),
+                Span::styled(count, theme::row_metadata_style(selected_row)),
+            ])
+        } else if inline {
+            Line::from(vec![
+                Span::styled(format!("{primary}  "), label_style),
+                Span::styled(count, theme::row_metadata_style(selected_row)),
+            ])
+        } else {
+            // Keep the checkbox and complete CIDR visible even at the
+            // smallest useful width; metadata yields rather than truncating
+            // the identity of the selectable item.
+            Line::from(Span::styled(primary, label_style))
+        };
         frame.render_widget(
-            checkbox,
+            Paragraph::new(row),
             Rect {
                 x: inner.x + 2,
                 y,
@@ -993,10 +1032,18 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
 
     // Right Side Info Panel
     let selected_count = app.cidr_candidates.iter().filter(|e| e.selected).count();
-    let total_ips = selected_count.saturating_mul(app.config.sample_per_cidr);
-    let total_requests = total_ips
-        .saturating_mul(app.config.probes)
-        .saturating_mul(app.config.ports.len().max(1));
+    let selected_cidrs: Vec<String> = app
+        .cidr_candidates
+        .iter()
+        .filter(|e| e.selected)
+        .map(|e| e.cidr.clone())
+        .collect();
+    let workload = crate::scanner::workload_for_cidrs(
+        &selected_cidrs,
+        app.config.sample_per_cidr,
+        app.config.probes,
+        app.config.ports.len(),
+    );
 
     let info_text = vec![
         Line::from(vec![Span::styled(" RANGE SUMMARY ", theme::header_style())]),
@@ -1015,11 +1062,11 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("Total target IPs: ", theme::title_style()),
-            Span::raw(total_ips.to_string()),
+            Span::raw(format_ip_count(workload.total_ips)),
         ]),
         Line::from(vec![
             Span::styled("Total HTTP Probes: ", theme::title_style()),
-            Span::raw(total_requests.to_string()),
+            Span::raw(format_ip_count(workload.total_probes)),
         ]),
         Line::from(""),
         Line::from(Span::styled(" Quick Actions: ", theme::subtitle_style())),
@@ -1256,22 +1303,26 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         desc_para_lines.push(Line::from("  Use j/k to move between fields."));
     }
 
-    let selected_count = app
+    let selected_cidrs: Vec<String> = app
         .cidr_candidates
         .iter()
         .filter(|entry| entry.selected)
-        .count();
-    let total_ips = selected_count.saturating_mul(app.config.sample_per_cidr);
-    let total_probes = total_ips
-        .saturating_mul(app.config.probes)
-        .saturating_mul(app.config.ports.len().max(1));
+        .map(|entry| entry.cidr.clone())
+        .collect();
+    let workload = crate::scanner::workload_for_cidrs(
+        &selected_cidrs,
+        app.config.sample_per_cidr,
+        app.config.probes,
+        app.config.ports.len(),
+    );
     desc_para_lines.insert(
         1,
         Line::from(Span::styled(
             format!(
-                "Estimated workload: {total_ips} targets{}{} probes",
+                "Estimated workload: {} targets{}{} probes",
+                format_ip_count(workload.total_ips),
                 widgets::workload_separator(),
-                total_probes
+                format_ip_count(workload.total_probes)
             ),
             theme::subtitle_style(),
         )),
@@ -1353,14 +1404,23 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
 
     let selected_count = selected.len();
     let preview_ready = !app.preview_targets.is_empty();
-    let total_ips = if app.preview_targets.is_empty() {
-        selected_count.saturating_mul(app.config.sample_per_cidr)
+    let workload = crate::scanner::workload_for_cidrs(
+        &selected,
+        app.config.sample_per_cidr,
+        app.config.probes,
+        app.config.ports.len(),
+    );
+    // A generated preview is deduplicated by the scanner and is therefore
+    // authoritative for the actual target workload. Before generation, the
+    // deterministic per-CIDR cap is the stable upper-bound estimate.
+    let total_ips = if preview_ready {
+        app.preview_targets.len() as u128
     } else {
-        app.preview_targets.len()
+        workload.total_ips
     };
     let total_probes = total_ips
-        .saturating_mul(app.config.probes)
-        .saturating_mul(app.config.ports.len().max(1));
+        .saturating_mul(app.config.probes as u128)
+        .saturating_mul(app.config.ports.len().max(1) as u128);
 
     // Ideal scan duration estimate
     let ideal_seconds =
@@ -1400,12 +1460,23 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
         ]),
         Line::from(""),
     ];
-    summary_left.extend(
-        selected
-            .iter()
-            .take(8)
-            .map(|c| Line::from(format!("  • {c}"))),
-    );
+    summary_left.extend(selected.iter().take(8).map(|c| {
+        let capacity = crate::scanner::cidr_address_count(c)
+            .map(ip_label)
+            .unwrap_or_else(|| "invalid".to_string());
+        let estimated = crate::scanner::workload_for_cidrs(
+            std::slice::from_ref(c),
+            app.config.sample_per_cidr,
+            1,
+            1,
+        )
+        .total_ips;
+        Line::from(format!(
+            "  {}  capacity: {capacity}; estimated targets: {}",
+            c,
+            ip_label(estimated)
+        ))
+    }));
     summary_left.push(Line::from(if selected_count > 8 {
         format!("  ... and {} more", selected_count - 8)
     } else {
@@ -1419,12 +1490,12 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
         )]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Samples/CIDR: ", theme::title_style()),
-            Span::raw(app.config.sample_per_cidr.to_string()),
+            Span::styled("Sampling limit: ", theme::title_style()),
+            Span::raw(format_ip_count(app.config.sample_per_cidr as u128)),
         ]),
         Line::from(vec![
             Span::styled("Probes/IP   : ", theme::title_style()),
-            Span::raw(app.config.probes.to_string()),
+            Span::raw(format_ip_count(app.config.probes as u128)),
         ]),
         Line::from(vec![
             Span::styled("Concurrency : ", theme::title_style()),
@@ -1444,12 +1515,19 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
         )]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Total IPs   : ", theme::title_style()),
-            Span::raw(total_ips.to_string()),
+            Span::styled(
+                if preview_ready {
+                    "Exact target IPs: "
+                } else {
+                    "Estimated target IPs: "
+                },
+                theme::title_style(),
+            ),
+            Span::raw(format_ip_count(total_ips)),
         ]),
         Line::from(vec![
             Span::styled("Total Probes: ", theme::title_style()),
-            Span::raw(total_probes.to_string()),
+            Span::raw(format_ip_count(total_probes)),
         ]),
         Line::from(vec![
             Span::styled("Early Stop  : ", theme::title_style()),
@@ -1495,7 +1573,7 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
     frame.render_widget(para_right, main_layout[1]);
 }
 
-fn ideal_scan_seconds(total_probes: usize, concurrency: usize, timeout_ms: u64) -> f64 {
+fn ideal_scan_seconds(total_probes: u128, concurrency: usize, timeout_ms: u64) -> f64 {
     (total_probes as f64 / concurrency.max(1) as f64) * (timeout_ms as f64 / 2000.0)
 }
 
@@ -2305,6 +2383,17 @@ mod tests {
         assert_eq!(
             SettingField::DiscoverFraction.nudged_text("1.0", 1),
             Some("1.00".to_string())
+        );
+    }
+
+    #[test]
+    fn ip_capacity_labels_use_trusted_compact_grammar() {
+        assert_eq!(super::ip_label(1), "1 IP");
+        assert_eq!(super::ip_label(256), "256 IPs");
+        assert_eq!(super::ip_label(4_096), "4,096 IPs");
+        assert_eq!(
+            super::format_ip_count(u128::MAX),
+            "340,282,366,920,938,463,463,374,607,431,768,211,455"
         );
     }
 }
