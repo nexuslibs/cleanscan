@@ -39,7 +39,7 @@ fn client() -> Result<Client> {
         .user_agent(concat!("cleanscan/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(4))
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::limited(10))
         .build()?)
 }
 
