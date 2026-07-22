@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.24.0](https://github.com/nexuslibs/cleanscan/compare/v0.23.0...v0.24.0) (2026-07-22)
+
+
+### Features
+
+* **settings:** increase MAX_SAMPLE_PER_CIDR to 1,000,000 and add test for large workloads ([42e0846](https://github.com/nexuslibs/cleanscan/commit/42e0846b2eeade00e9b65985349dca5cdac59c14))
+
 ## [0.23.0](https://github.com/nexuslibs/cleanscan/compare/v0.22.0...v0.23.0) (2026-07-22)
 
 
