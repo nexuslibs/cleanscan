@@ -308,22 +308,6 @@ impl AdaptivePolicy {
             .count()
     }
 
-    /// Number of connection or TLS failures currently in the window.
-    pub fn connection_failure_count(&self, now: Instant) -> usize {
-        self.observations_at(now)
-            .into_iter()
-            .filter(|observation| observation.kind == ObservationKind::ConnectionFailure)
-            .count()
-    }
-
-    /// Number of application/protocol failures currently in the window.
-    pub fn other_failure_count(&self, now: Instant) -> usize {
-        self.observations_at(now)
-            .into_iter()
-            .filter(|observation| observation.kind == ObservationKind::OtherFailure)
-            .count()
-    }
-
     /// Current p90 over valid successful steady-state latencies.
     pub fn latency_p90(&self, now: Instant) -> Option<f64> {
         let latencies: Vec<f64> = self
@@ -355,21 +339,18 @@ impl AdaptivePolicy {
         }
 
         let timeouts = self.timeout_count(now);
-        let failures = self
-            .connection_failure_count(now)
-            .saturating_add(self.other_failure_count(now));
         let successes = self.success_count(now);
         let completed_rate = completed as f64;
         let timeout_rate = timeouts as f64 / completed_rate;
-        let error_rate = failures as f64 / completed_rate;
 
-        if timeout_rate > self.params.timeout_rate_threshold
-            || error_rate > self.params.error_rate_threshold
-        {
+        // A failed target is not evidence that concurrency is too high. Only
+        // downscale on timeout pressure when successful traffic is present;
+        // all-failure windows commonly represent dead or blocked IPs.
+        if successes > 0 && timeout_rate > self.params.timeout_rate_threshold {
             return self.scale_down(
                 now,
-                "failure pressure exceeds adaptive threshold",
-                "failure pressure is sustained",
+                "timeout pressure exceeds adaptive threshold",
+                "timeout pressure is sustained",
             );
         }
 
@@ -740,10 +721,13 @@ mod tests {
     }
 
     #[test]
-    fn timeout_and_error_pressure_produce_down_signals() {
+    fn timeout_pressure_requires_successful_traffic() {
         let start = Instant::now();
         let mut timeouts = AdaptivePolicy::with_params(3, 1, 4, params());
-        for i in 0..4 {
+        for i in 0..2 {
+            timeouts.record(success(start + Duration::from_millis(i), Some(10.0)));
+        }
+        for i in 2..4 {
             timeouts.record(ProbeObservation {
                 kind: ObservationKind::Timeout,
                 latency: None,
@@ -763,8 +747,8 @@ mod tests {
             });
         }
         let error_decision = errors.evaluate(start + Duration::from_secs(1), 100);
-        assert_eq!(error_decision.signal, SignalDirection::Down);
-        assert_eq!(error_decision.action, Action::ScaleDown(1));
+        assert_eq!(error_decision.signal, SignalDirection::None);
+        assert_eq!(error_decision.action, Action::NoChange);
     }
 
     #[test]
@@ -834,7 +818,10 @@ mod tests {
         tuning.cooldown = Duration::ZERO;
         let mut controller = AdaptivePolicy::with_params(3, 1, 4, tuning);
 
-        for i in 0..4 {
+        for i in 0..2 {
+            controller.record(success(start + Duration::from_millis(i), Some(10.0)));
+        }
+        for i in 2..4 {
             controller.record(ProbeObservation {
                 kind: ObservationKind::Timeout,
                 latency: None,
