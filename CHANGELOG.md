@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.20.0](https://github.com/nexuslibs/cleanscan/compare/v0.19.2...v0.20.0) (2026-07-22)
+
+
+### Features
+
+* **adaptive:** add runtime minimum concurrency adjustment and UI controls ([0a2dad8](https://github.com/nexuslibs/cleanscan/commit/0a2dad8cec22a1e285c2f815d613675e292ba055))
+* **dashboard:** implement probe rate history for improved statistics tracking ([862b098](https://github.com/nexuslibs/cleanscan/commit/862b098a42bd7b8b286aff9ec620de3cc19fed9e))
+
+
+### Bug Fixes
+
+* **adaptive:** remove unused failure count methods and adjust timeout handling logic ([29627c4](https://github.com/nexuslibs/cleanscan/commit/29627c4cd54b3f65a7b4825e3ece3526a1ff5b79))
+
 ## [0.19.2](https://github.com/nexuslibs/cleanscan/compare/v0.19.1...v0.19.2) (2026-07-22)
 
 
