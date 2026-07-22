@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use flate2::read::GzDecoder;
+use futures::StreamExt;
 use reqwest::{Client, StatusCode};
 use semver::Version;
 use serde::Deserialize;
@@ -8,7 +9,7 @@ use std::{
     io::{Cursor, Read},
     path::Path,
     sync::mpsc::Receiver,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tar::Archive;
 
@@ -146,7 +147,54 @@ async fn download(client: &Client, asset: &Asset, tag: &str) -> Result<Vec<u8>> 
     if response.status() != StatusCode::OK {
         anyhow::bail!("download of {} returned {}", asset.name, response.status());
     }
-    Ok(response.bytes().await?.to_vec())
+    let total = response.content_length();
+    let mut stream = response.bytes_stream();
+    let mut downloaded = 0_u64;
+    let started = Instant::now();
+    let mut bytes = Vec::with_capacity(total.unwrap_or(0).try_into().unwrap_or(0));
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        downloaded += chunk.len() as u64;
+        bytes.extend_from_slice(&chunk);
+
+        let speed = downloaded as f64 / started.elapsed().as_secs_f64().max(0.001);
+        let progress = total.map_or_else(
+            || format!("{} downloaded", format_bytes(downloaded)),
+            |total| {
+                let percent = downloaded as f64 / total as f64 * 100.0;
+                format!(
+                    "{} / {} ({percent:.1}%)",
+                    format_bytes(downloaded),
+                    format_bytes(total)
+                )
+            },
+        );
+        print!(
+            "\r  {}: {progress} at {}/s",
+            asset.name,
+            format_bytes(speed as u64)
+        );
+        use std::io::Write;
+        std::io::stdout().flush()?;
+    }
+    println!();
+    Ok(bytes)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn current_version() -> Version {
@@ -180,14 +228,20 @@ pub fn start_background_check() -> UpdateReceiver {
 pub fn run_explicit(check_only: bool) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
+        println!("Checking for the latest cleanscan release...");
         let release = latest_release(API_URL).await?;
         let update = release_update(&release)?;
         if update.version <= current_version() {
             println!("cleanscan v{} is up to date", current_version());
             return Ok(());
         }
+        println!(
+            "Update available: cleanscan v{} → v{}",
+            current_version(),
+            update.version
+        );
         if check_only {
-            println!("Update available: cleanscan v{}", update.version);
+            println!("Check complete; nothing was installed (--check).");
             return Ok(());
         }
         install(&release, &update).await
@@ -201,12 +255,16 @@ async fn install(release: &Release, update: &UpdateInfo) -> Result<()> {
     let archive_asset = asset(release, &archive_name)?;
     let checksum_asset = asset(release, &checksum_name)?;
     let client = client(DOWNLOAD_TIMEOUT)?;
+    println!("Downloading {archive_name}...");
     let archive = download(&client, archive_asset, &update.tag).await?;
+    println!("Downloading {checksum_name}...");
     let expected = checksum(&download(&client, checksum_asset, &update.tag).await?)?;
+    println!("Verifying download checksum...");
     let actual: [u8; 32] = Sha256::digest(&archive).into();
     if actual != expected {
         anyhow::bail!("checksum mismatch for {archive_name}");
     }
+    println!("Installing cleanscan v{}...", update.version);
     replace_current_executable(&extract_binary(&archive)?, &update.version)
 }
 
