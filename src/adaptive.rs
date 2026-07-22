@@ -38,6 +38,10 @@ pub struct TuningParams {
     pub latency_degradation_min_samples: usize,
     /// p90 multiplier still considered healthy for scale-up.
     pub healthy_latency_ratio: f64,
+    /// Minimum relative throughput improvement required to justify another
+    /// scale-up after the previous resize. A value of `0.02` means that a
+    /// later worker increase must improve throughput by more than two percent.
+    pub throughput_improvement_threshold: f64,
     /// Remaining measured attempts required per desired worker.
     pub remaining_work_per_worker: usize,
     /// Minimum success fraction considered stable.
@@ -62,6 +66,7 @@ impl Default for TuningParams {
             latency_degradation_ratio: 1.5,
             latency_degradation_min_samples: 2,
             healthy_latency_ratio: 1.2,
+            throughput_improvement_threshold: 0.02,
             remaining_work_per_worker: 4,
             stable_success_rate: 0.90,
         }
@@ -110,6 +115,11 @@ impl TuningParams {
                 self.healthy_latency_ratio.max(1.0)
             } else {
                 defaults.healthy_latency_ratio
+            },
+            throughput_improvement_threshold: if self.throughput_improvement_threshold.is_finite() {
+                self.throughput_improvement_threshold.clamp(0.0, 1.0)
+            } else {
+                defaults.throughput_improvement_threshold
             },
             remaining_work_per_worker: self.remaining_work_per_worker.max(1),
             stable_success_rate: if self.stable_success_rate.is_finite() {
@@ -218,6 +228,8 @@ pub struct AdaptivePolicy {
     baseline_latency_samples: Vec<f64>,
     last_resize: Option<Instant>,
     last_scale_down: Option<Instant>,
+    scale_up_reference: Option<(Instant, f64)>,
+    scale_up_blocked: bool,
     up_streak: usize,
     down_streak: usize,
     healthy_streak: usize,
@@ -249,6 +261,8 @@ impl AdaptivePolicy {
             baseline_latency_samples: Vec::with_capacity(params.baseline_samples),
             last_resize: None,
             last_scale_down: None,
+            scale_up_reference: None,
+            scale_up_blocked: false,
             up_streak: 0,
             down_streak: 0,
             healthy_streak: 0,
@@ -260,6 +274,11 @@ impl AdaptivePolicy {
         self.min_workers = requested.max(1).min(self.max_workers);
         if self.workers < self.min_workers {
             self.workers = self.min_workers;
+            // The runtime floor changed the worker count outside the normal
+            // throughput-controlled resize path. Any prior reference belongs
+            // to the old worker count and must not gate the next scale-up.
+            self.scale_up_reference = None;
+            self.scale_up_blocked = false;
             ApplyResult {
                 resized: true,
                 workers: self.workers,
@@ -335,6 +354,44 @@ impl AdaptivePolicy {
             .filter(|latency| latency.is_finite())
             .collect();
         (!latencies.is_empty()).then(|| percentile(&latencies, 0.90))
+    }
+
+    /// Estimate throughput over a completed interval in the rolling window.
+    /// At least two distinct completion timestamps are required; treating a
+    /// burst of same-timestamp synthetic events as an infinite rate makes the
+    /// plateau detector permanently over-optimistic.
+    fn throughput_per_second(&self, now: Instant) -> Option<f64> {
+        let observations: Vec<_> = self
+            .observations_at(now)
+            .into_iter()
+            .filter(|observation| observation.kind != ObservationKind::Cancelled)
+            .collect();
+        let first = observations.first()?.at;
+        let last = observations.last()?.at;
+        let elapsed = elapsed_since(last, first).as_secs_f64();
+        (elapsed > 0.0).then_some(observations.len() as f64 / elapsed)
+    }
+
+    /// Throughput since a resize. This intentionally excludes all
+    /// pre-resize observations from the numerator and denominator so a slow
+    /// or fast period before the resize cannot make the new worker count look
+    /// equivalent to the old one.
+    fn throughput_since(&self, now: Instant, anchor: Instant) -> Option<f64> {
+        let samples = self.observations_since(now, anchor);
+        if samples == 0 {
+            return None;
+        }
+        let elapsed = elapsed_since(now, anchor).as_secs_f64();
+        (elapsed > 0.0).then_some(samples as f64 / elapsed)
+    }
+
+    fn observations_since(&self, now: Instant, anchor: Instant) -> usize {
+        self.observations_at(now)
+            .into_iter()
+            .filter(|observation| {
+                observation.at > anchor && observation.kind != ObservationKind::Cancelled
+            })
+            .count()
     }
 
     pub fn evaluate(&self, now: Instant, remaining_work: usize) -> Decision {
@@ -483,9 +540,30 @@ impl AdaptivePolicy {
 
         let should_resize = match (decision.signal, decision.action) {
             (SignalDirection::Up, Action::ScaleUp(step)) => {
-                self.up_streak >= self.params.hysteresis_streak
-                    && self.workers < self.max_workers
-                    && step > 0
+                let wants_scale_up = if self.scale_up_blocked {
+                    false
+                } else if let Some((anchor, reference)) = self.scale_up_reference {
+                    let enough_post_resize_samples =
+                        self.observations_since(now, anchor) >= self.params.min_samples;
+                    let throughput = self.throughput_since(now, anchor);
+                    if enough_post_resize_samples
+                        && throughput.is_some_and(|current| {
+                            current
+                                <= reference * (1.0 + self.params.throughput_improvement_threshold)
+                        })
+                    {
+                        // The latest increase did not improve throughput. Keep
+                        // this worker count as the stable point and do not keep
+                        // ramping into a flat or slower region.
+                        self.scale_up_blocked = true;
+                        false
+                    } else {
+                        self.up_streak >= self.params.hysteresis_streak
+                    }
+                } else {
+                    self.up_streak >= self.params.hysteresis_streak
+                };
+                wants_scale_up && self.workers < self.max_workers && step > 0
             }
             (SignalDirection::Down, Action::ScaleDown(step)) => {
                 self.down_streak >= self.params.hysteresis_streak
@@ -522,7 +600,22 @@ impl AdaptivePolicy {
         self.last_resize = Some(now);
         if downscaled {
             self.last_scale_down = Some(now);
+            self.scale_up_reference = None;
+            self.scale_up_blocked = false;
             self.healthy_streak = 0;
+        } else {
+            // Capture the pre-resize rate. The next comparison uses only
+            // completions after `now`, rather than a rolling window that
+            // straddles the resize.
+            self.scale_up_reference = self
+                .throughput_per_second(now)
+                .map(|throughput| (now, throughput));
+            // Without a measurable pre-resize interval there is no evidence
+            // that another increase is beneficial. Stop at this stable point
+            // instead of ramping blindly on a burst of same-timestamp events.
+            if self.scale_up_reference.is_none() {
+                self.scale_up_blocked = true;
+            }
         }
         self.up_streak = 0;
         self.down_streak = 0;
@@ -878,5 +971,124 @@ mod tests {
                 .apply(&first_eligible, start + Duration::from_secs(13))
                 .resized
         );
+    }
+
+    fn scale_once(policy: &mut AdaptivePolicy, at: Instant) {
+        let decision = policy.evaluate(at, 100);
+        assert_eq!(decision.action, Action::ScaleUp(1));
+        assert!(policy.apply(&decision, at).resized);
+    }
+
+    #[test]
+    fn throughput_plateau_uses_only_post_resize_observations() {
+        let start = Instant::now();
+        let mut tuning = params();
+        tuning.recovery_streak = 1;
+        tuning.hysteresis_streak = 1;
+        tuning.cooldown = Duration::ZERO;
+        let mut policy = AdaptivePolicy::with_params(5, 1, 7, tuning);
+
+        // Establish a measurable pre-resize rate of roughly five completions
+        // per second, then move from 5 to 6 workers.
+        for millis in [0, 200, 400, 600] {
+            policy.record(success(start + Duration::from_millis(millis), Some(10.0)));
+        }
+        scale_once(&mut policy, start + Duration::from_secs(1));
+
+        // This is flat/slower than the pre-resize rate. A rolling calculation
+        // over all observations could hide that fact by mixing both epochs.
+        for millis in [1200, 1400, 1600, 1800] {
+            policy.record(success(start + Duration::from_millis(millis), Some(10.0)));
+        }
+        let decision = policy.evaluate(start + Duration::from_secs(2), 100);
+        assert_eq!(decision.action, Action::ScaleUp(1));
+        assert!(
+            !policy
+                .apply(&decision, start + Duration::from_secs(2))
+                .resized
+        );
+        assert_eq!(policy.workers, 6);
+
+        // Once blocked, a healthy window must not keep increasing concurrency.
+        let decision = policy.evaluate(start + Duration::from_secs(2), 100);
+        assert!(
+            !policy
+                .apply(&decision, start + Duration::from_secs(2))
+                .resized
+        );
+        assert_eq!(policy.workers, 6);
+    }
+
+    #[test]
+    fn throughput_improvement_allows_the_next_worker() {
+        let start = Instant::now();
+        let mut tuning = params();
+        tuning.recovery_streak = 1;
+        tuning.hysteresis_streak = 1;
+        tuning.cooldown = Duration::ZERO;
+        let mut policy = AdaptivePolicy::with_params(5, 1, 7, tuning);
+        for millis in [0, 200, 400, 600] {
+            policy.record(success(start + Duration::from_millis(millis), Some(10.0)));
+        }
+        scale_once(&mut policy, start + Duration::from_secs(1));
+
+        // A genuinely faster post-resize epoch is allowed to advance to 7.
+        for millis in [1100, 1200, 1300, 1400] {
+            policy.record(success(start + Duration::from_millis(millis), Some(10.0)));
+        }
+        let decision = policy.evaluate(start + Duration::from_millis(1500), 100);
+        assert_eq!(decision.action, Action::ScaleUp(1));
+        assert!(
+            policy
+                .apply(&decision, start + Duration::from_millis(1500))
+                .resized
+        );
+        assert_eq!(policy.workers, 7);
+    }
+
+    #[test]
+    fn cancelled_observations_do_not_inflate_throughput() {
+        let start = Instant::now();
+        let mut policy = AdaptivePolicy::with_params(5, 1, 6, params());
+        for millis in [0, 200, 400, 600] {
+            policy.record(success(start + Duration::from_millis(millis), Some(10.0)));
+        }
+        policy.record(ProbeObservation {
+            kind: ObservationKind::Cancelled,
+            latency: None,
+            at: start + Duration::from_millis(800),
+        });
+
+        // Four real completions over 600ms is the rate; the cancelled task is
+        // not a completed probe and must not make this look like five.
+        let rate = policy.throughput_per_second(start + Duration::from_secs(1));
+        assert_eq!(rate, Some(4.0 / 0.6));
+    }
+
+    #[test]
+    fn floor_resize_resets_scale_up_measurement_gate() {
+        let start = Instant::now();
+        let mut tuning = params();
+        tuning.cooldown = Duration::ZERO;
+        tuning.hysteresis_streak = 1;
+        tuning.recovery_streak = 1;
+        let mut policy = AdaptivePolicy::with_params(2, 1, 5, tuning);
+        for millis in [0, 200, 400, 600] {
+            policy.record(success(start + Duration::from_millis(millis), Some(10.0)));
+        }
+        scale_once(&mut policy, start + Duration::from_secs(1));
+        assert!(policy.scale_up_reference.is_some());
+        policy.scale_up_blocked = true;
+
+        let update = policy.set_min_workers(4);
+        assert!(update.resized);
+        assert_eq!(policy.scale_up_reference, None);
+        assert!(!policy.scale_up_blocked);
+
+        let reference = policy.scale_up_reference;
+        let blocked = policy.scale_up_blocked;
+        assert!(!policy.set_min_workers(3).resized);
+        assert_eq!(policy.scale_up_reference, reference);
+        assert_eq!(policy.scale_up_blocked, blocked);
     }
 }

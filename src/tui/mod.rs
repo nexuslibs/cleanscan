@@ -64,6 +64,7 @@ pub struct ScanProgressState {
     pub latest_target: Option<String>,
     pub current_workers: Option<usize>,
     pub adaptive_reason: Option<String>,
+    pub targets_total: Option<usize>,
 }
 
 impl Default for ScanProgressState {
@@ -77,6 +78,7 @@ impl Default for ScanProgressState {
             latest_target: None,
             current_workers: None,
             adaptive_reason: None,
+            targets_total: None,
         }
     }
 }
@@ -284,6 +286,11 @@ pub struct App {
     pub edit_caret: usize,
     pub results: Vec<ProbeResult>,
     pub total_targets: usize,
+    pub scan_started_ips: HashSet<String>,
+    /// Unique IPs with at least one emitted result in the current scan.
+    pub scan_result_ips: HashSet<String>,
+    /// Unique IPs with at least one successful emitted result.
+    pub scan_succeeded_ips: HashSet<String>,
     pub scan_progress: ScanProgressState,
     /// Exact sampled targets shown in the review screen and used for the run.
     pub preview_targets: Vec<String>,
@@ -685,6 +692,9 @@ impl App {
             edit_caret: 0,
             results: Vec::new(),
             total_targets: 0,
+            scan_started_ips: HashSet::new(),
+            scan_result_ips: HashSet::new(),
+            scan_succeeded_ips: HashSet::new(),
             scan_progress: ScanProgressState::default(),
             preview_targets: Vec::new(),
             last_targets: Vec::new(),
@@ -858,6 +868,9 @@ impl App {
         self.show_result_details = false;
         self.detail_tab = 0;
         self.total_targets = total;
+        self.scan_started_ips.clear();
+        self.scan_result_ips.clear();
+        self.scan_succeeded_ips.clear();
         self.scan_progress = ScanProgressState::default();
         self.scan_complete = false;
         self.scan_lifecycle = ScanLifecycle::Running;
@@ -1007,10 +1020,18 @@ impl App {
     }
 
     pub fn add_result(&mut self, result: ProbeResult) {
+        self.scan_started_ips.insert(result.ip.clone());
+        self.scan_result_ips.insert(result.ip.clone());
+        if result.ok > 0 {
+            self.scan_succeeded_ips.insert(result.ip.clone());
+        }
         self.results.push(result);
     }
 
     pub fn apply_scan_progress(&mut self, progress: ScanProgress) {
+        if let Some(ip) = &progress.latest_target {
+            self.scan_started_ips.insert(ip.clone());
+        }
         self.scan_progress = ScanProgressState {
             phase: progress.phase,
             probes_started: self
@@ -1033,6 +1054,7 @@ impl App {
             adaptive_reason: progress
                 .adaptive_reason
                 .or(self.scan_progress.adaptive_reason.clone()),
+            targets_total: progress.targets_total.or(self.scan_progress.targets_total),
         };
     }
 
@@ -1736,7 +1758,9 @@ pub fn run_tui(
                 while let Ok(r) = rx.try_recv() {
                     app.add_result(r);
                 }
-                while progress_rx.try_recv().is_ok() {}
+                while let Ok(progress) = progress_rx.try_recv() {
+                    app.apply_scan_progress(progress);
+                }
                 if let Some(handle) = scanner.take() {
                     match handle.join() {
                         Ok(Ok(actual_targets)) => {
@@ -4115,13 +4139,29 @@ mod tests {
             latest_target: Some("192.0.2.1".to_string()),
             current_workers: None,
             adaptive_reason: None,
+            targets_total: Some(500),
         });
         assert!(app.results.is_empty());
+        assert!(app.scan_started_ips.contains("192.0.2.1"));
         assert_eq!(app.total_targets, 500);
         assert_eq!(app.scan_progress.probes_completed, 4);
         assert_eq!(app.scan_progress.active_probes, 8);
 
+        app.apply_scan_progress(ScanProgress {
+            phase: ScanPhase::Probing,
+            probes_started: 13,
+            probes_completed: 5,
+            active_probes: 1,
+            targets_completed: 1,
+            latest_target: None,
+            current_workers: Some(2),
+            adaptive_reason: Some("steady".to_string()),
+            targets_total: None,
+        });
+        assert_eq!(app.scan_progress.targets_total, Some(500));
+
         app.begin_scan(3);
+        assert!(app.scan_started_ips.is_empty());
         assert_eq!(app.scan_progress.phase, ScanPhase::Starting);
         assert_eq!(app.scan_progress.probes_started, 0);
         assert_eq!(app.scan_progress.targets_completed, 0);

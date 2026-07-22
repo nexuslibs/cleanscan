@@ -1,3 +1,6 @@
+use crate::scanner::{result_confidence, result_status, ProbeResult};
+use crate::tui::theme;
+use crate::tui::{modal_overlay, widgets, App, ButtonAction, ButtonKind, ScanLifecycle};
 use ratatui::{
     layout::{Constraint, Direction, Flex, Layout, Rect},
     style::Style,
@@ -10,10 +13,6 @@ use ratatui::{
     },
     Frame,
 };
-
-use crate::scanner::{result_confidence, result_status, ProbeResult};
-use crate::tui::theme;
-use crate::tui::{modal_overlay, widgets, App, ButtonAction, ButtonKind, ScanLifecycle};
 use std::time::{Duration, Instant};
 
 pub const RESULT_COLUMNS: [&str; 14] = [
@@ -206,6 +205,7 @@ fn render_compact(app: &mut App, frame: &mut Frame, area: Rect) {
 
 fn render_compact_stats(app: &App, frame: &mut Frame, area: Rect) {
     let (done, total) = progress_counts(app);
+    let (scanned, succeeded, failed, waiting) = unique_ip_counts(app);
     let ratio = if total > 0 {
         done as f64 / total as f64
     } else {
@@ -228,7 +228,7 @@ fn render_compact_stats(app: &App, frame: &mut Frame, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(format!(
-            "{} • {} probes • {} active",
+            "IPs {scanned}/{total} • ok {succeeded} • fail {failed} • wait {waiting} • {} • {} probes • {} active",
             phase_label(app.scan_progress.phase),
             app.scan_progress.probes_completed,
             app.scan_progress.active_probes
@@ -808,8 +808,32 @@ fn phase_label(phase: crate::scanner::ScanPhase) -> &'static str {
 
 fn progress_counts(app: &App) -> (usize, usize) {
     let completed = app.scan_progress.targets_completed;
-    let total = app.total_targets.max(completed);
+    let total = app
+        .total_targets
+        .max(app.scan_progress.targets_total.unwrap_or(0))
+        .max(completed);
     (completed.min(total), total)
+}
+
+fn unique_ip_counts(app: &App) -> (usize, usize, usize, usize) {
+    // A result is terminal for a single port/check, not necessarily for the
+    // IP. During multi-port, profile, or two-phase scans an all-failure
+    // partial result must remain unresolved until the whole scan completes.
+    let has_pending_ip_work =
+        app.config.ports.len() > 1 || !app.config.health_checks.is_empty() || app.config.two_phase;
+    let succeeded = app.scan_succeeded_ips.len();
+    let failed = if has_pending_ip_work && !app.scan_complete {
+        0
+    } else {
+        app.scan_result_ips.len().saturating_sub(succeeded)
+    };
+    let total = app
+        .total_targets
+        .max(app.scan_progress.targets_total.unwrap_or(0));
+    let waiting = total.saturating_sub(app.scan_started_ips.len());
+    // "Scanned" means work has started for the unique IP, including active
+    // and warmup work. This keeps scanned + waiting == total.
+    (app.scan_started_ips.len(), succeeded, failed, waiting)
 }
 
 fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
@@ -827,6 +851,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
         .split(area);
 
     let (passed, total) = progress_counts(app);
+    let (scanned_ips, succeeded_ips, failed_ips, waiting_ips) = unique_ip_counts(app);
     let pct = if total > 0 {
         (passed as f64 / total as f64 * 100.0) as u16
     } else {
@@ -885,6 +910,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // gauge
+            Constraint::Length(1), // unique IP counters
             Constraint::Length(1), // probe counters
             Constraint::Length(1), // rate / eta
             Constraint::Min(1),    // workers
@@ -908,7 +934,17 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Targets / probes: ", theme::title_style()),
+            Span::styled("Unique IPs: ", theme::title_style()),
+            Span::raw(format!(
+                "{} scanned • {} succeeded • {} failed • {} waiting",
+                scanned_ips, succeeded_ips, failed_ips, waiting_ips,
+            )),
+        ])),
+        p1_rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Probes: ", theme::title_style()),
             Span::raw(format!(
                 "{}/{} • {}/{} completed • {} active",
                 passed,
@@ -918,7 +954,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
                 app.scan_progress.active_probes,
             )),
         ])),
-        p1_rows[1],
+        p1_rows[2],
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -935,7 +971,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
                     .unwrap_or_default(),
             )),
         ])),
-        p1_rows[2],
+        p1_rows[3],
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -956,7 +992,7 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
                 app.config.probes
             )),
         ])),
-        p1_rows[3],
+        p1_rows[4],
     );
 
     // Panel 2: Latency summary
@@ -1518,8 +1554,12 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
 mod tests {
     use super::{
         latency_bucket, latency_summary, median, recommendation_ip, selected_latency_index,
+        unique_ip_counts,
     };
+    use crate::config::AppConfig;
     use crate::scanner::ProbeResult;
+    use crate::tui::{App, ScanLifecycle};
+    use std::sync::{atomic::AtomicBool, Arc};
 
     fn result(ip: &str, score: f64, samples: &[f64]) -> ProbeResult {
         ProbeResult {
@@ -1594,5 +1634,82 @@ mod tests {
         let second = result("192.0.2.2", 0.5, &[2.0]);
         let refs = vec![&first, &second];
         assert_eq!(selected_latency_index(Some("192.0.2.9"), &refs), None);
+    }
+
+    #[test]
+    fn unique_ip_counts_deduplicate_ports_and_defer_partial_failures() {
+        let mut app = App::new(
+            AppConfig {
+                ports: vec![443, 8443],
+                ..AppConfig::default()
+            },
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.total_targets = 3;
+        app.scan_started_ips
+            .extend(["192.0.2.1".to_string(), "192.0.2.2".to_string()]);
+        app.add_result(result("192.0.2.1", 1.0, &[0.1]));
+        let mut second_port_success = result("192.0.2.1", 0.9, &[0.2]);
+        second_port_success.port = 8443;
+        app.add_result(second_port_success);
+        let mut failed = result("192.0.2.2", 0.0, &[]);
+        failed.ok = 0;
+        failed.fail = 1;
+        failed.completed = 1;
+        failed.health_ok = false;
+        app.add_result(failed);
+
+        assert_eq!(unique_ip_counts(&app), (2, 1, 0, 1));
+
+        app.scan_complete = true;
+        app.scan_lifecycle = ScanLifecycle::Completed;
+        assert_eq!(unique_ip_counts(&app), (2, 1, 1, 1));
+    }
+
+    #[test]
+    fn unique_ip_counts_show_terminal_failure_for_single_port() {
+        let mut app = App::new(
+            AppConfig {
+                ports: vec![443],
+                ..AppConfig::default()
+            },
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.total_targets = 1;
+        app.scan_started_ips.insert("192.0.2.9".to_string());
+        let mut failed = result("192.0.2.9", 0.0, &[]);
+        failed.ok = 0;
+        failed.fail = 1;
+        failed.completed = 1;
+        failed.health_ok = false;
+        app.add_result(failed);
+        assert_eq!(unique_ip_counts(&app), (1, 0, 1, 0));
+    }
+
+    #[test]
+    fn unique_ip_success_wins_over_failure_across_ports() {
+        let mut app = App::new(
+            AppConfig {
+                ports: vec![443, 8443],
+                ..AppConfig::default()
+            },
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.total_targets = 1;
+        app.scan_started_ips.insert("192.0.2.10".to_string());
+        let mut failed = result("192.0.2.10", 0.0, &[]);
+        failed.ok = 0;
+        failed.fail = 1;
+        failed.completed = 1;
+        failed.health_ok = false;
+        app.add_result(failed);
+        app.add_result(result("192.0.2.10", 1.0, &[0.1]));
+        app.scan_complete = true;
+        app.scan_lifecycle = ScanLifecycle::Completed;
+
+        assert_eq!(unique_ip_counts(&app), (1, 1, 0, 0));
     }
 }

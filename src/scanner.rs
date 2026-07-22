@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt::Display,
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
@@ -40,8 +41,13 @@ pub struct ScanProgress {
     pub current_workers: Option<usize>,
     #[serde(default)]
     pub adaptive_reason: Option<String>,
+    /// Authoritative unique-target total when the scanner discovers targets
+    /// dynamically, such as during a two-phase focus pass.
+    #[serde(default)]
+    pub targets_total: Option<usize>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_progress(
     progress: Option<&std::sync::mpsc::Sender<ScanProgress>>,
     phase: ScanPhase,
@@ -50,6 +56,7 @@ fn send_progress(
     active_probes: usize,
     targets_completed: usize,
     latest_target: Option<String>,
+    targets_total: Option<usize>,
 ) {
     if let Some(tx) = progress {
         let _ = tx.send(ScanProgress {
@@ -61,6 +68,7 @@ fn send_progress(
             latest_target,
             current_workers: None,
             adaptive_reason: None,
+            targets_total,
         });
     }
 }
@@ -87,6 +95,7 @@ fn send_progress_with_workers(
             latest_target,
             current_workers: Some(current_workers),
             adaptive_reason: adaptive_reason.map(str::to_string),
+            targets_total: None,
         });
     }
 }
@@ -897,6 +906,7 @@ struct TargetState {
     port: u16,
     url: String,
     client: Option<Client>,
+    construction_failed: bool,
     samples: Vec<f64>,
     protocols: Vec<String>,
     ok: usize,
@@ -934,8 +944,11 @@ struct TargetState {
 impl TargetState {
     fn new(ip: String, args: &AppConfig, probe_count: usize, port: u16) -> Self {
         let url = format!("https://{}{}", https_authority(&args.host, port), args.path);
-        let client = client_for_ip(&args.host, &ip, args, port).ok();
-        let client_ok = client.is_some();
+        // Client construction is deferred until the target is actually
+        // scheduled. This keeps large target sets from blocking scanner
+        // startup before the first warmup can be dispatched.
+        let client = None;
+        let client_ok = ip.parse::<IpAddr>().is_ok();
         let (fail, loss, scheduled, completed) = if client_ok {
             (0, 0, 0, 0)
         } else {
@@ -947,6 +960,7 @@ impl TargetState {
             port,
             url,
             client,
+            construction_failed: !client_ok,
             samples: Vec::new(),
             protocols: Vec::new(),
             ok: 0,
@@ -990,7 +1004,11 @@ impl TargetState {
     }
 
     fn has_remaining_probe(&self, probe_count: usize) -> bool {
-        self.warmup_done && self.scheduled < probe_count && !self.in_flight && !self.stopped_early
+        self.warmup_done
+            && !self.construction_failed
+            && self.scheduled < probe_count
+            && !self.in_flight
+            && !self.stopped_early
     }
 
     /// Current best recommendation score from the samples gathered so far,
@@ -1331,12 +1349,79 @@ fn record_best(best: &mut Vec<(f64, f64)>, result: &ProbeResult, top: usize) {
 enum ProbeOutcome {
     Warmup {
         index: usize,
+        client: Option<Client>,
         sample: Result<(f64, String, Option<String>), ProbeDiagnostic>,
     },
     Measured {
         index: usize,
+        client: Option<Client>,
         sample: Result<(f64, String, Option<String>), ProbeDiagnostic>,
     },
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn probe_with_lazy_client(
+    client: Option<Client>,
+    host: String,
+    ip: String,
+    port: u16,
+    url: String,
+    args: Arc<AppConfig>,
+    sem: Arc<Semaphore>,
+    cancel: Arc<AtomicBool>,
+) -> (
+    Option<Client>,
+    Result<(f64, String, Option<String>), ProbeDiagnostic>,
+) {
+    let permit = tokio::select! {
+        biased;
+        permit = sem.acquire_owned() => permit.ok(),
+        _ = async {
+            while !cancel.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        } => None,
+    };
+    let Some(_permit) = permit else {
+        return (
+            client,
+            Err(ProbeDiagnostic {
+                category: DiagnosticCategory::Cancelled,
+                phase: DiagnosticPhase::Cancellation,
+                message: "cancelled".to_string(),
+                status: None,
+                location: None,
+                elapsed_ms: None,
+            }),
+        );
+    };
+
+    let client = match client {
+        Some(client) => client,
+        None => {
+            let build_args = args.clone();
+            match tokio::task::spawn_blocking(move || client_for_ip(&host, &ip, &build_args, port))
+                .await
+            {
+                Ok(Ok(client)) => client,
+                Ok(Err(error)) => return (None, Err(client_construction_diagnostic(error))),
+                Err(error) => return (None, Err(client_construction_diagnostic(error))),
+            }
+        }
+    };
+    let sample = probe_once(&client, &url, &args).await;
+    (Some(client), sample)
+}
+
+fn client_construction_diagnostic(error: impl Display) -> ProbeDiagnostic {
+    ProbeDiagnostic {
+        category: DiagnosticCategory::ClientSetup,
+        phase: DiagnosticPhase::ClientConstruction,
+        message: error.to_string(),
+        status: None,
+        location: None,
+        elapsed_ms: None,
+    }
 }
 
 fn remaining_measured_work(states: &[TargetState], probe_count: usize) -> usize {
@@ -1345,6 +1430,12 @@ fn remaining_measured_work(states: &[TargetState], probe_count: usize) -> usize 
         .filter(|state| state.warmup_done && !state.stopped_early)
         .map(|state| probe_count.saturating_sub(state.scheduled))
         .fold(0usize, usize::saturating_add)
+}
+
+fn select_next_warmup(states: &[TargetState]) -> Option<usize> {
+    states
+        .iter()
+        .position(|state| !state.warmup_done && !state.warmup_in_flight && !state.in_flight)
 }
 
 /// Keep the semaphore's idle permits consistent with the scheduler's current
@@ -1469,20 +1560,23 @@ async fn run_scan_port(
                 break;
             }
 
-            // Dispatch any pending warmup probes first so the TCP+TLS
-            // connection is established before steady-state probes run.
-            if args.warmup {
-                while futs.len() < workers {
-                    let warmup_index = states
-                        .iter()
-                        .position(|s| !s.warmup_done && !s.warmup_in_flight && !s.in_flight);
-                    let Some(index) = warmup_index else { break };
+            // Measured work always wins once a target's warmup has finished.
+            // If no measured target is ready, dispatch one pending warmup.
+            // Reserving a slot for warmup here would recreate a global
+            // warmup barrier: a slow pending warmup could occupy the last
+            // slot while ready targets wait indefinitely for measurement.
+            let next = if args.adaptive_probing {
+                select_next_target_adaptive(&mut states, probe_count, args.min_probes)
+            } else {
+                select_next_target(&states, probe_count)
+            };
+            let Some(index) = next else {
+                if let Some(index) = args.warmup.then(|| select_next_warmup(&states)).flatten() {
                     let state = &mut states[index];
-                    let client = state
-                        .client
-                        .as_ref()
-                        .expect("targets without clients are completed during initialization")
-                        .clone();
+                    let client = state.client.clone();
+                    let host = args.host.clone();
+                    let ip = state.ip.clone();
+                    let port = state.port;
                     let url = state.url.clone();
                     let probe_args = args.clone();
                     state.warmup_in_flight = true;
@@ -1501,45 +1595,25 @@ async fn run_scan_port(
                     let sem = sem.clone();
                     let cancel = cancel.clone();
                     futs.push(tokio::spawn(async move {
-                        let permit = tokio::select! {
-                            biased;
-                            permit = sem.acquire_owned() => permit.ok(),
-                            _ = async {
-                                while !cancel.load(Ordering::Relaxed) {
-                                    tokio::time::sleep(Duration::from_millis(25)).await;
-                                }
-                            } => None,
-                        };
-                        let sample = match permit {
-                            Some(_permit) => probe_once(&client, &url, &probe_args).await,
-                            None => Err(ProbeDiagnostic {
-                                category: DiagnosticCategory::Cancelled,
-                                phase: DiagnosticPhase::Cancellation,
-                                message: "cancelled".to_string(),
-                                status: None,
-                                location: None,
-                                elapsed_ms: None,
-                            }),
-                        };
-                        ProbeOutcome::Warmup { index, sample }
+                        let (client, sample) = probe_with_lazy_client(
+                            client, host, ip, port, url, probe_args, sem, cancel,
+                        )
+                        .await;
+                        ProbeOutcome::Warmup {
+                            index,
+                            client,
+                            sample,
+                        }
                     }));
+                    continue;
                 }
-            }
-
-            let next = if args.adaptive_probing {
-                select_next_target_adaptive(&mut states, probe_count, args.min_probes)
-            } else {
-                select_next_target(&states, probe_count)
-            };
-            let Some(index) = next else {
                 break;
             };
             let state = &mut states[index];
-            let client = state
-                .client
-                .as_ref()
-                .expect("targets without clients are completed during initialization")
-                .clone();
+            let client = state.client.clone();
+            let host = args.host.clone();
+            let ip = state.ip.clone();
+            let port = state.port;
             let url = state.url.clone();
             let probe_args = args.clone();
             state.scheduled += 1;
@@ -1560,27 +1634,14 @@ async fn run_scan_port(
             let cancel = cancel.clone();
 
             futs.push(tokio::spawn(async move {
-                let permit = tokio::select! {
-                    biased;
-                    permit = sem.acquire_owned() => permit.ok(),
-                    _ = async {
-                        while !cancel.load(Ordering::Relaxed) {
-                            tokio::time::sleep(Duration::from_millis(25)).await;
-                        }
-                    } => None,
-                };
-                let sample = match permit {
-                    Some(_permit) => probe_once(&client, &url, &probe_args).await,
-                    None => Err(ProbeDiagnostic {
-                        category: DiagnosticCategory::Cancelled,
-                        phase: DiagnosticPhase::Cancellation,
-                        message: "cancelled".to_string(),
-                        status: None,
-                        location: None,
-                        elapsed_ms: None,
-                    }),
-                };
-                ProbeOutcome::Measured { index, sample }
+                let (client, sample) =
+                    probe_with_lazy_client(client, host, ip, port, url, probe_args, sem, cancel)
+                        .await;
+                ProbeOutcome::Measured {
+                    index,
+                    client,
+                    sample,
+                }
             }));
         }
 
@@ -1600,10 +1661,17 @@ async fn run_scan_port(
             joined = futs.next() => {
                 let Some(Ok(outcome)) = joined else { continue };
                 match outcome {
-                    ProbeOutcome::Warmup { index, sample } => {
+                    ProbeOutcome::Warmup {
+                        index,
+                        client,
+                        sample,
+                    } => {
                         probes_completed += 1;
                         let state = &mut states[index];
                         state.warmup_in_flight = false;
+                        if client.is_some() {
+                            state.client = client;
+                        }
                         match sample {
                             Ok((value, _protocol, colo)) => {
                                 state.warmup_done = true;
@@ -1618,18 +1686,51 @@ async fn run_scan_port(
                                 // the warmup phase but flag the first successful
                                 // measured probe to be discarded as the cold
                                 // request, keeping its setup cost out of latency.
+                                let construction_failed = matches!(
+                                    diagnostic.category,
+                                    DiagnosticCategory::ClientSetup
+                                );
                                 state.warmup_done = true;
-                                state.warmup_discard_first = true;
+                                state.warmup_discard_first = !construction_failed;
+                                state.construction_failed = construction_failed;
                                 state.diagnostics.push(diagnostic.clone());
                                 state.failures.push(diagnostic.message);
+                                if construction_failed {
+                                    state.fail = probe_count;
+                                    state.scheduled = probe_count;
+                                    state.completed = probe_count;
+                                    let mut result = state.result_with_mode(args.adaptive_probing);
+                                    if include_port_details {
+                                        result.port_results = vec![port_result(&result)];
+                                    }
+                                    let _ = tx.send(result);
+                                    if include_port_details {
+                                        targets_completed += 1;
+                                    }
+                                }
                             }
                         }
                     }
-                    ProbeOutcome::Measured { index, sample } => {
+                    ProbeOutcome::Measured {
+                        index,
+                        client,
+                        sample,
+                    } => {
                         let state = &mut states[index];
                         state.in_flight = false;
+                        if client.is_some() {
+                            state.client = client;
+                        }
                         probes_completed += 1;
                         state.completed += 1;
+                        let construction_failed = matches!(
+                            &sample,
+                            Err(diagnostic)
+                                if diagnostic.category == DiagnosticCategory::ClientSetup
+                        );
+                        if construction_failed {
+                            state.construction_failed = true;
+                        }
                         let fallback_cold = sample.is_ok() && state.warmup_discard_first;
                         let adaptive_now = controller.as_ref().map(|_| Instant::now());
                         if let Some(controller) = controller.as_mut() {
@@ -1693,6 +1794,11 @@ async fn run_scan_port(
                                 state.failures.push(diagnostic.message.clone());
                                 state.diagnostics.push(diagnostic);
                             }
+                        }
+                        if construction_failed {
+                            state.fail += probe_count.saturating_sub(state.completed);
+                            state.scheduled = probe_count;
+                            state.completed = probe_count;
                         }
                         let adaptive_min_reached = !args.adaptive_probing || state.completed >= args.min_probes;
                         let legacy_stop = adaptive_min_reached
@@ -1869,6 +1975,7 @@ async fn run_scan_with_progress_from_offsets(
         0,
         progress_offsets.2,
         None,
+        None,
     );
     for (_, results) in by_ip {
         if let Some(result) = merge_port_results(&results) {
@@ -2021,6 +2128,7 @@ async fn run_profile_scan_with_progress_from_offsets(
         progress_offsets.1,
         0,
         progress_offsets.2,
+        None,
         None,
     );
     progress_offsets
@@ -2320,7 +2428,16 @@ pub async fn run_scan_two_phase_with_progress(
     };
 
     // Discovery pass.
-    send_progress(progress.as_ref(), ScanPhase::Discovery, 0, 0, 0, 0, None);
+    send_progress(
+        progress.as_ref(),
+        ScanPhase::Discovery,
+        0,
+        0,
+        0,
+        0,
+        None,
+        None,
+    );
     let (p1_tx, p1_rx) = std::sync::mpsc::channel();
     let targets1 = collect_from_cidrs_with_seed(&selected_cidrs, discover_per, base_seed)?;
     let mut actual_targets: BTreeSet<String> = targets1.iter().cloned().collect();
@@ -2380,9 +2497,23 @@ pub async fn run_scan_two_phase_with_progress(
         }
     }
 
+    // Discovery and focus represent one unique-IP workload. A random sample
+    // can overlap the discovery set, so remove those IPs before scheduling the
+    // focus pass; otherwise target-completion progress counts a repeated IP as
+    // a new target even though the dashboard correctly deduplicates it.
+    targets2.retain(|ip| !actual_targets.contains(ip));
     if !targets2.is_empty() {
         actual_targets.extend(targets2.iter().cloned());
-        send_progress(progress.as_ref(), ScanPhase::Focus, 0, 0, 0, 0, None);
+        send_progress(
+            progress.as_ref(),
+            ScanPhase::Focus,
+            0,
+            0,
+            0,
+            0,
+            None,
+            Some(actual_targets.len()),
+        );
         run_scan_with_progress_from_offsets(
             targets2.into_iter().collect(),
             config,
@@ -2405,8 +2536,8 @@ mod tests {
         collect_from_cidrs_with_seed, https_authority, merge_port_results, merge_profile_results,
         parse_colo, reconcile_worker_permits, record_best, remaining_measured_work,
         resolve_host_for_ip, result_confidence, result_status, score_from_samples,
-        select_focus_cidrs, select_next_target, should_stop_early, validate_response,
-        wilson_interval, DiagnosticCategory, ProbeResult, TargetState,
+        select_focus_cidrs, select_next_target, select_next_warmup, should_stop_early,
+        validate_response, wilson_interval, DiagnosticCategory, ProbeResult, TargetState,
     };
     use crate::adaptive::{Action, ApplyResult, Decision, SignalDirection};
     use crate::config::{AppConfig, HealthCheck};
@@ -2424,6 +2555,7 @@ mod tests {
             port: 443,
             url: String::new(),
             client: None,
+            construction_failed: false,
             samples: samples.to_vec(),
             protocols: Vec::new(),
             ok: samples.len(),
@@ -2671,6 +2803,22 @@ mod tests {
     }
 
     #[test]
+    fn warmup_selection_skips_completed_and_in_flight_targets() {
+        let mut completed = state("192.0.2.1", 0, 0, &[], 0);
+        completed.warmup_done = true;
+        let mut in_flight = state("192.0.2.2", 0, 0, &[], 0);
+        in_flight.warmup_done = false;
+        in_flight.warmup_in_flight = true;
+        let mut pending = state("192.0.2.3", 0, 0, &[], 0);
+        pending.warmup_done = false;
+
+        assert_eq!(
+            select_next_warmup(&[completed, in_flight, pending]),
+            Some(2)
+        );
+    }
+
+    #[test]
     fn seeded_sampling_is_reproducible_and_deduplicated() {
         let first = collect_from_cidrs_with_seed(
             &["192.0.2.0/24".to_string(), "192.0.2.0/24".to_string()],
@@ -2775,6 +2923,7 @@ mod tests {
             port: 443,
             url: String::new(),
             client: None,
+            construction_failed: false,
             samples: vec![0.2, 0.3, 0.25],
             protocols: vec!["h2".to_string(); 3],
             ok: 3,
@@ -2832,6 +2981,7 @@ mod tests {
             port: 443,
             url: String::new(),
             client: None,
+            construction_failed: false,
             samples: vec![0.10, 0.20, 0.30],
             protocols: vec!["h2".to_string(); 3],
             ok: 3,
@@ -2875,6 +3025,7 @@ mod tests {
             port: 443,
             url: String::new(),
             client: None,
+            construction_failed: false,
             samples: vec![0.20, 0.20, 0.30, 0.30],
             protocols: vec!["h2".to_string(); 4],
             ok: 4,
@@ -2903,6 +3054,7 @@ mod tests {
             port: 443,
             url: String::new(),
             client: None,
+            construction_failed: false,
             samples: vec![0.10, 0.10, 0.30, 0.30],
             protocols: vec!["h2".to_string(); 4],
             ok: 4,
@@ -2938,6 +3090,7 @@ mod tests {
             port: 443,
             url: String::new(),
             client: None,
+            construction_failed: false,
             samples: vec![0.20, 0.20, 0.20],
             protocols: vec!["h2".to_string(); 3],
             ok: 3,
@@ -2966,6 +3119,7 @@ mod tests {
             port: 443,
             url: String::new(),
             client: None,
+            construction_failed: false,
             samples: vec![0.20, 0.20, 0.20],
             protocols: vec!["h2".to_string(); 3],
             ok: 3,
@@ -3047,6 +3201,7 @@ mod tests {
             port: 443,
             url: String::new(),
             client: None,
+            construction_failed: false,
             samples: vec![0.10, 0.20, 0.30],
             protocols: vec!["h2".to_string(); 3],
             ok: 3,
