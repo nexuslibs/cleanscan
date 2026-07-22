@@ -484,15 +484,17 @@ fn main() -> Result<()> {
 
     let system_network = system_info::lookup_sync(!args.no_network_info);
 
-    if args.cli {
-        if let Some(receiver) = update_receiver.take() {
+    let update_notice = if args.cli {
+        update_receiver.take().map(|receiver| {
             std::thread::spawn(move || {
                 if let Ok(notice) = receiver.recv() {
                     eprintln!("{notice}");
                 }
-            });
-        }
-    }
+            })
+        })
+    } else {
+        None
+    };
 
     let watch_policy = watch::WatchPolicy {
         promote_after: args.watch_promote_after,
@@ -508,7 +510,7 @@ fn main() -> Result<()> {
             system_network.asn_display(),
             system_network.isp_display()
         );
-        cli_mode(
+        let result = cli_mode(
             config,
             args.cidr,
             args.ips,
@@ -533,7 +535,11 @@ fn main() -> Result<()> {
             watch_policy,
             args.watch_state.as_deref(),
             args.watch_new_sample,
-        )
+        );
+        if let Some(handle) = update_notice {
+            let _ = handle.join();
+        }
+        result
     } else {
         tui::run_tui(
             config,

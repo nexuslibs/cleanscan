@@ -15,6 +15,8 @@ use tar::Archive;
 const API_URL: &str = "https://api.github.com/repos/nexuslibs/cleanscan/releases/latest";
 const REPOSITORY: &str = "nexuslibs/cleanscan";
 const BINARY: &str = "cleanscan";
+const METADATA_TIMEOUT: Duration = Duration::from_secs(4);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Deserialize)]
 struct Release {
@@ -34,17 +36,17 @@ struct UpdateInfo {
     tag: String,
 }
 
-fn client() -> Result<Client> {
+fn client(timeout: Duration) -> Result<Client> {
     Ok(Client::builder()
         .user_agent(concat!("cleanscan/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(4))
+        .timeout(timeout)
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()?)
 }
 
 async fn latest_release(endpoint: &str) -> Result<Release> {
-    let response = client()?.get(endpoint).send().await?;
+    let response = client(METADATA_TIMEOUT)?.get(endpoint).send().await?;
     if response.status() != StatusCode::OK {
         anyhow::bail!("release service returned {}", response.status());
     }
@@ -198,7 +200,7 @@ async fn install(release: &Release, update: &UpdateInfo) -> Result<()> {
     let checksum_name = format!("{archive_name}.sha256");
     let archive_asset = asset(release, &archive_name)?;
     let checksum_asset = asset(release, &checksum_name)?;
-    let client = client()?;
+    let client = client(DOWNLOAD_TIMEOUT)?;
     let archive = download(&client, archive_asset, &update.tag).await?;
     let expected = checksum(&download(&client, checksum_asset, &update.tag).await?)?;
     let actual: [u8; 32] = Sha256::digest(&archive).into();
