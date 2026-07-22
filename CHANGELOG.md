@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.21.0](https://github.com/nexuslibs/cleanscan/compare/v0.20.0...v0.21.0) (2026-07-22)
+
+
+### Features
+
+* **dashboard:** add support for multiple ports in scan results ([96d9fa8](https://github.com/nexuslibs/cleanscan/commit/96d9fa8ace2a1463d9a61c0e40ce66f6937e4000))
+* **dashboard:** add unique IP tracking and display in stats panel ([ee4c1a2](https://github.com/nexuslibs/cleanscan/commit/ee4c1a2c8dd892c8ad84c1eb7186d8b6b3ac0809))
+
+
+### Bug Fixes
+
+* **adaptive:** reset scale-up measurement gate on worker count adjustment ([96d9fa8](https://github.com/nexuslibs/cleanscan/commit/96d9fa8ace2a1463d9a61c0e40ce66f6937e4000))
+* **scanner:** add warmup selection logic and improve progress handling in TUI ([c5782dd](https://github.com/nexuslibs/cleanscan/commit/c5782dda5de790095e79a0a3c795bca2c2930f67))
+* **scanner:** filter out cancelled observations and update progress tracking ([984e1f4](https://github.com/nexuslibs/cleanscan/commit/984e1f4e370c7c0c386b3fed6829baea6bb4377a))
+* **scanner:** reduce startup delay and stabilize adaptive workers ([182d847](https://github.com/nexuslibs/cleanscan/commit/182d847b84291d67851094a9830d92c1641842cc))
+* **scanner:** reduce startup delay and stabilize adaptive workers ([3b7b59d](https://github.com/nexuslibs/cleanscan/commit/3b7b59d7f47789c20c76a17dd943f60ac5c17327))
+* **scanner:** streamline diagnostic handling by removing duplicate entries in run_scan_port ([aab08e5](https://github.com/nexuslibs/cleanscan/commit/aab08e597f2bab65f37405d17d19e796d1131628))
+* **scanner:** track construction failure in TargetState and update probing logic ([ab8d674](https://github.com/nexuslibs/cleanscan/commit/ab8d67429e2781e5da6670dd8dbd1e00f7c7a16c))
+
 ## [0.20.0](https://github.com/nexuslibs/cleanscan/compare/v0.19.2...v0.20.0) (2026-07-22)
 
 
