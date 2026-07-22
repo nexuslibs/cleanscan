@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.22.0](https://github.com/nexuslibs/cleanscan/compare/v0.21.0...v0.22.0) (2026-07-22)
+
+
+### Features
+
+* **updater:** enhance download progress reporting and checksum verification ([d44227c](https://github.com/nexuslibs/cleanscan/commit/d44227cf483f63f95ff9bf47f498b186aa7a78f8))
+
 ## [0.21.0](https://github.com/nexuslibs/cleanscan/compare/v0.20.0...v0.21.0) (2026-07-22)
 
 
