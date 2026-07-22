@@ -4260,7 +4260,26 @@ mod tests {
         app.add_result(result("192.0.2.1", 0, 0.04));
         app.show_result_details = true;
         draw(&mut app, 80, 24);
+        assert!(app.buttons.iter().all(|(button, _)| button.height == 3));
         draw(&mut app, 79, 23);
+    }
+
+    #[test]
+    fn scan_dashboard_keeps_footer_buttons_below_results() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(10);
+        app.add_result(result("192.0.2.1", 0, 0.04));
+        draw(&mut app, 168, 13);
+
+        let table_bottom = app.table_inner.expect("scan table rendered").bottom();
+        assert!(app
+            .buttons
+            .iter()
+            .all(|(button, _)| button.y >= table_bottom));
     }
 
     #[test]

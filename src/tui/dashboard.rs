@@ -50,7 +50,9 @@ const WIDTHS: [Constraint; 14] = [
 
 /// Render the live scanning dashboard.
 pub fn render(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) {
-    if area.width < 48 || area.height < 10 {
+    let compact = area.width < 168;
+    let minimum_height = if compact { 12 } else { 15 };
+    if area.width < 48 || area.height < minimum_height {
         render_micro(app, frame, area);
         render_result_details(app, frame, area, elapsed);
         return;
@@ -58,7 +60,7 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) {
 
     // The full 14-column table needs 153 (WIDTHS) + 13 column separators
     // + 2 border columns = 168 columns to render without clipping.
-    if area.width < 168 {
+    if compact {
         render_compact(app, frame, area);
     } else {
         render_wide(app, frame, area);
@@ -177,7 +179,7 @@ fn render_wide(app: &mut App, frame: &mut Frame, area: Rect) {
             Constraint::Length(3), // Header
             Constraint::Length(7), // Stats panel + failure summary
             Constraint::Min(1),    // Results table
-            Constraint::Length(3), // Footer
+            Constraint::Length(4), // Footer: buttons + status bar
         ])
         .split(area);
 
@@ -196,7 +198,7 @@ fn render_compact(app: &mut App, frame: &mut Frame, area: Rect) {
             Constraint::Length(3),
             Constraint::Length(4),
             Constraint::Min(1),
-            Constraint::Length(3),
+            Constraint::Length(4), // Footer: buttons + status bar
         ])
         .split(area);
     render_header(app, frame, chunks[0]);
@@ -468,7 +470,7 @@ fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
 fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .constraints([Constraint::Length(3), Constraint::Length(1)])
         .split(area);
     let buttons = Layout::default()
         .direction(Direction::Horizontal)
@@ -1594,6 +1596,7 @@ fn latency_bucket(ms: f64) -> usize {
 }
 
 fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
+    let footer_rows = Layout::vertical([Constraint::Length(3), Constraint::Length(1)]).split(area);
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -1603,7 +1606,7 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
             Constraint::Min(0),
             Constraint::Length(18),
         ])
-        .split(area);
+        .split(footer_rows[0]);
 
     let left_action = if app.scan_complete {
         ButtonAction::Save
@@ -1686,7 +1689,7 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
             ("q", "quit"),
         ]
     };
-    widgets::status_bar(frame, chunks[3], hints, app.visible_message());
+    widgets::status_bar(frame, footer_rows[1], hints, app.visible_message());
 }
 
 #[cfg(test)]
