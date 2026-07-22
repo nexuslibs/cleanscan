@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.19.0](https://github.com/nexuslibs/cleanscan/compare/v0.18.1...v0.19.0) (2026-07-22)
+
+
+### Features
+
+* **scanner:** add CIDR address count and workload calculations ([99ccc41](https://github.com/nexuslibs/cleanscan/commit/99ccc411e77cc2f61bdaf8713ac2f77e1b8cfc53))
+* **scanner:** harden adaptive worker concurrency ([390c04d](https://github.com/nexuslibs/cleanscan/commit/390c04d67ca5e4a7533eeea68684af8abf8a6f9e))
+* **scanner:** harden adaptive worker concurrency ([368ce74](https://github.com/nexuslibs/cleanscan/commit/368ce74f9c33d44f9be27a6aee8754bf9d563357))
+* **tui:** enhance UI to display IP counts and workload estimates ([99ccc41](https://github.com/nexuslibs/cleanscan/commit/99ccc411e77cc2f61bdaf8713ac2f77e1b8cfc53))
+* **wizard:** refactor CIDR selection and workload calculation into a separate function ([462ba34](https://github.com/nexuslibs/cleanscan/commit/462ba34ca3bebd482e4d3d618e7f9c5d56139a4a))
+
+
+### Bug Fixes
+
+* **tui:** change toast notification from info to warning for update acknowledgment ([327e4e2](https://github.com/nexuslibs/cleanscan/commit/327e4e2e60d9129c1f6ce25f8e944313cdd20d4b))
+
 ## [0.18.1](https://github.com/nexuslibs/cleanscan/compare/v0.18.0...v0.18.1) (2026-07-22)
 
 
