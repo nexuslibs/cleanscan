@@ -9,6 +9,8 @@ pub mod wizard;
 pub use widgets::{ButtonKind, ToastKind};
 
 use std::{
+    cell::RefCell,
+    cmp::Ordering as CmpOrdering,
     collections::HashSet,
     fs,
     io::{self, Write},
@@ -27,7 +29,7 @@ use ratatui::{
 };
 
 use crate::config::AppConfig;
-use crate::scanner::{ProbeResult, ScanPhase, ScanProgress};
+use crate::scanner::{ProbeFailureCounts, ProbeResult, ScanPhase, ScanProgress};
 use crate::speed::{SpeedDirection, SpeedResult};
 use crate::tui::wizard::SettingField;
 use tui_overlay::{Anchor, Backdrop, Easing, Overlay, OverlayState, Slide};
@@ -65,6 +67,7 @@ pub struct ScanProgressState {
     pub current_workers: Option<usize>,
     pub adaptive_reason: Option<String>,
     pub targets_total: Option<usize>,
+    pub failure_counts: ProbeFailureCounts,
 }
 
 impl Default for ScanProgressState {
@@ -79,6 +82,7 @@ impl Default for ScanProgressState {
             current_workers: None,
             adaptive_reason: None,
             targets_total: None,
+            failure_counts: ProbeFailureCounts::default(),
         }
     }
 }
@@ -285,6 +289,8 @@ pub struct App {
     pub edit_buffer: String,
     pub edit_caret: usize,
     pub results: Vec<ProbeResult>,
+    results_revision: u64,
+    sorted_cache: RefCell<Option<SortedCache>>,
     pub total_targets: usize,
     pub scan_started_ips: HashSet<String>,
     /// Unique IPs with at least one emitted result in the current scan.
@@ -294,6 +300,9 @@ pub struct App {
     pub scan_progress: ScanProgressState,
     /// Exact sampled targets shown in the review screen and used for the run.
     pub preview_targets: Vec<String>,
+    preview_rx: Option<std::sync::mpsc::Receiver<Result<Vec<String>, String>>>,
+    preview_pending: bool,
+    preview_failed: bool,
     pub last_targets: Vec<String>,
     pub scan_seed: u64,
     pub scan_complete: bool,
@@ -423,6 +432,12 @@ pub struct App {
     /// Last frame timestamp used to derive per-frame animation deltas.
     anim_clock: Option<Instant>,
     explicit_target_source: Option<(Vec<String>, Option<String>)>,
+}
+
+#[derive(Clone)]
+struct SortedCache {
+    key: (u64, usize, bool, bool, Option<String>, Option<String>),
+    indices: Vec<usize>,
 }
 
 /// Default animation configuration shared by every modal overlay.
@@ -691,12 +706,17 @@ impl App {
             edit_buffer: String::new(),
             edit_caret: 0,
             results: Vec::new(),
+            results_revision: 0,
+            sorted_cache: RefCell::new(None),
             total_targets: 0,
             scan_started_ips: HashSet::new(),
             scan_result_ips: HashSet::new(),
             scan_succeeded_ips: HashSet::new(),
             scan_progress: ScanProgressState::default(),
             preview_targets: Vec::new(),
+            preview_rx: None,
+            preview_pending: false,
+            preview_failed: false,
             last_targets: Vec::new(),
             scan_seed,
             scan_complete: false,
@@ -879,6 +899,8 @@ impl App {
         self.scan_lifecycle = ScanLifecycle::Running;
         self.scan_error = None;
         self.results.clear();
+        self.results_revision = self.results_revision.wrapping_add(1);
+        self.sorted_cache.borrow_mut().take();
         self.scroll = 0;
         self.result_cursor = 0;
         self.sort_col = 0;
@@ -913,20 +935,59 @@ impl App {
     pub fn set_scan_targets(&mut self, targets: Vec<String>) {
         self.last_targets = targets.clone();
         self.preview_targets = targets;
+        self.preview_failed = false;
     }
 
     pub fn invalidate_preview(&mut self) {
         self.preview_targets.clear();
+        self.preview_failed = false;
     }
 
     pub fn refresh_preview(&mut self) {
-        let result = self.collect_preview(self.scan_seed);
+        if self.preview_pending || self.preview_failed {
+            return;
+        }
+        let seed = self.scan_seed;
+        let config = self.config.clone();
+        let source = self.explicit_target_source.clone();
+        let cidrs: Vec<String> = self
+            .cidr_candidates
+            .iter()
+            .filter(|entry| entry.selected)
+            .map(|entry| entry.cidr.clone())
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = if let Some((explicit_cidrs, ips)) = source {
+                crate::scanner::collect_targets_with_seed(&config, &explicit_cidrs, &ips, seed)
+            } else {
+                crate::scanner::collect_from_cidrs_with_seed(&cidrs, config.sample_per_cidr, seed)
+            }
+            .map_err(|error| error.to_string());
+            let _ = tx.send(result);
+        });
+        self.preview_rx = Some(rx);
+        self.preview_pending = true;
+        self.toast_info("Generating target preview…");
+    }
+
+    fn poll_preview(&mut self) {
+        let Some(rx) = self.preview_rx.as_ref() else {
+            return;
+        };
+        let Ok(result) = rx.try_recv() else { return };
+        self.preview_rx = None;
+        self.preview_pending = false;
         match result {
             Ok(targets) => {
                 self.preview_targets = targets;
+                self.preview_failed = false;
                 self.toast_success(format!("Generated {} targets", self.preview_targets.len()));
             }
-            Err(error) => self.toast_error(format!("Preview failed: {error}")),
+            Err(error) => {
+                self.preview_failed = true;
+                self.toast_error(format!("Preview failed: {error}"));
+            }
         }
     }
 
@@ -945,16 +1006,19 @@ impl App {
     }
 
     pub fn regenerate_preview(&mut self) -> bool {
+        self.preview_failed = false;
         let seed = rand::random();
         match self.collect_preview(seed) {
             Ok(targets) => {
                 self.scan_seed = seed;
                 self.config.seed = seed;
                 self.preview_targets = targets;
+                self.preview_failed = false;
                 self.toast_success(format!("Generated {} targets", self.preview_targets.len()));
                 true
             }
             Err(error) => {
+                self.preview_failed = true;
                 self.toast_error(format!("Preview failed: {error}"));
                 false
             }
@@ -963,22 +1027,26 @@ impl App {
 
     pub fn set_explicit_target_source(&mut self, cidrs: Vec<String>, ips: Option<String>) {
         self.explicit_target_source = Some((cidrs, ips));
+        self.preview_failed = false;
     }
 
     fn regenerate_explicit_preview(&mut self) -> bool {
         if self.explicit_target_source.is_none() {
             return false;
         }
+        self.preview_failed = false;
         let seed = rand::random();
         match self.collect_preview(seed) {
             Ok(targets) => {
                 self.scan_seed = seed;
                 self.config.seed = seed;
                 self.preview_targets = targets;
+                self.preview_failed = false;
                 self.toast_success(format!("Generated {} targets", self.preview_targets.len()));
                 true
             }
             Err(error) => {
+                self.preview_failed = true;
                 self.toast_error(format!("Preview failed: {error}"));
                 false
             }
@@ -1029,6 +1097,8 @@ impl App {
             self.scan_succeeded_ips.insert(result.ip.clone());
         }
         self.results.push(result);
+        self.results_revision = self.results_revision.wrapping_add(1);
+        self.sorted_cache.borrow_mut().take();
     }
 
     pub fn apply_scan_progress(&mut self, progress: ScanProgress) {
@@ -1058,6 +1128,28 @@ impl App {
                 .adaptive_reason
                 .or(self.scan_progress.adaptive_reason.clone()),
             targets_total: progress.targets_total.or(self.scan_progress.targets_total),
+            failure_counts: ProbeFailureCounts {
+                request_timeout: self
+                    .scan_progress
+                    .failure_counts
+                    .request_timeout
+                    .max(progress.failure_counts.request_timeout),
+                connect_timeout: self
+                    .scan_progress
+                    .failure_counts
+                    .connect_timeout
+                    .max(progress.failure_counts.connect_timeout),
+                connection_tls: self
+                    .scan_progress
+                    .failure_counts
+                    .connection_tls
+                    .max(progress.failure_counts.connection_tls),
+                general_errors: self
+                    .scan_progress
+                    .failure_counts
+                    .general_errors
+                    .max(progress.failure_counts.general_errors),
+            },
         };
     }
 
@@ -1175,83 +1267,98 @@ impl App {
 
     /// Results sorted for display according to the active sort column.
     pub fn sorted_results(&self) -> Vec<&ProbeResult> {
-        let mut v: Vec<&ProbeResult> = self
-            .results
-            .iter()
-            .filter(|r| self.show_failures || r.ok > 0)
-            .filter(|r| match &self.colo_filter {
-                Some(want) => r
-                    .colo
-                    .as_deref()
-                    .is_some_and(|c| c.eq_ignore_ascii_case(want)),
-                None => true,
-            })
-            .filter(|r| match &self.country_filter {
-                Some(want) => r
-                    .country
-                    .as_deref()
-                    .is_some_and(|c| c.to_lowercase().contains(&want.to_lowercase())),
-                None => true,
-            })
-            .collect();
-        if self.sort_col == 0 {
-            v.sort_by(|a, b| {
-                let ord = Self::natural_cmp(a, b);
-                if self.sort_asc {
-                    ord
+        let key = (
+            self.results_revision,
+            self.sort_col,
+            self.sort_asc,
+            self.show_failures,
+            self.colo_filter.clone(),
+            self.country_filter.clone(),
+        );
+        let indices = if self
+            .sorted_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|cache| cache.key == key)
+        {
+            self.sorted_cache
+                .borrow()
+                .as_ref()
+                .expect("cache checked above")
+                .indices
+                .clone()
+        } else {
+            let mut indices: Vec<usize> = self
+                .results
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| self.show_failures || r.ok > 0)
+                .filter(|(_, r)| match &self.colo_filter {
+                    Some(want) => r
+                        .colo
+                        .as_deref()
+                        .is_some_and(|c| c.eq_ignore_ascii_case(want)),
+                    None => true,
+                })
+                .filter(|(_, r)| match &self.country_filter {
+                    Some(want) => r
+                        .country
+                        .as_deref()
+                        .is_some_and(|c| c.to_lowercase().contains(&want.to_lowercase())),
+                    None => true,
+                })
+                .map(|(index, _)| index)
+                .collect();
+            indices.sort_by(|&left, &right| {
+                let a = &self.results[left];
+                let b = &self.results[right];
+                if self.sort_col == 0 {
+                    let ord = Self::natural_cmp(a, b);
+                    if self.sort_asc {
+                        ord
+                    } else {
+                        ord.reverse()
+                    }
                 } else {
-                    ord.reverse()
+                    let ord = match self.sort_col {
+                        1 => a.ip.cmp(&b.ip),
+                        2 => a.protocol.cmp(&b.protocol),
+                        3 => a.ok.cmp(&b.ok),
+                        4 => a.fail.cmp(&b.fail),
+                        5 => a.avg.partial_cmp(&b.avg).unwrap_or(CmpOrdering::Equal),
+                        6 => a.p50.partial_cmp(&b.p50).unwrap_or(CmpOrdering::Equal),
+                        7 => a.p90.partial_cmp(&b.p90).unwrap_or(CmpOrdering::Equal),
+                        8 => a.p95.partial_cmp(&b.p95).unwrap_or(CmpOrdering::Equal),
+                        9 => a.max.partial_cmp(&b.max).unwrap_or(CmpOrdering::Equal),
+                        10 => a.colo.cmp(&b.colo),
+                        11 => a.country.cmp(&b.country),
+                        12 => a
+                            .jitter
+                            .partial_cmp(&b.jitter)
+                            .unwrap_or(CmpOrdering::Equal),
+                        13 => a
+                            .packet_loss
+                            .partial_cmp(&b.packet_loss)
+                            .unwrap_or(CmpOrdering::Equal),
+                        _ => CmpOrdering::Equal,
+                    };
+                    if self.sort_asc {
+                        ord
+                    } else {
+                        ord.reverse()
+                    }
                 }
             });
-            return v;
-        }
-        let cmp = |a: &&ProbeResult, b: &&ProbeResult| -> std::cmp::Ordering {
-            let (a, b) = (*a, *b);
-            let ord = match self.sort_col {
-                1 => a.ip.cmp(&b.ip),
-                2 => a.protocol.cmp(&b.protocol),
-                3 => a.ok.cmp(&b.ok),
-                4 => a.fail.cmp(&b.fail),
-                5 => a
-                    .avg
-                    .partial_cmp(&b.avg)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                6 => a
-                    .p50
-                    .partial_cmp(&b.p50)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                7 => a
-                    .p90
-                    .partial_cmp(&b.p90)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                8 => a
-                    .p95
-                    .partial_cmp(&b.p95)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                9 => a
-                    .max
-                    .partial_cmp(&b.max)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                10 => a.colo.cmp(&b.colo),
-                11 => a.country.cmp(&b.country),
-                12 => a
-                    .jitter
-                    .partial_cmp(&b.jitter)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                13 => a
-                    .packet_loss
-                    .partial_cmp(&b.packet_loss)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                _ => std::cmp::Ordering::Equal,
-            };
-            if self.sort_asc {
-                ord
-            } else {
-                ord.reverse()
-            }
+            self.sorted_cache.replace(Some(SortedCache {
+                key,
+                indices: indices.clone(),
+            }));
+            indices
         };
-        v.sort_by(cmp);
-        v
+        indices
+            .into_iter()
+            .map(|index| &self.results[index])
+            .collect()
     }
 
     // --- shared rendering helpers (also record mouse hit regions) ---
@@ -1528,7 +1635,9 @@ pub fn run_tui(
     });
     let config_arc = Arc::new(config);
     let (tx, rx) = std::sync::mpsc::channel::<ProbeResult>();
-    let (progress_tx, progress_rx) = std::sync::mpsc::channel::<ScanProgress>();
+    // Progress is telemetry, not work completion. Bound it so a fast scanner
+    // cannot grow an unbounded queue or starve rendering/input handling.
+    let (progress_tx, progress_rx) = std::sync::mpsc::sync_channel::<ScanProgress>(128);
     let (speed_tx, speed_rx) = std::sync::mpsc::channel::<SpeedResult>();
     let (manifest_tx, manifest_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let progress_sender = progress_tx.clone();
@@ -1693,6 +1802,10 @@ pub fn run_tui(
                 app.toast_warn("Set a Host before starting the scan");
                 return;
             }
+            if app.preview_pending {
+                app.toast_info("Target preview is still generating");
+                return;
+            }
             let targets = if let Some(targets) = exact_targets {
                 Ok(targets)
             } else if app.preview_targets.is_empty() {
@@ -1750,8 +1863,11 @@ pub fn run_tui(
             while let Ok(r) = rx.try_recv() {
                 app.add_result(r);
             }
-            while let Ok(progress) = progress_rx.try_recv() {
-                app.apply_scan_progress(progress);
+            for _ in 0..256 {
+                match progress_rx.try_recv() {
+                    Ok(progress) => app.apply_scan_progress(progress),
+                    Err(_) => break,
+                }
             }
             while let Ok(r) = speed_rx.try_recv() {
                 app.speed_results.push(r);
@@ -1761,8 +1877,11 @@ pub fn run_tui(
                 while let Ok(r) = rx.try_recv() {
                     app.add_result(r);
                 }
-                while let Ok(progress) = progress_rx.try_recv() {
-                    app.apply_scan_progress(progress);
+                for _ in 0..256 {
+                    match progress_rx.try_recv() {
+                        Ok(progress) => app.apply_scan_progress(progress),
+                        Err(_) => break,
+                    }
                 }
                 if let Some(handle) = scanner.take() {
                     match handle.join() {
@@ -1945,6 +2064,8 @@ pub fn run_tui(
 
             if app.watch_due.is_some_and(|due| Instant::now() >= due) {
                 app.results.clear();
+                app.results_revision = app.results_revision.wrapping_add(1);
+                app.sorted_cache.borrow_mut().take();
                 app.scan_complete = false;
                 app.watch_due = None;
                 app.rescan_targets = Some(app.last_targets.clone());
@@ -2009,6 +2130,7 @@ pub fn run_tui(
                     update_receiver = None;
                 }
             }
+            app.poll_preview();
             app.tick_message();
             app.tick = app.tick.wrapping_add(1);
 
@@ -2017,7 +2139,7 @@ pub fn run_tui(
                 && !app.scan_complete
                 && app.last_tp_instant.elapsed() >= Duration::from_millis(1000)
             {
-                let now_count = app.results.len();
+                let now_count = app.scan_progress.probes_completed;
                 let delta = now_count.saturating_sub(app.last_tp_count) as u64;
                 app.throughput.push(delta);
                 if app.throughput.len() > 240 {
@@ -3490,7 +3612,8 @@ mod tests {
     };
     use crate::config::AppConfig;
     use crate::scanner::{
-        DiagnosticCategory, DiagnosticPhase, ProbeDiagnostic, ScanPhase, ScanProgress,
+        DiagnosticCategory, DiagnosticPhase, ProbeDiagnostic, ProbeFailureCounts, ScanPhase,
+        ScanProgress,
     };
     use crate::watch::{WatchPolicy, WatchState};
     use crossterm::event::{KeyCode, KeyModifiers};
@@ -4137,7 +4260,26 @@ mod tests {
         app.add_result(result("192.0.2.1", 0, 0.04));
         app.show_result_details = true;
         draw(&mut app, 80, 24);
+        assert!(app.buttons.iter().all(|(button, _)| button.height == 3));
         draw(&mut app, 79, 23);
+    }
+
+    #[test]
+    fn scan_dashboard_keeps_footer_buttons_below_results() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(10);
+        app.add_result(result("192.0.2.1", 0, 0.04));
+        draw(&mut app, 168, 13);
+
+        let table_bottom = app.table_inner.expect("scan table rendered").bottom();
+        assert!(app
+            .buttons
+            .iter()
+            .all(|(button, _)| button.y >= table_bottom));
     }
 
     #[test]
@@ -4158,6 +4300,7 @@ mod tests {
             current_workers: None,
             adaptive_reason: None,
             targets_total: Some(500),
+            failure_counts: ProbeFailureCounts::default(),
         });
         assert!(app.results.is_empty());
         assert!(app.scan_started_ips.contains("192.0.2.1"));
@@ -4175,6 +4318,7 @@ mod tests {
             current_workers: Some(2),
             adaptive_reason: Some("steady".to_string()),
             targets_total: None,
+            failure_counts: ProbeFailureCounts::default(),
         });
         assert_eq!(app.scan_progress.targets_total, Some(500));
 
