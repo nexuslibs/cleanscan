@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.25.0](https://github.com/nexuslibs/cleanscan/compare/v0.24.0...v0.25.0) (2026-07-22)
+
+
+### Features
+
+* **scanner:** remove reliable flag from send_progress function and related calls ([b785669](https://github.com/nexuslibs/cleanscan/commit/b7856699741ef5c45c73a08d1ca21a2c75ce7e1f))
+* **tui:** enhance failure summary rendering and track preview failures ([b2c2dec](https://github.com/nexuslibs/cleanscan/commit/b2c2dec74f87ec91649397b7b1192c170aa0d284))
+* **tui:** improve dashboard layout for compact view and adjust footer button positioning ([d11bd9e](https://github.com/nexuslibs/cleanscan/commit/d11bd9e9a84c7e30ec7b523ee29613382c3857d4))
+* **tui:** show live probe failure summary ([dc04f3a](https://github.com/nexuslibs/cleanscan/commit/dc04f3a9719b16232e6b7d777d8b1452d9f866da))
+* **tui:** show live probe failure summary ([f9e913b](https://github.com/nexuslibs/cleanscan/commit/f9e913be87aaeb43338330ccbee7de097544a661))
+* **tui:** update failure summary handling to use terminal cell width and remove unused function ([c7344a3](https://github.com/nexuslibs/cleanscan/commit/c7344a3a84365a4577382824905b45d3c27fb8af))
+
+
+### Bug Fixes
+
+* **scanner:** remove 'Cancelled' from loss reason categories in is_loss_reason function ([14126bd](https://github.com/nexuslibs/cleanscan/commit/14126bd02e0c745bda84ecd6188bd63f87f441d5))
+
 ## [0.24.0](https://github.com/nexuslibs/cleanscan/compare/v0.23.0...v0.24.0) (2026-07-22)
 
 
