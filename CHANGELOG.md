@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.26.0](https://github.com/nexuslibs/cleanscan/compare/v0.25.0...v0.26.0) (2026-07-23)
+
+
+### Features
+
+* **tui:** summarize live probe failures ([a7fa732](https://github.com/nexuslibs/cleanscan/commit/a7fa73258bb1dec01f1ffa0f4b321677c8b85ed6))
+* **tui:** summarize live probe failures ([86bc595](https://github.com/nexuslibs/cleanscan/commit/86bc595b1c836ca40409a895f5afc43c25c2db49))
+
+
+### Bug Fixes
+
+* apply CodeRabbit auto-fixes ([5812a96](https://github.com/nexuslibs/cleanscan/commit/5812a9655cf43d944b5d54d352d5f9c5faf0033b))
+
 ## [0.25.0](https://github.com/nexuslibs/cleanscan/compare/v0.24.0...v0.25.0) (2026-07-22)
 
 
