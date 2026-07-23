@@ -111,7 +111,21 @@ fn wizard_lines(step: WizardStep) -> Vec<Line<'static>> {
 fn scanning_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(Span::styled(" Scanning dashboard", theme::header_style())),
-        key("↑ / ↓", "Select a result IP"),
+        key("o", "Cycle Results / Live Targets / Run Log"),
+        key("↑ / ↓", "Select a result, live target, or run"),
+        key("Space", "Mark or unmark a target"),
+        key(
+            "f (Live Targets)",
+            "Cycle all / active / problems / selected",
+        ),
+        key(
+            "s (Live Targets)",
+            "Cycle attention / age / stage / IP sorting",
+        ),
+        key(
+            "target:<text>",
+            "Search live targets from the command palette",
+        ),
         key("c", "Copy the selected IP"),
         key("PageUp / PageDn", "Move by 10 rows"),
         key("Home / End", "Jump to top / bottom"),
@@ -129,8 +143,21 @@ fn scanning_lines(app: &App) -> Vec<Line<'static>> {
         lines.push(key("n", "Generate a new sample with the same settings"));
         lines.push(key("m", "Export runs for comparison"));
         lines.push(key("w", "Customize scan parameters and ranges"));
+        lines.push(key("R", "Rerun the selected targets"));
+        lines.push(key(
+            "i",
+            "Run an isolated investigation for the selected target",
+        ));
     } else {
-        lines.push(key("p", "Pause / resume the scan"));
+        lines.push(key("p", "Pause scheduling / resume; active probes drain"));
+        lines.push(key(
+            "i",
+            "Isolate the selected target after active work drains",
+        ));
+        lines.push(key("x", "Stop the scan and keep completed results"));
+        lines.push(key(", / .", "Decrease / increase live worker count"));
+        lines.push(key("[ / ]", "Decrease / increase workers by 8"));
+        lines.push(key("0", "Return worker count to automatic control"));
         lines.push(key("f", "Show failed targets while scanning"));
     }
 
@@ -138,7 +165,7 @@ fn scanning_lines(app: &App) -> Vec<Line<'static>> {
         key("Click header", "Sort results by that column"),
         key("Mouse wheel", "Scroll the results table"),
         key("?  Esc  q", "Close this help"),
-        key("Esc", "Cancel scan or quit results"),
+        key("Esc", "Open quit confirmation or quit results"),
         key("q", "Quit (press twice while scanning)"),
         Line::from(""),
         Line::from(Span::styled(

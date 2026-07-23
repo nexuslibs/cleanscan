@@ -256,7 +256,16 @@ the TUI and are not edited in this screen.
 | Key       | Action                          |
 |-----------|---------------------------------|
 | `q`       | Quit                            |
-| `p`       | Pause / resume the scan         |
+| `o`       | Cycle Results, Live Targets, and Run Log views |
+| `Space`   | Select or deselect the highlighted target |
+| `f` / `s` | In Live Targets, cycle the filter / sort order |
+| `p`       | Pause scheduling / resume; active probes drain |
+| `i`       | Isolate the highlighted target after active probes drain |
+| `x`       | Stop the scan and keep completed results |
+| `w`       | Stop safely, preserve partial results, and edit settings for a new run |
+| `,` / `.` | Decrease / increase live workers |
+| `[` / `]` | Decrease / increase live workers by 8 |
+| `0`       | Return worker count to automatic control |
 | `e`       | Export results to a `.tsv` file (after the scan finishes) |
 | `t`       | Select successful IPs for speed testing (after the scan finishes) |
 | `Enter`   | Open full details for the selected IP |
@@ -266,6 +275,7 @@ the TUI and are not edited in this screen.
 | `r`       | Re-run the identical sampled target set |
 | `n`       | Generate a new sample with the same settings |
 | `m`       | Export runs for comparison |
+| `R`       | Rerun selected targets after the scan stops or completes |
 | `/`       | Open the command palette |
 | `?`       | Open contextual help (close with `?`, `Esc`, or `q`) |
 
@@ -274,6 +284,17 @@ results table to IPs in that Cloudflare colo; `colo:` with no code clears the
 filter. Type `country:Germany` (substring match) to narrow results to a country;
 `country:` with no code clears it. The `Colo` and `Country` columns are shown by
 default and can be toggled like any other result column.
+
+The Live Targets view shows queued, warming, probing, and finalized targets,
+including probe counts, active age, time since the last change, and recent
+scanner events. The Run Log keeps the current run and up to ten earlier runs in
+memory. Targeted reruns and investigations link to their exact source run and
+show average/p95 latency, packet-loss, success-rate, outcome, colo, and
+diagnostic deltas for matching IPs. If that source is evicted, the comparison
+is reported as unavailable rather than silently using another run. Isolated
+investigations have their own telemetry and cancellation lifecycle and never
+replace or mutate the primary scan results. In the command palette, use
+`target:<text>` to search live targets; `target:` clears the search.
 
 **Speed-test screen**
 

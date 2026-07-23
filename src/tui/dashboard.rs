@@ -1,6 +1,9 @@
 use crate::scanner::{result_confidence, result_status, ProbeFailureCounts, ProbeResult};
 use crate::tui::theme;
-use crate::tui::{modal_overlay, widgets, App, ButtonAction, ButtonKind, ScanLifecycle};
+use crate::tui::{
+    modal_overlay, widgets, App, ButtonAction, ButtonKind, RunKind, ScanDashboardView,
+    ScanLifecycle, TargetStage,
+};
 use ratatui::{
     layout::{Constraint, Direction, Flex, Layout, Rect},
     style::Style,
@@ -13,6 +16,7 @@ use ratatui::{
     },
     Frame,
 };
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 pub const RESULT_COLUMNS: [&str; 14] = [
@@ -52,7 +56,7 @@ const WIDTHS: [Constraint; 14] = [
 pub fn render(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) {
     let compact = area.width < 168;
     let minimum_height = if compact { 12 } else { 15 };
-    if area.width < 48 || area.height < minimum_height {
+    if area.width < 72 || area.height < minimum_height {
         render_micro(app, frame, area);
         render_result_details(app, frame, area, elapsed);
         return;
@@ -83,6 +87,19 @@ fn render_micro(app: &mut App, frame: &mut Frame, area: Rect) {
     render_micro_header(app, frame, chunks[0]);
     render_compact_stats(app, frame, chunks[1]);
 
+    if app.dashboard_view != ScanDashboardView::Results {
+        render_scan_view(app, frame, chunks[2], true);
+        let isolated_work = app.investigation.is_some() || app.pending_isolation.is_some();
+        let hints: &[widgets::KeyHint] = if app.scan_complete && isolated_work {
+            &[("x", "stop"), ("q", "quit"), ("p", "resume"), ("o", "view")]
+        } else if app.scan_complete {
+            &[("q", "quit"), ("o", "view"), ("↑/↓", "select")]
+        } else {
+            &[("x", "stop"), ("q", "quit"), ("p", "pause"), ("o", "view")]
+        };
+        widgets::status_bar(frame, chunks[3], hints, app.visible_message());
+        return;
+    }
     let block = widgets::panel_block("Results — Enter details", app.focus_index == 0);
     let inner = block.inner(chunks[2]);
     app.table_inner = Some(inner);
@@ -137,17 +154,24 @@ fn render_micro(app: &mut App, frame: &mut Frame, area: Rect) {
         .block(block),
         chunks[2],
     );
-    widgets::status_bar(
-        frame,
-        chunks[3],
+    let isolated_work = app.investigation.is_some() || app.pending_isolation.is_some();
+    let hints: &[widgets::KeyHint] = if app.scan_complete && isolated_work {
+        &[("x", "stop"), ("q", "quit"), ("p", "resume")]
+    } else if app.scan_complete {
         &[
+            ("q", "quit"),
             ("↑/↓", "select"),
             (widgets::enter_key(), "details"),
-            ("Esc", "quit"),
+        ]
+    } else {
+        &[
+            ("x", "stop"),
             ("q", "quit"),
-        ],
-        app.visible_message(),
-    );
+            ("p", "pause"),
+            ("↑/↓", "select"),
+        ]
+    };
+    widgets::status_bar(frame, chunks[3], hints, app.visible_message());
 }
 
 fn render_micro_header(app: &App, frame: &mut Frame, area: Rect) {
@@ -178,6 +202,7 @@ fn render_wide(app: &mut App, frame: &mut Frame, area: Rect) {
         .constraints([
             Constraint::Length(3), // Header
             Constraint::Length(7), // Stats panel + failure summary
+            Constraint::Length(2), // Dashboard view tabs
             Constraint::Min(1),    // Results table
             Constraint::Length(4), // Footer: buttons + status bar
         ])
@@ -187,8 +212,9 @@ fn render_wide(app: &mut App, frame: &mut Frame, area: Rect) {
     let stats = Layout::vertical([Constraint::Length(6), Constraint::Length(1)]).split(chunks[1]);
     render_stats_panel(app, frame, stats[0]);
     render_failure_summary(app, frame, stats[1]);
-    render_table(app, frame, chunks[2]);
-    render_footer(app, frame, chunks[3]);
+    render_scan_tabs(app, frame, chunks[2]);
+    render_scan_view(app, frame, chunks[3], false);
+    render_footer(app, frame, chunks[4]);
 }
 
 fn render_compact(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -197,14 +223,58 @@ fn render_compact(app: &mut App, frame: &mut Frame, area: Rect) {
         .constraints([
             Constraint::Length(3),
             Constraint::Length(4),
+            Constraint::Length(2),
             Constraint::Min(1),
             Constraint::Length(4), // Footer: buttons + status bar
         ])
         .split(area);
     render_header(app, frame, chunks[0]);
     render_compact_stats(app, frame, chunks[1]);
-    render_compact_table(app, frame, chunks[2]);
-    render_compact_footer(app, frame, chunks[3]);
+    render_scan_tabs(app, frame, chunks[2]);
+    render_scan_view(app, frame, chunks[3], true);
+    render_compact_footer(app, frame, chunks[4]);
+}
+
+fn render_scan_tabs(app: &mut App, frame: &mut Frame, area: Rect) {
+    let labels = ScanDashboardView::ALL
+        .iter()
+        .map(|view| view.label())
+        .collect::<Vec<_>>();
+    let selected = ScanDashboardView::ALL
+        .iter()
+        .position(|view| *view == app.dashboard_view)
+        .unwrap_or(0);
+    let tab_width = area.width / ScanDashboardView::ALL.len() as u16;
+    app.dashboard_tabs = ScanDashboardView::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, view)| {
+            let x = area.x + tab_width.saturating_mul(index as u16);
+            let width = if index + 1 == ScanDashboardView::ALL.len() {
+                area.right().saturating_sub(x)
+            } else {
+                tab_width
+            };
+            (Rect::new(x, area.y, width, area.height), *view)
+        })
+        .collect();
+    frame.render_widget(
+        Tabs::new(labels)
+            .select(selected)
+            .highlight_style(theme::highlight_style())
+            .divider("│")
+            .padding(" ", " "),
+        area,
+    );
+}
+
+fn render_scan_view(app: &mut App, frame: &mut Frame, area: Rect, compact: bool) {
+    match app.dashboard_view {
+        ScanDashboardView::Results if compact => render_compact_table(app, frame, area),
+        ScanDashboardView::Results => render_table(app, frame, area),
+        ScanDashboardView::LiveTargets => render_live_targets(app, frame, area, compact),
+        ScanDashboardView::RunLog => render_run_log(app, frame, area, compact),
+    }
 }
 
 fn render_compact_stats(app: &App, frame: &mut Frame, area: Rect) {
@@ -475,14 +545,49 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     let buttons = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(17),
-            Constraint::Length(16),
-            Constraint::Length(18),
+            Constraint::Length(15),
+            Constraint::Length(14),
+            Constraint::Length(14),
             Constraint::Min(0),
-            Constraint::Length(12),
+            Constraint::Length(15),
+            Constraint::Length(10),
         ])
         .split(layout[0]);
-    if app.scan_complete {
+    let isolated_work = app.investigation.is_some() || app.pending_isolation.is_some();
+    if app.scan_complete && isolated_work {
+        app.button_ex(
+            frame,
+            buttons[0],
+            "Resume (p)",
+            ButtonAction::PauseResume,
+            ButtonKind::Secondary,
+            app.focus_index == 1,
+        );
+        app.button_ex(
+            frame,
+            buttons[1],
+            "Stop (x)",
+            ButtonAction::StopKeepResults,
+            ButtonKind::Secondary,
+            app.focus_index == 2,
+        );
+        app.button_ex(
+            frame,
+            buttons[2],
+            "Customize (w)",
+            ButtonAction::CustomizeScan,
+            ButtonKind::Primary,
+            app.focus_index == 3,
+        );
+        app.button_ex(
+            frame,
+            buttons[5],
+            "Quit (q)",
+            ButtonAction::Quit,
+            ButtonKind::Secondary,
+            app.focus_index == 4,
+        );
+    } else if app.scan_complete {
         app.button_ex(
             frame,
             buttons[0],
@@ -509,7 +614,7 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         );
         app.button_ex(
             frame,
-            buttons[4],
+            buttons[5],
             "Quit (q)",
             ButtonAction::Quit,
             ButtonKind::Secondary,
@@ -518,11 +623,11 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     } else {
         app.button_ex(
             frame,
-            buttons[1],
+            buttons[0],
             if app.paused.load(std::sync::atomic::Ordering::Relaxed) {
                 "Resume (p)"
             } else {
-                "Pause (p)"
+                "Pause sched (p)"
             },
             ButtonAction::PauseResume,
             ButtonKind::Secondary,
@@ -530,14 +635,54 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         );
         app.button_ex(
             frame,
+            buttons[1],
+            "Workers − (,)",
+            ButtonAction::WorkerDown,
+            ButtonKind::Secondary,
+            false,
+        );
+        app.button_ex(
+            frame,
+            buttons[3],
+            "Auto workers (0)",
+            ButtonAction::WorkerAuto,
+            ButtonKind::Secondary,
+            false,
+        );
+        app.button_ex(
+            frame,
+            buttons[2],
+            "Workers + (.)",
+            ButtonAction::WorkerUp,
+            ButtonKind::Secondary,
+            false,
+        );
+        app.button_ex(
+            frame,
             buttons[4],
-            "Quit (q)",
-            ButtonAction::Quit,
+            "Stop + keep (x)",
+            ButtonAction::StopKeepResults,
             ButtonKind::Secondary,
             app.focus_index == 2,
         );
+        app.button_ex(
+            frame,
+            buttons[5],
+            "Quit (q)",
+            ButtonAction::Quit,
+            ButtonKind::Secondary,
+            app.focus_index == 3,
+        );
     }
-    let hints: &[widgets::KeyHint] = if app.scan_complete {
+    let hints: &[widgets::KeyHint] = if app.scan_complete && isolated_work {
+        &[
+            ("Tab", "focus"),
+            ("p", "resume"),
+            ("x", "stop"),
+            ("w", "customize"),
+            ("q", "quit"),
+        ]
+    } else if app.scan_complete {
         &[
             ("Tab", "focus"),
             (widgets::enter_key(), "details"),
@@ -552,7 +697,12 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         &[
             ("Tab", "focus"),
             (widgets::enter_key(), "details"),
-            ("p", "pause"),
+            ("o", "view"),
+            ("Space", "select"),
+            ("i", "isolate"),
+            ("p", "pause scheduling"),
+            ("x", "stop + keep"),
+            ("w", "edit + restart"),
             ("[ ] , .", "workers"),
             ("0", "auto workers"),
             ("c", "copy"),
@@ -1191,7 +1341,93 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
         spark_cols[1],
     );
 
-    // Panel 3: Latency distribution as a horizontal bar chart.
+    // Panel 3: live outcome distribution and factual activity timing.
+    if !app.scan_complete {
+        let failures = app.scan_progress.failure_counts;
+        let failure_total = failures
+            .request_timeout
+            .saturating_add(failures.connect_timeout)
+            .saturating_add(failures.connection_tls)
+            .saturating_add(failures.general_errors);
+        let successes = app
+            .scan_progress
+            .probes_completed
+            .saturating_sub(failure_total);
+        let bars = [
+            ("success", successes as u64, theme::good_style()),
+            (
+                "request timeout",
+                failures.request_timeout as u64,
+                theme::warn_style(),
+            ),
+            (
+                "connect / TLS",
+                failures
+                    .connect_timeout
+                    .saturating_add(failures.connection_tls) as u64,
+                theme::bad_style(),
+            ),
+            (
+                "other error",
+                failures.general_errors as u64,
+                theme::bad_style(),
+            ),
+        ]
+        .into_iter()
+        .map(|(label, value, style)| {
+            Bar::default()
+                .value(value)
+                .label(Line::from(label))
+                .text_value(value.to_string())
+                .style(style)
+        })
+        .collect::<Vec<_>>();
+        let block = widgets::subtle_panel_block("Probe Outcomes & Activity");
+        let inner = block.inner(col_chunks[2]);
+        frame.render_widget(block, col_chunks[2]);
+        let rows = Layout::vertical([Constraint::Min(2), Constraint::Length(2)]).split(inner);
+        frame.render_widget(
+            BarChart::default()
+                .data(BarGroup::default().bars(&bars))
+                .direction(Direction::Horizontal)
+                .bar_width(1)
+                .bar_gap(0)
+                .max(app.scan_progress.probes_completed.max(1) as u64)
+                .label_style(theme::hint_style()),
+            rows[0],
+        );
+        let now = Instant::now();
+        let since_completion = app
+            .last_completion_at
+            .map(|at| format!("{} ago", format_duration(now.saturating_duration_since(at))))
+            .unwrap_or_else(|| "none yet".to_string());
+        let oldest = app
+            .target_activity
+            .values()
+            .filter(|target| matches!(target.stage, TargetStage::WarmingUp | TargetStage::Probing))
+            .filter_map(|target| target.first_activity)
+            .min()
+            .map(|at| format_duration(now.saturating_duration_since(at)))
+            .unwrap_or_else(|| "—".to_string());
+        let recent = app
+            .scan_events
+            .front()
+            .map(|entry| entry.event.message.as_str())
+            .unwrap_or("waiting for scanner activity");
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(format!(
+                    "Last completion {since_completion} • oldest active {oldest}"
+                )),
+                Line::from(format!("Recent: {recent}")),
+            ])
+            .style(theme::hint_style()),
+            rows[1],
+        );
+        return;
+    }
+
+    // Completed scans return to the latency distribution decision aid.
     let total_ok = ok_results.len();
     let (mut exc, mut gd, mut fr, mut pr) = (0u64, 0u64, 0u64, 0u64);
     for r in &ok_results {
@@ -1535,6 +1771,546 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
     }
 }
 
+fn render_live_targets(app: &mut App, frame: &mut Frame, area: Rect, compact: bool) {
+    let micro = area.width < 72;
+    let columns = if micro {
+        vec![
+            Constraint::Length(4),
+            Constraint::Min(12),
+            Constraint::Length(9),
+            Constraint::Length(7),
+        ]
+    } else if compact {
+        vec![
+            Constraint::Length(4),
+            Constraint::Min(16),
+            Constraint::Length(9),
+            Constraint::Length(7),
+            Constraint::Length(8),
+        ]
+    } else {
+        vec![
+            Constraint::Length(4),
+            Constraint::Min(18),
+            Constraint::Length(10),
+            Constraint::Length(11),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Min(24),
+        ]
+    };
+    let panes = if compact {
+        Layout::horizontal([Constraint::Percentage(100), Constraint::Length(0)]).split(area)
+    } else {
+        Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(area)
+    };
+    let query = if app.target_query.is_empty() {
+        String::new()
+    } else {
+        format!(" • search {}", app.target_query)
+    };
+    let isolation = app
+        .investigation
+        .as_ref()
+        .map(|investigation| {
+            format!(
+                " • isolated {} {}",
+                investigation.target,
+                investigation.activity.stage.label()
+            )
+        })
+        .unwrap_or_default();
+    let title = format!(
+        "Live targets — filter {} • sort {}{}{}",
+        app.target_filter.label(),
+        app.target_sort.label(),
+        query,
+        isolation
+    );
+    let block = widgets::panel_block(&title, true);
+    let inner = block.inner(panes[0]);
+    app.table_inner = Some(inner);
+    let visible = inner.height.saturating_sub(1) as usize;
+    let target_ips = app.visible_target_ips();
+    app.target_cursor = app.target_cursor.min(target_ips.len().saturating_sub(1));
+    let max_start = target_ips.len().saturating_sub(visible);
+    app.target_scroll = app
+        .target_scroll
+        .max(app.target_cursor.saturating_sub(visible.saturating_sub(1)))
+        .min(app.target_cursor)
+        .min(max_start);
+    let start = app.target_scroll;
+    app.target_render_start = start;
+    let now = Instant::now();
+    let rows = target_ips
+        .iter()
+        .skip(start)
+        .take(visible)
+        .enumerate()
+        .filter_map(|(offset, ip)| {
+            let target = app.target_activity.get(ip)?;
+            let selected = start + offset == app.target_cursor;
+            let marked = app.selected_targets.contains(&target.ip);
+            let age = target
+                .first_activity
+                .map(|at| format_duration(now.saturating_duration_since(at)))
+                .unwrap_or_else(|| "—".to_string());
+            let idle = target
+                .last_activity
+                .map(|at| format_duration(now.saturating_duration_since(at)))
+                .unwrap_or_else(|| "—".to_string());
+            let mut cells = vec![
+                Cell::from(if marked { "[x]" } else { "[ ]" }),
+                Cell::from(target.ip.clone()),
+                Cell::from(target.stage.label()),
+            ];
+            if micro {
+                cells.push(Cell::from(age));
+            } else {
+                cells.push(Cell::from(format!(
+                    "{}/{}",
+                    target.probes_completed, target.probes_started
+                )));
+                cells.push(Cell::from(age));
+            }
+            if !compact && !micro {
+                cells.push(Cell::from(idle));
+                cells.push(Cell::from(target.last_outcome.clone()));
+            }
+            Some(Row::new(cells).style(if selected {
+                theme::row_selected_style()
+            } else {
+                match target.stage {
+                    TargetStage::Finalized if target.failures > 0 => theme::warn_style(),
+                    TargetStage::Finalized => theme::good_style(),
+                    _ => Style::default(),
+                }
+            }))
+        });
+    let headers = if micro {
+        vec!["Sel", "IP", "Stage", "Age"]
+    } else if compact {
+        vec!["Sel", "IP", "Stage", "Done", "Age"]
+    } else {
+        vec![
+            "Sel",
+            "IP",
+            "Stage",
+            "Done/Start",
+            "Age",
+            "Idle",
+            "Last event",
+        ]
+    };
+    frame.render_widget(
+        Table::new(rows, columns)
+            .header(Row::new(headers).style(theme::title_style()))
+            .block(block),
+        panes[0],
+    );
+
+    if !compact {
+        let selected = target_ips
+            .get(app.target_cursor)
+            .and_then(|ip| app.target_activity.get(ip));
+        let mut lines = Vec::new();
+        if let Some(target) = selected {
+            lines.extend([
+                Line::from(Span::styled(target.ip.clone(), theme::header_style())),
+                Line::from(format!("Stage       : {}", target.stage.label())),
+                Line::from(format!(
+                    "Probe work  : {} started / {} completed / {} failed",
+                    target.probes_started, target.probes_completed, target.failures
+                )),
+                Line::from(format!(
+                    "Active for  : {}",
+                    target
+                        .first_activity
+                        .map(|at| format_duration(now.saturating_duration_since(at)))
+                        .unwrap_or_else(|| "not started".to_string())
+                )),
+                Line::from(format!(
+                    "Last change : {} ago",
+                    target
+                        .last_activity
+                        .map(|at| format_duration(now.saturating_duration_since(at)))
+                        .unwrap_or_else(|| "—".to_string())
+                )),
+                Line::from(format!("Outcome     : {}", target.last_outcome)),
+            ]);
+            if let Some(investigation) = app
+                .investigation
+                .as_ref()
+                .filter(|investigation| investigation.target == target.ip)
+            {
+                lines.extend([
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!("Isolated run #{}", investigation.id),
+                        theme::subtitle_style(),
+                    )),
+                    Line::from(format!(
+                        "{} • {} results • {} elapsed",
+                        investigation.activity.stage.label(),
+                        investigation.results.len(),
+                        format_duration(investigation.started_at.elapsed())
+                    )),
+                    Line::from(format!(
+                        "Last event   : {}",
+                        investigation.activity.last_outcome
+                    )),
+                ]);
+            }
+            lines.extend([
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Recent primary scanner events",
+                    theme::subtitle_style(),
+                )),
+            ]);
+            for event in app
+                .scan_events
+                .iter()
+                .filter(|entry| entry.event.target.as_deref() == Some(target.ip.as_str()))
+                .take(6)
+            {
+                lines.push(Line::from(format!(
+                    "{}  {}",
+                    format_duration(event.elapsed),
+                    event.event.message
+                )));
+            }
+        } else {
+            lines.push(Line::from("No target activity yet."));
+        }
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(widgets::subtle_panel_block("Target inspector")),
+            panes[1],
+        );
+    }
+}
+
+fn render_run_log(app: &mut App, frame: &mut Frame, area: Rect, compact: bool) {
+    let micro = area.width < 72 || area.height < 12;
+    let panes = if micro {
+        Layout::horizontal([Constraint::Percentage(100), Constraint::Length(0)]).split(area)
+    } else if compact {
+        Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).split(area)
+    } else {
+        Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area)
+    };
+    let table_block = widgets::panel_block("Session runs — newest first", true);
+    let table_inner = table_block.inner(panes[0]);
+    app.table_inner = Some(table_inner);
+    let has_investigation = app.investigation.is_some();
+    let total_runs = app.run_log_len();
+    let visible = table_inner.height.saturating_sub(1) as usize;
+    app.run_cursor = app.run_cursor.min(total_runs.saturating_sub(1));
+    let max_start = total_runs.saturating_sub(visible);
+    app.run_scroll = app
+        .run_scroll
+        .max(app.run_cursor.saturating_sub(visible.saturating_sub(1)))
+        .min(app.run_cursor)
+        .min(max_start);
+    app.run_render_start = app.run_scroll;
+    let current_status = match app.scan_lifecycle {
+        ScanLifecycle::Running => "RUNNING",
+        ScanLifecycle::Paused => "PAUSED",
+        ScanLifecycle::Cancelling => "STOPPING",
+        ScanLifecycle::Completed => "DONE",
+        ScanLifecycle::Failed => "FAILED",
+        ScanLifecycle::Cancelled => "STOPPED",
+    };
+    let row_for = |index: usize,
+                   id: String,
+                   kind: RunKind,
+                   targets: usize,
+                   results: usize,
+                   elapsed: Duration,
+                   state: &'static str| {
+        let cells = if micro {
+            vec![
+                Cell::from(id),
+                Cell::from(kind.label()),
+                Cell::from(state),
+                Cell::from(results.to_string()),
+                Cell::from(format_duration(elapsed)),
+            ]
+        } else {
+            vec![
+                Cell::from(id),
+                Cell::from(kind.label()),
+                Cell::from(targets.to_string()),
+                Cell::from(results.to_string()),
+                Cell::from(format_duration(elapsed)),
+                Cell::from(state),
+            ]
+        };
+        Row::new(cells).style(if app.run_cursor == index {
+            theme::row_selected_style()
+        } else if index == 0 {
+            theme::highlight_style()
+        } else {
+            Style::default()
+        })
+    };
+    let mut rows = vec![row_for(
+        0,
+        format!("#{}", app.current_run_id),
+        app.active_run_kind,
+        app.active_targets.len(),
+        app.results.len(),
+        app.start_time.elapsed(),
+        current_status,
+    )];
+    if let Some(investigation) = &app.investigation {
+        rows.push(row_for(
+            1,
+            format!("#{}", investigation.id),
+            RunKind::Investigation,
+            1,
+            investigation.results.len(),
+            investigation.started_at.elapsed(),
+            "RUNNING",
+        ));
+    }
+    let history_offset = 1 + usize::from(has_investigation);
+    rows.extend(app.run_history.iter().enumerate().map(|(index, run)| {
+        row_for(
+            index + history_offset,
+            format!("#{}", run.id),
+            run.kind,
+            run.targets.len(),
+            run.results.len(),
+            run.elapsed,
+            lifecycle_label(run.lifecycle),
+        )
+    }));
+    let rows = rows
+        .into_iter()
+        .skip(app.run_scroll)
+        .take(visible)
+        .collect::<Vec<_>>();
+    let (headers, widths) = if micro {
+        (
+            vec!["Run", "Kind", "State", "Results", "Elapsed"],
+            vec![
+                Constraint::Length(7),
+                Constraint::Length(10),
+                Constraint::Length(9),
+                Constraint::Length(8),
+                Constraint::Min(7),
+            ],
+        )
+    } else {
+        (
+            vec!["Run", "Kind", "Targets", "Results", "Elapsed", "State"],
+            vec![
+                Constraint::Length(9),
+                Constraint::Length(10),
+                Constraint::Length(9),
+                Constraint::Length(9),
+                Constraint::Length(9),
+                Constraint::Length(9),
+            ],
+        )
+    };
+    frame.render_widget(
+        Table::new(rows, widths)
+            .header(Row::new(headers).style(theme::title_style()))
+            .block(table_block),
+        panes[0],
+    );
+
+    if micro {
+        return;
+    }
+
+    let (id, source_run_id, kind, results, targets, elapsed) = if app.run_cursor == 0 {
+        (
+            app.current_run_id,
+            app.current_source_run_id,
+            app.active_run_kind,
+            app.results.as_slice(),
+            app.active_targets.as_slice(),
+            app.start_time.elapsed(),
+        )
+    } else if app.run_cursor == 1 && has_investigation {
+        let investigation = app
+            .investigation
+            .as_ref()
+            .expect("active investigation checked");
+        (
+            investigation.id,
+            Some(investigation.source_run_id),
+            RunKind::Investigation,
+            investigation.results.as_slice(),
+            std::slice::from_ref(&investigation.target),
+            investigation.started_at.elapsed(),
+        )
+    } else if let Some(run) = app.run_history.get(app.run_cursor - history_offset) {
+        (
+            run.id,
+            run.source_run_id,
+            run.kind,
+            run.results.as_slice(),
+            run.targets.as_slice(),
+            run.elapsed,
+        )
+    } else {
+        (
+            app.current_run_id,
+            app.current_source_run_id,
+            RunKind::Full,
+            app.results.as_slice(),
+            app.active_targets.as_slice(),
+            Duration::ZERO,
+        )
+    };
+    let ok = results.iter().filter(|result| result.ok > 0).count();
+    let failed = results.len().saturating_sub(ok);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("#{id} {} run", kind.label()),
+            theme::header_style(),
+        )),
+        Line::from(format!("Targets     : {}", targets.len())),
+        Line::from(format!(
+            "Results     : {} ({ok} responsive / {failed} failed)",
+            results.len()
+        )),
+        Line::from(format!("Elapsed     : {}", format_duration(elapsed))),
+    ];
+    lines.push(Line::from(""));
+    lines.extend(comparison_lines(app, id, source_run_id, results));
+    lines.extend([
+        Line::from(""),
+        Line::from(format!("Retained runs: {}/10", app.run_history.len())),
+        Line::from(format!("Retained events: {}/1000", app.scan_events.len())),
+    ]);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(widgets::subtle_panel_block("Run details & deltas")),
+        panes[1],
+    );
+}
+
+fn lifecycle_label(lifecycle: ScanLifecycle) -> &'static str {
+    match lifecycle {
+        ScanLifecycle::Completed => "DONE",
+        ScanLifecycle::Cancelled => "STOPPED",
+        ScanLifecycle::Failed => "FAILED",
+        ScanLifecycle::Paused => "PAUSED",
+        ScanLifecycle::Cancelling => "STOPPING",
+        ScanLifecycle::Running => "RUNNING",
+    }
+}
+
+fn canonical_results_by_ip(results: &[ProbeResult]) -> BTreeMap<&str, &ProbeResult> {
+    let mut by_ip = BTreeMap::new();
+    for result in results {
+        let rank = (
+            usize::from(!result.port_results.is_empty()),
+            result.checks.len(),
+            result.completed,
+        );
+        by_ip
+            .entry(result.ip.as_str())
+            .and_modify(|current: &mut &ProbeResult| {
+                let current_rank = (
+                    usize::from(!current.port_results.is_empty()),
+                    current.checks.len(),
+                    current.completed,
+                );
+                if rank > current_rank {
+                    *current = result;
+                }
+            })
+            .or_insert(result);
+    }
+    by_ip
+}
+
+fn comparison_lines(
+    app: &App,
+    run_id: u64,
+    source_run_id: Option<u64>,
+    results: &[ProbeResult],
+) -> Vec<Line<'static>> {
+    let Some(source_id) = source_run_id.filter(|source_id| *source_id != run_id) else {
+        return vec![Line::from(Span::styled(
+            "No source run is linked.",
+            theme::hint_style(),
+        ))];
+    };
+    let source_results = if source_id == app.current_run_id {
+        Some(app.results.as_slice())
+    } else {
+        app.run_history
+            .iter()
+            .find(|run| run.id == source_id)
+            .map(|run| run.results.as_slice())
+    };
+    let Some(source_results) = source_results else {
+        return vec![Line::from(Span::styled(
+            format!("Source run #{source_id} is no longer retained."),
+            theme::hint_style(),
+        ))];
+    };
+    let mut lines = vec![Line::from(Span::styled(
+        format!("Compared with source run #{source_id}"),
+        theme::subtitle_style(),
+    ))];
+    let source_by_ip = canonical_results_by_ip(source_results);
+    let result_by_ip = canonical_results_by_ip(results);
+    let mut matched = 0usize;
+    for (ip, result) in result_by_ip {
+        let Some(source) = source_by_ip.get(ip).copied() else {
+            continue;
+        };
+        matched += 1;
+        lines.push(Line::from(format!(
+            "{}  avg {:+.1}ms • p95 {:+.1}ms • loss {:+.1}pp • success {:+.1}pp",
+            ip,
+            (result.avg - source.avg) * 1000.0,
+            (result.p95 - source.p95) * 1000.0,
+            (result.packet_loss - source.packet_loss) * 100.0,
+            (result.success_rate - source.success_rate) * 100.0,
+        )));
+        lines.push(Line::from(format!(
+            "  {}→{} • colo {}→{} • diagnostics {:+}",
+            result_status(source),
+            result_status(result),
+            source.colo.as_deref().unwrap_or("—"),
+            result.colo.as_deref().unwrap_or("—"),
+            result.diagnostics.len() as isize - source.diagnostics.len() as isize,
+        )));
+    }
+    if matched == 0 {
+        lines.push(Line::from(Span::styled(
+            "No matching IPs exist in the linked source run.",
+            theme::hint_style(),
+        )));
+    } else {
+        lines.insert(1, Line::from(format!("Matched IPs : {matched}")));
+    }
+    lines
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds >= 60 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else if seconds > 0 {
+        format!("{seconds}s")
+    } else {
+        format!("{}ms", duration.as_millis())
+    }
+}
+
 fn fmt_ms(sec: f64) -> String {
     format!("{:.1}ms", sec * 1000.0)
 }
@@ -1601,26 +2377,32 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Length(18),
-            Constraint::Length(20),
-            Constraint::Length(20),
+            Constraint::Length(18),
+            Constraint::Length(18),
             Constraint::Min(0),
             Constraint::Length(18),
+            Constraint::Length(12),
         ])
         .split(footer_rows[0]);
 
-    let left_action = if app.scan_complete {
+    let isolated_work = app.investigation.is_some() || app.pending_isolation.is_some();
+    let left_action = if app.scan_complete && isolated_work {
+        ButtonAction::PauseResume
+    } else if app.scan_complete {
         ButtonAction::Save
     } else {
         ButtonAction::PauseResume
     };
-    let left_label = if app.scan_complete {
+    let left_label = if app.scan_complete && isolated_work {
+        "Resume scheduling (p)"
+    } else if app.scan_complete {
         "Export (e)"
     } else if app.paused.load(std::sync::atomic::Ordering::Relaxed) {
         "Resume (p)"
     } else {
         "Pause (p)"
     };
-    let left_kind = if app.scan_complete {
+    let left_kind = if app.scan_complete && !isolated_work {
         ButtonKind::Primary
     } else {
         ButtonKind::Secondary
@@ -1634,7 +2416,24 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         app.focus_index == 1,
     );
 
-    if app.scan_complete {
+    if app.scan_complete && isolated_work {
+        app.button_ex(
+            frame,
+            chunks[1],
+            "Stop + keep (x)",
+            ButtonAction::StopKeepResults,
+            ButtonKind::Secondary,
+            app.focus_index == 2,
+        );
+        app.button_ex(
+            frame,
+            chunks[2],
+            "Customize (w)",
+            ButtonAction::CustomizeScan,
+            ButtonKind::Primary,
+            app.focus_index == 3,
+        );
+    } else if app.scan_complete {
         app.button_ex(
             frame,
             chunks[1],
@@ -1651,20 +2450,75 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
             ButtonKind::Primary,
             app.focus_index == 3,
         );
+    } else {
+        app.button_ex(
+            frame,
+            chunks[1],
+            "Workers − (,)",
+            ButtonAction::WorkerDown,
+            ButtonKind::Secondary,
+            false,
+        );
+        app.button_ex(
+            frame,
+            chunks[3],
+            "Auto workers (0)",
+            ButtonAction::WorkerAuto,
+            ButtonKind::Secondary,
+            false,
+        );
+        app.button_ex(
+            frame,
+            chunks[2],
+            "Workers + (.)",
+            ButtonAction::WorkerUp,
+            ButtonKind::Secondary,
+            false,
+        );
     }
-    app.button_ex(
-        frame,
-        chunks[4],
-        "Quit (q)",
-        ButtonAction::Quit,
-        ButtonKind::Secondary,
-        app.focus_index == if app.scan_complete { 4 } else { 2 },
-    );
+    if app.scan_complete {
+        app.button_ex(
+            frame,
+            chunks[5],
+            "Quit (q)",
+            ButtonAction::Quit,
+            ButtonKind::Secondary,
+            app.focus_index == 4,
+        );
+    } else {
+        app.button_ex(
+            frame,
+            chunks[4],
+            "Stop + keep (x)",
+            ButtonAction::StopKeepResults,
+            ButtonKind::Secondary,
+            app.focus_index == 2,
+        );
+        app.button_ex(
+            frame,
+            chunks[5],
+            "Quit (q)",
+            ButtonAction::Quit,
+            ButtonKind::Secondary,
+            app.focus_index == 3,
+        );
+    }
 
-    let hints: &[widgets::KeyHint] = if app.scan_complete {
+    let hints: &[widgets::KeyHint] = if app.scan_complete && isolated_work {
+        &[
+            ("Tab", "focus"),
+            ("p", "resume scheduling"),
+            ("x", "stop + keep"),
+            ("w", "customize"),
+            ("q", "quit"),
+        ]
+    } else if app.scan_complete {
         &[
             ("Tab", "focus"),
             (widgets::enter_key(), "details"),
+            ("o", "view"),
+            ("Space", "select"),
+            ("R", "rerun selected"),
             ("c", "copy"),
             ("e", "export"),
             ("t", "speed test"),
@@ -1682,7 +2536,12 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         &[
             ("Tab", "focus"),
             (widgets::enter_key(), "details"),
-            ("p", "pause"),
+            ("o", "view"),
+            ("Space", "select"),
+            ("i", "isolate"),
+            ("p", "pause scheduling"),
+            ("x", "stop + keep"),
+            ("w", "edit + restart"),
             ("c", "copy"),
             ("/", "commands"),
             ("?", "help"),
@@ -1695,8 +2554,8 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::{
-        failure_summary_line, latency_bucket, latency_summary, median, recommendation_ip,
-        selected_latency_index, unique_ip_counts, FailureSummaryMode,
+        canonical_results_by_ip, failure_summary_line, latency_bucket, latency_summary, median,
+        recommendation_ip, selected_latency_index, unique_ip_counts, FailureSummaryMode,
     };
     use crate::config::AppConfig;
     use crate::scanner::{ProbeFailureCounts, ProbeResult};
@@ -1797,6 +2656,19 @@ mod tests {
         let second = result("192.0.2.2", 0.5, &[3.0, 5.0, 7.0]);
         let refs = vec![&first, &second];
         assert_eq!(latency_summary(&refs), (4.0, 4.0));
+    }
+
+    #[test]
+    fn comparison_canonicalization_emits_one_aggregate_result_per_ip() {
+        let port_443 = result("192.0.2.1", 1.0, &[0.010, 0.011]);
+        let mut aggregate = result("192.0.2.1", 1.0, &[0.010, 0.011, 0.020, 0.021]);
+        aggregate.port = 8443;
+        let port_8443 = result("192.0.2.1", 1.0, &[0.020, 0.021]);
+        let results = vec![port_443, port_8443, aggregate];
+
+        let canonical = canonical_results_by_ip(&results);
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical["192.0.2.1"].completed, 4);
     }
 
     #[test]

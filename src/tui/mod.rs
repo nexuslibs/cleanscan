@@ -11,7 +11,7 @@ pub use widgets::{ButtonKind, ToastKind};
 use std::{
     cell::RefCell,
     cmp::Ordering as CmpOrdering,
-    collections::HashSet,
+    collections::{BTreeMap, HashSet, VecDeque},
     fs,
     io::{self, Write},
     sync::atomic::{AtomicBool, Ordering},
@@ -29,7 +29,9 @@ use ratatui::{
 };
 
 use crate::config::AppConfig;
-use crate::scanner::{ProbeFailureCounts, ProbeResult, ScanPhase, ScanProgress};
+use crate::scanner::{
+    ProbeFailureCounts, ProbeResult, ScanControl, ScanEvent, ScanEventKind, ScanPhase, ScanProgress,
+};
 use crate::speed::{SpeedDirection, SpeedResult};
 use crate::tui::wizard::SettingField;
 use tui_overlay::{Anchor, Backdrop, Easing, Overlay, OverlayState, Slide};
@@ -54,6 +56,219 @@ pub enum ScanLifecycle {
     Completed,
     Failed,
     Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanDashboardView {
+    Results,
+    LiveTargets,
+    RunLog,
+}
+
+impl ScanDashboardView {
+    pub const ALL: [Self; 3] = [Self::Results, Self::LiveTargets, Self::RunLog];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Results => "Results",
+            Self::LiveTargets => "Live Targets",
+            Self::RunLog => "Run Log",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetStage {
+    Queued,
+    WarmingUp,
+    Probing,
+    Finalized,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetFilter {
+    All,
+    Active,
+    Problems,
+    Selected,
+}
+
+impl TargetFilter {
+    pub const ALL: [Self; 4] = [Self::All, Self::Active, Self::Problems, Self::Selected];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Active => "active",
+            Self::Problems => "problems",
+            Self::Selected => "selected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetSort {
+    Attention,
+    ActivityAge,
+    Stage,
+    Ip,
+}
+
+impl TargetSort {
+    pub const ALL: [Self; 4] = [Self::Attention, Self::ActivityAge, Self::Stage, Self::Ip];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Attention => "attention",
+            Self::ActivityAge => "age",
+            Self::Stage => "stage",
+            Self::Ip => "IP",
+        }
+    }
+}
+
+impl TargetStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Queued => "QUEUED",
+            Self::WarmingUp => "WARMUP",
+            Self::Probing => "PROBING",
+            Self::Finalized => "DONE",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetActivity {
+    pub ip: String,
+    pub stage: TargetStage,
+    pub probes_started: usize,
+    pub probes_completed: usize,
+    pub failures: usize,
+    pub first_activity: Option<Instant>,
+    pub last_activity: Option<Instant>,
+    pub last_outcome: String,
+}
+
+impl TargetActivity {
+    fn queued(ip: String) -> Self {
+        Self {
+            ip,
+            stage: TargetStage::Queued,
+            probes_started: 0,
+            probes_completed: 0,
+            failures: 0,
+            first_activity: None,
+            last_activity: None,
+            last_outcome: "waiting for scheduler".to_string(),
+        }
+    }
+}
+
+fn apply_event_to_activity(activity: &mut TargetActivity, event: &ScanEvent, now: Instant) -> bool {
+    activity.first_activity.get_or_insert(now);
+    activity.last_activity = Some(now);
+    activity.last_outcome = event.message.clone();
+    match event.kind {
+        ScanEventKind::TargetQueued => activity.stage = TargetStage::Queued,
+        ScanEventKind::WarmupStarted => {
+            activity.stage = TargetStage::WarmingUp;
+            activity.probes_started = activity.probes_started.saturating_add(1);
+        }
+        ScanEventKind::ProbeStarted => {
+            activity.stage = TargetStage::Probing;
+            activity.probes_started = activity.probes_started.saturating_add(1);
+        }
+        ScanEventKind::ProbeCompleted => {
+            activity.stage = TargetStage::Probing;
+            activity.probes_completed = activity.probes_completed.saturating_add(1);
+            // Telemetry is deliberately bounded and may shed an earlier start
+            // event under extreme pressure. A completion proves that start
+            // happened, so preserve the factual invariant instead of showing
+            // impossible counts such as 6 completed / 4 started.
+            activity.probes_started = activity.probes_started.max(activity.probes_completed);
+            if event.probe_succeeded == Some(false) {
+                activity.failures = activity.failures.saturating_add(1);
+            }
+            return true;
+        }
+        ScanEventKind::TargetFinalized => {
+            activity.stage = TargetStage::Finalized;
+            return true;
+        }
+        ScanEventKind::WorkerChanged | ScanEventKind::ScanFinalizing => {}
+    }
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunKind {
+    Full,
+    Targeted,
+    Investigation,
+}
+
+impl RunKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Full => "FULL",
+            Self::Targeted => "TARGETED",
+            Self::Investigation => "ISOLATED",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RunRecord {
+    pub id: u64,
+    pub source_run_id: Option<u64>,
+    pub kind: RunKind,
+    pub targets: Vec<String>,
+    pub results: Vec<ProbeResult>,
+    pub elapsed: Duration,
+    pub lifecycle: ScanLifecycle,
+}
+
+#[derive(Debug, Clone)]
+pub struct InvestigationState {
+    pub id: u64,
+    pub target: String,
+    pub source_run_id: u64,
+    pub started_at: Instant,
+    pub cancel: Arc<AtomicBool>,
+    pub activity: TargetActivity,
+    pub events: VecDeque<TimedScanEvent>,
+    pub results: Vec<ProbeResult>,
+}
+
+impl InvestigationState {
+    fn new(id: u64, target: String, source_run_id: u64) -> Self {
+        Self {
+            id,
+            activity: TargetActivity::queued(target.clone()),
+            target,
+            source_run_id,
+            started_at: Instant::now(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            events: VecDeque::new(),
+            results: Vec::new(),
+        }
+    }
+
+    fn apply_event(&mut self, event: ScanEvent) {
+        apply_event_to_activity(&mut self.activity, &event, Instant::now());
+        self.events.push_front(TimedScanEvent {
+            elapsed: self.started_at.elapsed(),
+            event,
+        });
+        self.events.truncate(1_000);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TimedScanEvent {
+    pub elapsed: Duration,
+    pub event: ScanEvent,
 }
 
 #[derive(Debug, Clone)]
@@ -143,10 +358,14 @@ pub enum Action {
     NewSample,
     ExportComparison,
     CustomizeScan,
+    CycleScanView,
+    IsolateTarget,
+    RerunSelected,
+    StopKeepResults,
 }
 
 impl Action {
-    pub const ALL: [Action; 25] = [
+    pub const ALL: [Action; 29] = [
         Action::Back,
         Action::Next,
         Action::Start,
@@ -172,6 +391,10 @@ impl Action {
         Action::NewSample,
         Action::ExportComparison,
         Action::CustomizeScan,
+        Action::CycleScanView,
+        Action::IsolateTarget,
+        Action::RerunSelected,
+        Action::StopKeepResults,
     ];
 
     pub fn label(self) -> &'static str {
@@ -201,6 +424,10 @@ impl Action {
             Action::NewSample => "Generate new sample",
             Action::ExportComparison => "Export comparison",
             Action::CustomizeScan => "Customize scan",
+            Action::CycleScanView => "Cycle scan dashboard view",
+            Action::IsolateTarget => "Isolate selected target",
+            Action::RerunSelected => "Rerun selected targets",
+            Action::StopKeepResults => "Stop and keep results",
         }
     }
 
@@ -221,6 +448,10 @@ impl Action {
             Action::NewSample => "n",
             Action::ExportComparison => "m",
             Action::CustomizeScan => "w",
+            Action::CycleScanView => "o",
+            Action::IsolateTarget => "i",
+            Action::RerunSelected => "R",
+            Action::StopKeepResults => "x",
             _ => "",
         }
     }
@@ -238,6 +469,10 @@ impl Action {
             Action::NewSample => "Generate a new target sample with the same settings",
             Action::ExportComparison => "Export the current run for comparison",
             Action::CustomizeScan => "Return to scan parameters without discarding results",
+            Action::CycleScanView => "Switch between results, live targets, and run log",
+            Action::IsolateTarget => "Pause main scheduling and investigate one target alone",
+            Action::RerunSelected => "Start a focused scan using the selected targets",
+            Action::StopKeepResults => "Stop active work and preserve completed results",
             _ => self.label(),
         }
     }
@@ -263,6 +498,10 @@ pub enum ButtonAction {
     SpeedStart,
     SpeedBack,
     CustomizeScan,
+    WorkerDown,
+    WorkerUp,
+    WorkerAuto,
+    StopKeepResults,
 }
 
 /// A selectable CIDR candidate in the wizard's ranges step.
@@ -298,6 +537,31 @@ pub struct App {
     /// Unique IPs with at least one successful emitted result.
     pub scan_succeeded_ips: HashSet<String>,
     pub scan_progress: ScanProgressState,
+    pub dashboard_view: ScanDashboardView,
+    pub target_activity: BTreeMap<String, TargetActivity>,
+    pub target_cursor: usize,
+    pub target_scroll: usize,
+    pub target_render_start: usize,
+    pub target_filter: TargetFilter,
+    pub target_sort: TargetSort,
+    pub target_query: String,
+    pub selected_targets: HashSet<String>,
+    pub scan_events: VecDeque<TimedScanEvent>,
+    pub last_completion_at: Option<Instant>,
+    pub run_history: VecDeque<RunRecord>,
+    pub run_cursor: usize,
+    pub run_scroll: usize,
+    pub run_render_start: usize,
+    pub current_run_id: u64,
+    pub current_source_run_id: Option<u64>,
+    pub next_run_id: u64,
+    pub active_run_kind: RunKind,
+    pub pending_run_kind: RunKind,
+    pub pending_source_run_id: Option<u64>,
+    pub active_targets: Vec<String>,
+    pub pending_isolation: Option<String>,
+    pub investigation: Option<InvestigationState>,
+    pub scan_control: Option<std::sync::mpsc::Sender<ScanControl>>,
     /// Exact sampled targets shown in the review screen and used for the run.
     pub preview_targets: Vec<String>,
     preview_rx: Option<std::sync::mpsc::Receiver<Result<Vec<String>, String>>>,
@@ -313,6 +577,8 @@ pub struct App {
     pub should_quit: bool,
     pub paused: Arc<AtomicBool>,
     pub cancel: Option<Arc<AtomicBool>>,
+    pub quit_after_cancel: bool,
+    pub edit_after_stop: bool,
     pub message: Option<String>,
     pub message_kind: ToastKind,
     pub message_time: Option<Instant>,
@@ -362,6 +628,7 @@ pub struct App {
     pub table_header: Option<Rect>,
     pub table_col_bounds: Vec<(u16, u16)>,
     pub table_col_indices: Vec<usize>,
+    pub dashboard_tabs: Vec<(Rect, ScanDashboardView)>,
     /// Speed-select list inner rect + first visible index, for mouse hit-testing.
     pub speed_list_inner: Option<Rect>,
     pub speed_list_start: usize,
@@ -520,7 +787,7 @@ impl App {
                 if self.scan_complete && self.scan_lifecycle != ScanLifecycle::Cancelling {
                     5
                 } else {
-                    3
+                    4
                 }
             }
             Screen::SpeedSelect => 8,
@@ -604,7 +871,11 @@ impl App {
                         | Action::NewSample
                         | Action::ExportComparison
                         | Action::CustomizeScan
-                )
+                        | Action::CycleScanView
+                        | Action::RerunSelected
+                        | Action::IsolateTarget
+                ) || ((self.investigation.is_some() || self.pending_isolation.is_some())
+                    && matches!(action, Action::PauseResume | Action::StopKeepResults))
             }
             Screen::Scanning => matches!(
                 action,
@@ -615,6 +886,10 @@ impl App {
                     | Action::OpenHelp
                     | Action::OpenCommandPalette
                     | Action::ToggleFailures
+                    | Action::CycleScanView
+                    | Action::IsolateTarget
+                    | Action::StopKeepResults
+                    | Action::CustomizeScan
             ),
             Screen::SpeedSelect => matches!(
                 action,
@@ -713,6 +988,31 @@ impl App {
             scan_result_ips: HashSet::new(),
             scan_succeeded_ips: HashSet::new(),
             scan_progress: ScanProgressState::default(),
+            dashboard_view: ScanDashboardView::Results,
+            target_activity: BTreeMap::new(),
+            target_cursor: 0,
+            target_scroll: 0,
+            target_render_start: 0,
+            target_filter: TargetFilter::All,
+            target_sort: TargetSort::Attention,
+            target_query: String::new(),
+            selected_targets: HashSet::new(),
+            scan_events: VecDeque::new(),
+            last_completion_at: None,
+            run_history: VecDeque::new(),
+            run_cursor: 0,
+            run_scroll: 0,
+            run_render_start: 0,
+            current_run_id: 0,
+            current_source_run_id: None,
+            next_run_id: 1,
+            active_run_kind: RunKind::Full,
+            pending_run_kind: RunKind::Full,
+            pending_source_run_id: None,
+            active_targets: Vec::new(),
+            pending_isolation: None,
+            investigation: None,
+            scan_control: None,
             preview_targets: Vec::new(),
             preview_rx: None,
             preview_pending: false,
@@ -725,6 +1025,8 @@ impl App {
             should_quit: false,
             paused,
             cancel: None,
+            quit_after_cancel: false,
+            edit_after_stop: false,
             message: None,
             message_kind: ToastKind::Info,
             message_time: None,
@@ -759,6 +1061,7 @@ impl App {
             table_header: None,
             table_col_bounds: Vec::new(),
             table_col_indices: Vec::new(),
+            dashboard_tabs: Vec::new(),
             speed_list_inner: None,
             speed_list_start: 0,
             speed_table_header: None,
@@ -881,6 +1184,13 @@ impl App {
 
     /// Switch to the scanning dashboard once targets are known. Resets per-scan state.
     pub fn begin_scan(&mut self, total: usize) {
+        self.archive_current_run();
+        self.active_run_kind = self.pending_run_kind;
+        self.current_source_run_id = self.pending_source_run_id;
+        self.pending_run_kind = RunKind::Full;
+        self.pending_source_run_id = None;
+        self.current_run_id = self.next_run_id;
+        self.next_run_id = self.next_run_id.saturating_add(1);
         self.screen = Screen::Scanning;
         self.return_to_results = false;
         self.focus_index = 0;
@@ -895,9 +1205,30 @@ impl App {
         self.scan_result_ips.clear();
         self.scan_succeeded_ips.clear();
         self.scan_progress = ScanProgressState::default();
+        self.dashboard_view = ScanDashboardView::Results;
+        self.target_activity = self
+            .last_targets
+            .iter()
+            .cloned()
+            .map(|ip| (ip.clone(), TargetActivity::queued(ip)))
+            .collect();
+        self.active_targets = self.last_targets.clone();
+        self.target_cursor = 0;
+        self.target_scroll = 0;
+        self.target_render_start = 0;
+        self.target_filter = TargetFilter::All;
+        self.target_sort = TargetSort::Attention;
+        self.target_query.clear();
+        self.selected_targets.clear();
+        self.scan_events.clear();
+        self.last_completion_at = None;
+        self.pending_isolation = None;
+        self.investigation = None;
         self.scan_complete = false;
         self.scan_lifecycle = ScanLifecycle::Running;
         self.scan_error = None;
+        self.quit_after_cancel = false;
+        self.edit_after_stop = false;
         self.results.clear();
         self.results_revision = self.results_revision.wrapping_add(1);
         self.sorted_cache.borrow_mut().take();
@@ -915,20 +1246,140 @@ impl App {
         self.probe_rate_history.clear();
     }
 
+    fn archive_current_run(&mut self) {
+        if self.active_targets.is_empty() || (self.results.is_empty() && !self.scan_complete) {
+            return;
+        }
+        let record = RunRecord {
+            id: self.current_run_id,
+            source_run_id: self.current_source_run_id,
+            kind: self.active_run_kind,
+            targets: self.active_targets.clone(),
+            results: self.results.clone(),
+            elapsed: self.start_time.elapsed(),
+            lifecycle: self.scan_lifecycle,
+        };
+        self.run_history.push_front(record);
+        self.evict_run_history();
+        self.run_cursor = 0;
+        self.run_scroll = 0;
+        self.run_render_start = 0;
+    }
+
+    fn evict_run_history(&mut self) {
+        while self.run_history.len() > 10 {
+            let mut linked_sources = self
+                .run_history
+                .iter()
+                .filter_map(|run| run.source_run_id)
+                .collect::<HashSet<_>>();
+            linked_sources.extend(self.pending_source_run_id);
+            linked_sources.extend(self.current_source_run_id);
+            // Index zero is the run just archived. Prefer evicting the oldest
+            // unreferenced prior run; if every prior run is linked, evict the
+            // oldest one and let its dependants report source unavailable.
+            let removable = (1..self.run_history.len())
+                .rev()
+                .find(|index| !linked_sources.contains(&self.run_history[*index].id))
+                .unwrap_or_else(|| self.run_history.len() - 1);
+            self.run_history.remove(removable);
+        }
+    }
+
+    pub fn set_scan_control(&mut self, tx: std::sync::mpsc::Sender<ScanControl>) {
+        self.scan_control = Some(tx);
+    }
+
+    fn apply_runtime_control(
+        &mut self,
+        control: ScanControl,
+        primary_cancel: &Arc<AtomicBool>,
+        scheduler_paused: &Arc<AtomicBool>,
+    ) {
+        match control {
+            ScanControl::PauseScheduling => {
+                scheduler_paused.store(true, Ordering::Relaxed);
+                self.scan_lifecycle = ScanLifecycle::Paused;
+                self.toast_info("Scheduling paused; active probes are draining");
+            }
+            ScanControl::ResumeScheduling => {
+                if self.investigation.is_some() {
+                    self.toast_warn("Wait for or stop the isolated investigation before resuming");
+                } else {
+                    if self.pending_isolation.take().is_some() {
+                        self.toast_info("Pending isolated investigation cancelled");
+                    }
+                    scheduler_paused.store(false, Ordering::Relaxed);
+                    if !self.scan_complete {
+                        self.scan_lifecycle = ScanLifecycle::Running;
+                    }
+                    self.toast_info("Probe scheduling resumed");
+                }
+            }
+            ScanControl::SetWorkers(workers) => {
+                self.config
+                    .runtime_worker_override
+                    .store(workers.max(1), Ordering::Relaxed);
+            }
+            ScanControl::AutomaticWorkers => {
+                self.config
+                    .runtime_worker_override
+                    .store(0, Ordering::Relaxed);
+            }
+            ScanControl::IsolateTarget(ip) => {
+                if self.investigation.is_some() || self.pending_isolation.is_some() {
+                    self.toast_warn("An isolated investigation is already pending");
+                } else {
+                    scheduler_paused.store(true, Ordering::Relaxed);
+                    if !self.scan_complete {
+                        self.scan_lifecycle = ScanLifecycle::Paused;
+                    }
+                    self.pending_isolation = Some(ip.clone());
+                    self.toast_info(format!("Draining active probes before isolating {ip}"));
+                }
+            }
+            ScanControl::StopAndKeepResults => {
+                self.quit_after_cancel = false;
+                self.pending_isolation = None;
+                if let Some(investigation) = &self.investigation {
+                    investigation.cancel.store(true, Ordering::Relaxed);
+                }
+                if !self.scan_complete {
+                    primary_cancel.store(true, Ordering::Relaxed);
+                    self.scan_lifecycle = ScanLifecycle::Cancelling;
+                }
+                self.toast_info("Stopping active work; completed results will be kept");
+            }
+        }
+    }
+
     pub fn set_cancel_token(&mut self, cancel: Arc<AtomicBool>) {
         self.cancel = Some(cancel);
     }
 
     fn request_cancel(&mut self) {
-        if matches!(
+        let primary_running = matches!(
             self.scan_lifecycle,
             ScanLifecycle::Running | ScanLifecycle::Paused
-        ) {
+        );
+        let investigation_running = self.investigation.is_some();
+        if primary_running || investigation_running || self.pending_isolation.is_some() {
             if let Some(cancel) = &self.cancel {
-                cancel.store(true, Ordering::Relaxed);
+                if primary_running {
+                    cancel.store(true, Ordering::Relaxed);
+                }
             }
-            self.scan_lifecycle = ScanLifecycle::Cancelling;
-            self.toast_info("Cancelling… waiting for active work to stop");
+            if let Some(investigation) = &self.investigation {
+                investigation.cancel.store(true, Ordering::Relaxed);
+            }
+            self.pending_isolation = None;
+            self.quit_after_cancel = true;
+            if primary_running {
+                self.scan_lifecycle = ScanLifecycle::Cancelling;
+            }
+            self.toast_info("Cancelling active scan work…");
+        } else {
+            self.should_quit = true;
         }
     }
 
@@ -1096,6 +1547,18 @@ impl App {
         if result.ok > 0 {
             self.scan_succeeded_ips.insert(result.ip.clone());
         }
+        let now = Instant::now();
+        let activity = self
+            .target_activity
+            .entry(result.ip.clone())
+            .or_insert_with(|| TargetActivity::queued(result.ip.clone()));
+        activity.stage = TargetStage::Finalized;
+        activity.probes_completed = activity.probes_completed.max(result.completed);
+        activity.probes_started = activity.probes_started.max(activity.probes_completed);
+        activity.failures = result.fail;
+        activity.last_activity = Some(now);
+        activity.last_outcome = crate::scanner::result_status(&result).to_string();
+        self.last_completion_at = Some(now);
         self.results.push(result);
         self.results_revision = self.results_revision.wrapping_add(1);
         self.sorted_cache.borrow_mut().take();
@@ -1104,6 +1567,27 @@ impl App {
     pub fn apply_scan_progress(&mut self, progress: ScanProgress) {
         if let Some(ip) = &progress.latest_target {
             self.scan_started_ips.insert(ip.clone());
+        }
+        if progress.current_workers != self.scan_progress.current_workers
+            || (progress.adaptive_reason.is_some()
+                && progress.adaptive_reason != self.scan_progress.adaptive_reason)
+        {
+            let workers = progress
+                .current_workers
+                .unwrap_or(self.config.concurrency.max(1));
+            self.apply_scan_event(ScanEvent {
+                kind: ScanEventKind::WorkerChanged,
+                target: None,
+                message: progress
+                    .adaptive_reason
+                    .clone()
+                    .unwrap_or_else(|| format!("scheduler using {workers} workers")),
+                diagnostic_category: None,
+                probe_succeeded: None,
+            });
+        }
+        if let Some(event) = progress.event.clone() {
+            self.apply_scan_event(event);
         }
         self.scan_progress = ScanProgressState {
             phase: progress.phase,
@@ -1151,6 +1635,24 @@ impl App {
                     .max(progress.failure_counts.general_errors),
             },
         };
+    }
+
+    fn apply_scan_event(&mut self, event: ScanEvent) {
+        let now = Instant::now();
+        if let Some(ip) = &event.target {
+            let activity = self
+                .target_activity
+                .entry(ip.clone())
+                .or_insert_with(|| TargetActivity::queued(ip.clone()));
+            if apply_event_to_activity(activity, &event, now) {
+                self.last_completion_at = Some(now);
+            }
+        }
+        self.scan_events.push_front(TimedScanEvent {
+            elapsed: self.start_time.elapsed(),
+            event,
+        });
+        self.scan_events.truncate(1_000);
     }
 
     fn copy_selected_ip(&mut self) {
@@ -1640,6 +2142,10 @@ pub fn run_tui(
     let (progress_tx, progress_rx) = std::sync::mpsc::sync_channel::<ScanProgress>(128);
     let (speed_tx, speed_rx) = std::sync::mpsc::channel::<SpeedResult>();
     let (manifest_tx, manifest_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let (control_tx, control_rx) = std::sync::mpsc::channel::<ScanControl>();
+    let (investigation_tx, investigation_rx) = std::sync::mpsc::channel::<ProbeResult>();
+    let (investigation_progress_tx, investigation_progress_rx) =
+        std::sync::mpsc::sync_channel::<ScanProgress>(64);
     let progress_sender = progress_tx.clone();
     let paused = Arc::new(AtomicBool::new(false));
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1651,6 +2157,7 @@ pub fn run_tui(
     let mut app = App::new((*config_arc).clone(), has_cli_targets, paused.clone());
     app.system_network = system_network;
     app.set_cancel_token(cancel.clone());
+    app.set_scan_control(control_tx);
     app.watch_interval = watch_interval.map(|seconds| Duration::from_secs(seconds.max(1)));
     app.manifest_path = manifest_path;
     app.manifest_thresholds = crate::HealthThresholds {
@@ -1733,6 +2240,7 @@ pub fn run_tui(
     };
 
     let mut scanner: Option<std::thread::JoinHandle<Result<Vec<String>, String>>> = None;
+    let mut investigator: Option<std::thread::JoinHandle<Result<(), String>>> = None;
     let mut speed_runner: Option<std::thread::JoinHandle<Result<(), String>>> = None;
 
     // CLI-provided targets start scanning immediately (legacy behavior).
@@ -1855,6 +2363,9 @@ pub fn run_tui(
 
     let mut run = || -> anyhow::Result<()> {
         loop {
+            while let Ok(control) = control_rx.try_recv() {
+                app.apply_runtime_control(control, &cancel, &paused);
+            }
             while let Ok(result) = manifest_rx.try_recv() {
                 if let Err(error) = result {
                     app.toast_warn(format!("Manifest write failed: {error}"));
@@ -1871,6 +2382,108 @@ pub fn run_tui(
             }
             while let Ok(r) = speed_rx.try_recv() {
                 app.speed_results.push(r);
+            }
+            while let Ok(result) = investigation_rx.try_recv() {
+                if let Some(investigation) = app.investigation.as_mut() {
+                    investigation.results.push(result);
+                }
+            }
+            for _ in 0..64 {
+                match investigation_progress_rx.try_recv() {
+                    Ok(progress) => {
+                        if let (Some(event), Some(investigation)) =
+                            (progress.event, app.investigation.as_mut())
+                        {
+                            investigation.apply_event(event);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            if app.pending_isolation.is_some()
+                && app.investigation.is_none()
+                && app.scan_progress.active_probes == 0
+            {
+                let ip = app
+                    .pending_isolation
+                    .take()
+                    .expect("pending isolation checked");
+                let config = Arc::new(app.config.clone());
+                let result_tx = investigation_tx.clone();
+                let progress_tx = investigation_progress_tx.clone();
+                let investigation_id = app.next_run_id;
+                app.next_run_id = app.next_run_id.saturating_add(1);
+                let state =
+                    InvestigationState::new(investigation_id, ip.clone(), app.current_run_id);
+                let investigation_cancel = state.cancel.clone();
+                app.investigation = Some(state);
+                app.toast_info(format!("Running isolated investigation for {ip}"));
+                investigator = Some(std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Runtime::new()
+                        .map_err(|error| format!("failed to create runtime: {error}"))?;
+                    runtime.block_on(crate::scanner::run_profile_scan_with_progress(
+                        vec![ip],
+                        config,
+                        result_tx,
+                        investigation_cancel,
+                        Arc::new(AtomicBool::new(false)),
+                        Some(progress_tx),
+                    ));
+                    Ok(())
+                }));
+            }
+
+            if investigator
+                .as_ref()
+                .is_some_and(|worker| worker.is_finished())
+            {
+                while let Ok(result) = investigation_rx.try_recv() {
+                    if let Some(investigation) = app.investigation.as_mut() {
+                        investigation.results.push(result);
+                    }
+                }
+                let outcome = investigator
+                    .take()
+                    .expect("finished investigator exists")
+                    .join();
+                let Some(investigation) = app.investigation.take() else {
+                    continue;
+                };
+                let cancelled = investigation.cancel.load(Ordering::Relaxed);
+                let lifecycle = match &outcome {
+                    Ok(Ok(())) if cancelled => ScanLifecycle::Cancelled,
+                    Ok(Ok(())) => ScanLifecycle::Completed,
+                    Ok(Err(_)) | Err(_) => ScanLifecycle::Failed,
+                };
+                let record = RunRecord {
+                    id: investigation.id,
+                    source_run_id: Some(investigation.source_run_id),
+                    kind: RunKind::Investigation,
+                    targets: vec![investigation.target],
+                    results: investigation.results,
+                    elapsed: investigation.started_at.elapsed(),
+                    lifecycle,
+                };
+                app.run_history.push_front(record);
+                app.evict_run_history();
+                match outcome {
+                    Ok(Ok(())) if cancelled => {
+                        app.toast_warn("Isolated investigation stopped; partial results kept")
+                    }
+                    Ok(Ok(())) => app
+                        .toast_success("Isolated investigation complete; main scan remains paused"),
+                    Ok(Err(error)) => {
+                        app.toast_error(format!("Isolated investigation failed: {error}"))
+                    }
+                    Err(_) => app.toast_error("Isolated investigation worker panicked"),
+                }
+                if app.quit_after_cancel {
+                    app.should_quit = true;
+                } else if app.edit_after_stop && app.scan_complete {
+                    app.edit_after_stop = false;
+                    app.enter_customization();
+                }
             }
 
             if !app.scan_complete && scanner.as_ref().is_some_and(|s| s.is_finished()) {
@@ -1910,7 +2523,17 @@ pub fn run_tui(
                         }
                     }
                     if app.scan_lifecycle == ScanLifecycle::Cancelled {
-                        app.should_quit = true;
+                        if app.quit_after_cancel {
+                            app.should_quit = true;
+                        } else if app.edit_after_stop && app.investigation.is_none() {
+                            app.edit_after_stop = false;
+                            app.enter_customization();
+                            app.toast_info(
+                                "Partial results preserved; edit settings and start a new run",
+                            );
+                        } else {
+                            app.toast_warn("Scan stopped; completed results were preserved");
+                        }
                     }
                     if app.watch_interval.is_some()
                         && app.scan_complete
@@ -2062,7 +2685,7 @@ pub fn run_tui(
                 }
             }
 
-            if app.watch_due.is_some_and(|due| Instant::now() >= due) {
+            if app.watch_relaunch_ready(Instant::now(), paused.load(Ordering::Relaxed)) {
                 app.results.clear();
                 app.results_revision = app.results_revision.wrapping_add(1);
                 app.sorted_cache.borrow_mut().take();
@@ -2178,7 +2801,7 @@ pub fn run_tui(
                 break;
             }
 
-            if app.pending_start {
+            if app.pending_start && app.investigation.is_none() && app.pending_isolation.is_none() {
                 app.pending_start = false;
                 start_wizard_scan(&mut app, &mut scanner, &spawn_scanner);
             }
@@ -2217,11 +2840,17 @@ pub fn run_tui(
     let result = run();
 
     cancel.store(true, Ordering::Relaxed);
+    if let Some(investigation) = &app.investigation {
+        investigation.cancel.store(true, Ordering::Relaxed);
+    }
     if let Some(s) = scanner {
         let _ = s.join();
     }
     if let Some(s) = speed_runner {
         let _ = s.join();
+    }
+    if let Some(worker) = investigator {
+        let _ = worker.join();
     }
     result
 }
@@ -2337,6 +2966,19 @@ impl App {
                         }
                         return;
                     }
+                    if let Some(value) = query.strip_prefix("target:") {
+                        self.target_query = value.trim().to_string();
+                        self.dashboard_view = ScanDashboardView::LiveTargets;
+                        self.target_cursor = 0;
+                        self.target_scroll = 0;
+                        self.close_command_palette();
+                        if self.target_query.is_empty() {
+                            self.toast_info("Live target search cleared");
+                        } else {
+                            self.toast_info(format!("Live target search: {}", self.target_query));
+                        }
+                        return;
+                    }
                     if let Some(action) = self.selected_action() {
                         self.close_command_palette();
                         self.activate_action(action);
@@ -2412,7 +3054,10 @@ impl App {
                 return;
             }
             KeyCode::Esc if self.screen == Screen::Scanning => {
-                if self.scan_complete {
+                if self.scan_complete
+                    && self.investigation.is_none()
+                    && self.pending_isolation.is_none()
+                {
                     self.show_help = false;
                     self.should_quit = true;
                 } else {
@@ -2434,7 +3079,11 @@ impl App {
                 return;
             }
             KeyCode::Char('q') | KeyCode::Char('Q') => {
-                if self.screen == Screen::Scanning && !self.scan_complete {
+                if self.screen == Screen::Scanning
+                    && (!self.scan_complete
+                        || self.investigation.is_some()
+                        || self.pending_isolation.is_some())
+                {
                     self.confirm_quit = true;
                 } else if self.screen == Screen::SpeedTesting {
                     self.request_cancel();
@@ -2454,17 +3103,33 @@ impl App {
                 return;
             }
             KeyCode::Char(' ') if self.screen == Screen::Scanning => {
-                self.activate_action(Action::PauseResume);
+                self.toggle_selected_target();
                 return;
             }
             KeyCode::Enter if self.screen == Screen::Scanning => {
                 match self.focus_index {
-                    0 => self.show_result_details = true,
+                    0 if self.dashboard_view == ScanDashboardView::Results => {
+                        self.show_result_details = true
+                    }
+                    0 if self.dashboard_view == ScanDashboardView::LiveTargets => {
+                        self.toggle_selected_target()
+                    }
+                    1 if self.scan_complete
+                        && (self.investigation.is_some() || self.pending_isolation.is_some()) =>
+                    {
+                        self.activate_action(Action::PauseResume)
+                    }
                     1 if self.scan_complete => self.activate_action(Action::Export),
                     1 => self.activate_action(Action::PauseResume),
+                    2 if self.scan_complete
+                        && (self.investigation.is_some() || self.pending_isolation.is_some()) =>
+                    {
+                        self.activate_action(Action::StopKeepResults)
+                    }
                     2 if self.scan_complete => self.activate_action(Action::SpeedTest),
-                    2 => self.activate_action(Action::Quit),
+                    2 => self.activate_action(Action::StopKeepResults),
                     3 if self.scan_complete => self.activate_action(Action::CustomizeScan),
+                    3 => self.activate_action(Action::Quit),
                     4 if self.scan_complete => self.activate_action(Action::Quit),
                     _ => {}
                 }
@@ -2560,10 +3225,25 @@ impl App {
                 }
             }
             Action::CustomizeScan => {
-                if self.screen == Screen::Scanning && self.scan_complete {
-                    self.enter_customization();
+                if self.screen == Screen::Scanning {
+                    if self.scan_complete
+                        && self.investigation.is_none()
+                        && self.pending_isolation.is_none()
+                    {
+                        self.enter_customization();
+                    } else {
+                        self.edit_after_stop = true;
+                        self.send_scan_control(ScanControl::StopAndKeepResults);
+                        self.toast_info(
+                            "Stopping safely; scan settings will open when active work ends",
+                        );
+                    }
                 }
             }
+            Action::CycleScanView => self.cycle_scan_view(),
+            Action::IsolateTarget => self.isolate_selected_target(),
+            Action::RerunSelected => self.rerun_selected_targets(),
+            Action::StopKeepResults => self.send_scan_control(ScanControl::StopAndKeepResults),
         }
     }
 
@@ -2578,6 +3258,7 @@ impl App {
         self.table_header = None;
         self.table_col_bounds.clear();
         self.table_col_indices.clear();
+        self.dashboard_tabs.clear();
         self.speed_list_inner = None;
         self.speed_table_header = None;
         self.speed_table_col_bounds.clear();
@@ -2837,11 +3518,11 @@ impl App {
         let lines = vec![
             Line::from(""),
             Line::from(Span::styled(
-                "A scan is still running.",
+                "Scan work is still active.",
                 theme::title_style(),
             )),
             Line::from(Span::styled(
-                "Quitting now will discard in-progress results.",
+                "Use x to stop and keep completed results; quitting exits the app.",
                 theme::hint_style(),
             )),
         ];
@@ -2876,6 +3557,17 @@ impl App {
 
     fn handle_scan_key(&mut self, code: KeyCode) {
         match code {
+            KeyCode::Char('o') => self.activate_action(Action::CycleScanView),
+            KeyCode::Char(' ') => self.toggle_selected_target(),
+            KeyCode::Char('i') => self.activate_action(Action::IsolateTarget),
+            KeyCode::Char('R') if self.scan_complete => self.activate_action(Action::RerunSelected),
+            KeyCode::Char('x')
+                if !self.scan_complete
+                    || self.investigation.is_some()
+                    || self.pending_isolation.is_some() =>
+            {
+                self.activate_action(Action::StopKeepResults)
+            }
             KeyCode::Char(',') => self.adjust_runtime_worker_override(-1),
             KeyCode::Char('.') => self.adjust_runtime_worker_override(1),
             KeyCode::Char('[') => self.adjust_runtime_worker_override(-8),
@@ -2886,54 +3578,270 @@ impl App {
             KeyCode::Char('m') if self.scan_complete => {
                 self.activate_action(Action::ExportComparison)
             }
+            KeyCode::Char('f') if self.dashboard_view == ScanDashboardView::LiveTargets => {
+                self.cycle_target_filter()
+            }
+            KeyCode::Char('s') if self.dashboard_view == ScanDashboardView::LiveTargets => {
+                self.cycle_target_sort()
+            }
             KeyCode::Char('f') => self.activate_action(Action::ToggleFailures),
             KeyCode::Char('v') => self.activate_action(Action::ConfigureColumns),
-            KeyCode::Char('w') if self.scan_complete => self.activate_action(Action::CustomizeScan),
+            KeyCode::Char('w') => self.activate_action(Action::CustomizeScan),
             KeyCode::Char('p') => self.activate_action(Action::PauseResume),
             KeyCode::Char('e') => self.activate_action(Action::Export),
             KeyCode::Char('t') if self.scan_complete => self.activate_action(Action::SpeedTest),
             KeyCode::Char('c') => self.activate_action(Action::CopyIp),
-            KeyCode::Up => {
-                self.result_cursor = self.result_cursor.saturating_sub(1);
-                self.scroll = self.scroll.min(self.result_cursor);
-            }
+            KeyCode::Up => self.move_scan_cursor(-1),
             KeyCode::Down => {
+                self.move_scan_cursor(1);
+            }
+            KeyCode::PageUp => self.move_scan_cursor(-10),
+            KeyCode::PageDown => self.move_scan_cursor(10),
+            KeyCode::Home => self.scan_cursor_home(),
+            KeyCode::End => self.scan_cursor_end(),
+            _ => {}
+        }
+    }
+
+    fn cycle_scan_view(&mut self) {
+        let current = ScanDashboardView::ALL
+            .iter()
+            .position(|view| *view == self.dashboard_view)
+            .unwrap_or(0);
+        self.dashboard_view = ScanDashboardView::ALL[(current + 1) % ScanDashboardView::ALL.len()];
+        self.scroll = 0;
+        self.toast_info(format!("{} view", self.dashboard_view.label()));
+    }
+
+    pub fn visible_target_ips(&self) -> Vec<String> {
+        let query = self.target_query.to_lowercase();
+        let mut targets = self
+            .target_activity
+            .values()
+            .filter(|target| match self.target_filter {
+                TargetFilter::All => true,
+                TargetFilter::Active => {
+                    matches!(target.stage, TargetStage::WarmingUp | TargetStage::Probing)
+                }
+                TargetFilter::Problems => target.failures > 0,
+                TargetFilter::Selected => self.selected_targets.contains(&target.ip),
+            })
+            .filter(|target| {
+                query.is_empty()
+                    || target.ip.to_lowercase().contains(&query)
+                    || target.last_outcome.to_lowercase().contains(&query)
+                    || target.stage.label().to_lowercase().contains(&query)
+            })
+            .collect::<Vec<_>>();
+        let attention_rank = |target: &TargetActivity| match target.stage {
+            TargetStage::WarmingUp | TargetStage::Probing => 0,
+            TargetStage::Finalized if target.failures > 0 => 1,
+            TargetStage::Queued => 2,
+            TargetStage::Finalized => 3,
+        };
+        let stage_rank = |target: &TargetActivity| match target.stage {
+            TargetStage::WarmingUp => 0,
+            TargetStage::Probing => 1,
+            TargetStage::Queued => 2,
+            TargetStage::Finalized => 3,
+        };
+        targets.sort_by(|left, right| {
+            let order = match self.target_sort {
+                TargetSort::Attention => attention_rank(left)
+                    .cmp(&attention_rank(right))
+                    .then_with(|| left.first_activity.cmp(&right.first_activity)),
+                TargetSort::ActivityAge => left
+                    .first_activity
+                    .is_none()
+                    .cmp(&right.first_activity.is_none())
+                    .then_with(|| left.first_activity.cmp(&right.first_activity)),
+                TargetSort::Stage => stage_rank(left).cmp(&stage_rank(right)),
+                TargetSort::Ip => CmpOrdering::Equal,
+            };
+            order.then_with(|| left.ip.cmp(&right.ip))
+        });
+        targets
+            .into_iter()
+            .map(|target| target.ip.clone())
+            .collect()
+    }
+
+    pub fn run_log_len(&self) -> usize {
+        1 + usize::from(self.investigation.is_some()) + self.run_history.len()
+    }
+
+    fn watch_relaunch_ready(&self, now: Instant, scheduler_paused: bool) -> bool {
+        self.watch_due.is_some_and(|due| now >= due)
+            && self.pending_isolation.is_none()
+            && self.investigation.is_none()
+            && !scheduler_paused
+    }
+
+    fn cycle_target_filter(&mut self) {
+        let current = TargetFilter::ALL
+            .iter()
+            .position(|filter| *filter == self.target_filter)
+            .unwrap_or(0);
+        self.target_filter = TargetFilter::ALL[(current + 1) % TargetFilter::ALL.len()];
+        self.target_cursor = 0;
+        self.target_scroll = 0;
+        self.toast_info(format!(
+            "Live targets filter: {}",
+            self.target_filter.label()
+        ));
+    }
+
+    fn cycle_target_sort(&mut self) {
+        let current = TargetSort::ALL
+            .iter()
+            .position(|sort| *sort == self.target_sort)
+            .unwrap_or(0);
+        self.target_sort = TargetSort::ALL[(current + 1) % TargetSort::ALL.len()];
+        self.target_cursor = 0;
+        self.target_scroll = 0;
+        self.toast_info(format!("Live targets sort: {}", self.target_sort.label()));
+    }
+
+    fn move_scan_cursor(&mut self, delta: i32) {
+        match self.dashboard_view {
+            ScanDashboardView::Results => {
                 let max = self
                     .sorted_results()
                     .len()
                     .min(self.config.top)
                     .saturating_sub(1);
-                self.result_cursor = (self.result_cursor + 1).min(max);
-                self.scroll = self.scroll.max(self.result_cursor);
-            }
-            KeyCode::PageUp => {
-                self.result_cursor = self.result_cursor.saturating_sub(10);
+                self.result_cursor = if delta < 0 {
+                    self.result_cursor
+                        .saturating_sub(delta.unsigned_abs() as usize)
+                } else {
+                    (self.result_cursor + delta as usize).min(max)
+                };
                 self.scroll = self.scroll.min(self.result_cursor);
             }
-            KeyCode::PageDown => {
-                let max = self
-                    .sorted_results()
-                    .len()
-                    .min(self.config.top)
-                    .saturating_sub(1);
-                self.result_cursor = (self.result_cursor + 10).min(max);
-                self.scroll = self.scroll.max(self.result_cursor);
+            ScanDashboardView::LiveTargets => {
+                let max = self.visible_target_ips().len().saturating_sub(1);
+                self.target_cursor = if delta < 0 {
+                    self.target_cursor
+                        .saturating_sub(delta.unsigned_abs() as usize)
+                } else {
+                    (self.target_cursor + delta as usize).min(max)
+                };
             }
-            KeyCode::Home => {
+            ScanDashboardView::RunLog => {
+                let max = self.run_log_len().saturating_sub(1);
+                self.run_cursor = if delta < 0 {
+                    self.run_cursor
+                        .saturating_sub(delta.unsigned_abs() as usize)
+                } else {
+                    (self.run_cursor + delta as usize).min(max)
+                };
+            }
+        }
+    }
+
+    fn scan_cursor_home(&mut self) {
+        match self.dashboard_view {
+            ScanDashboardView::Results => {
                 self.result_cursor = 0;
                 self.scroll = 0;
             }
-            KeyCode::End => {
-                let max = self
+            ScanDashboardView::LiveTargets => {
+                self.target_cursor = 0;
+                self.target_scroll = 0;
+            }
+            ScanDashboardView::RunLog => {
+                self.run_cursor = 0;
+                self.run_scroll = 0;
+            }
+        }
+    }
+
+    fn scan_cursor_end(&mut self) {
+        match self.dashboard_view {
+            ScanDashboardView::Results => {
+                self.result_cursor = self
                     .sorted_results()
                     .len()
                     .min(self.config.top)
                     .saturating_sub(1);
-                self.result_cursor = max;
-                self.scroll = max;
+                self.scroll = self.result_cursor;
             }
-            _ => {}
+            ScanDashboardView::LiveTargets => {
+                self.target_cursor = self.visible_target_ips().len().saturating_sub(1);
+                self.target_scroll = self.target_cursor;
+            }
+            ScanDashboardView::RunLog => {
+                self.run_cursor = self.run_log_len().saturating_sub(1);
+                self.run_scroll = self.run_cursor;
+            }
         }
+    }
+
+    fn selected_scan_target(&self) -> Option<String> {
+        match self.dashboard_view {
+            ScanDashboardView::Results => self
+                .sorted_results()
+                .get(self.result_cursor)
+                .map(|result| result.ip.clone()),
+            ScanDashboardView::LiveTargets => {
+                self.visible_target_ips().get(self.target_cursor).cloned()
+            }
+            ScanDashboardView::RunLog => None,
+        }
+    }
+
+    fn toggle_selected_target(&mut self) {
+        let Some(ip) = self.selected_scan_target() else {
+            self.toast_warn("Select a target first");
+            return;
+        };
+        if !self.selected_targets.insert(ip.clone()) {
+            self.selected_targets.remove(&ip);
+        }
+        self.toast_info(format!(
+            "{} target(s) selected",
+            self.selected_targets.len()
+        ));
+    }
+
+    fn send_scan_control(&mut self, control: ScanControl) {
+        let Some(tx) = &self.scan_control else {
+            self.toast_warn("Scan controls are unavailable");
+            return;
+        };
+        if tx.send(control).is_err() {
+            self.toast_warn("Scanner control channel closed");
+        }
+    }
+
+    fn isolate_selected_target(&mut self) {
+        let Some(ip) = self.selected_scan_target() else {
+            self.toast_warn("Select a live target to isolate");
+            return;
+        };
+        self.send_scan_control(ScanControl::IsolateTarget(ip));
+    }
+
+    fn rerun_selected_targets(&mut self) {
+        if self.investigation.is_some() || self.pending_isolation.is_some() {
+            self.toast_warn("Stop or finish the isolated investigation before starting a rerun");
+            return;
+        }
+        if self.selected_targets.is_empty() {
+            if let Some(ip) = self.selected_scan_target() {
+                self.selected_targets.insert(ip);
+            }
+        }
+        if self.selected_targets.is_empty() {
+            self.toast_warn("Select one or more targets first");
+            return;
+        }
+        let mut targets = self.selected_targets.iter().cloned().collect::<Vec<_>>();
+        targets.sort();
+        self.pending_run_kind = RunKind::Targeted;
+        self.pending_source_run_id = Some(self.current_run_id);
+        self.rescan_targets = Some(targets);
+        self.pending_start = true;
     }
 
     fn adjust_runtime_worker_override(&mut self, delta: i32) {
@@ -2962,6 +3870,9 @@ impl App {
         self.config
             .runtime_worker_override
             .store(next, Ordering::Relaxed);
+        if let Some(tx) = &self.scan_control {
+            let _ = tx.send(ScanControl::SetWorkers(next));
+        }
         self.toast_info(format!("Manual workers: {next} (0 = automatic)"));
     }
 
@@ -2969,6 +3880,9 @@ impl App {
         self.config
             .runtime_worker_override
             .store(0, Ordering::Relaxed);
+        if let Some(tx) = &self.scan_control {
+            let _ = tx.send(ScanControl::AutomaticWorkers);
+        }
         self.toast_info("Worker count returned to automatic control");
     }
 
@@ -3001,6 +3915,10 @@ impl App {
     }
 
     fn repeat_targets(&mut self) {
+        if self.investigation.is_some() || self.pending_isolation.is_some() {
+            self.toast_warn("Stop or finish the isolated investigation before repeating the scan");
+            return;
+        }
         self.confirm_scan_action = Some(PendingScanAction::RepeatTargets);
     }
 
@@ -3008,6 +3926,8 @@ impl App {
         if self.last_targets.is_empty() {
             self.toast_warn("No previous target manifest available");
         } else {
+            self.pending_run_kind = RunKind::Full;
+            self.pending_source_run_id = Some(self.current_run_id);
             self.rescan_targets = Some(self.last_targets.clone());
             self.pending_start = true;
             self.toast_info("Re-running the identical target set");
@@ -3015,10 +3935,18 @@ impl App {
     }
 
     fn generate_new_sample(&mut self) {
+        if self.investigation.is_some() || self.pending_isolation.is_some() {
+            self.toast_warn(
+                "Stop or finish the isolated investigation before generating a new sample",
+            );
+            return;
+        }
         self.confirm_scan_action = Some(PendingScanAction::NewSample);
     }
 
     fn generate_new_sample_now(&mut self) {
+        self.pending_run_kind = RunKind::Full;
+        self.pending_source_run_id = Some(self.current_run_id);
         let generated = if self.explicit_target_source.is_some() {
             self.regenerate_explicit_preview()
         } else {
@@ -3327,10 +4255,7 @@ impl App {
         match m.kind {
             MouseEventKind::ScrollUp => {
                 if self.screen == Screen::Scanning {
-                    if self.result_cursor > 0 {
-                        self.result_cursor -= 1;
-                        self.scroll = self.scroll.min(self.result_cursor);
-                    }
+                    self.move_scan_cursor(-1);
                 } else if self.screen == Screen::SpeedResults {
                     if self.speed_result_cursor > 0 {
                         self.speed_result_cursor -= 1;
@@ -3351,13 +4276,7 @@ impl App {
             }
             MouseEventKind::ScrollDown => {
                 if self.screen == Screen::Scanning {
-                    let max = self
-                        .sorted_results()
-                        .len()
-                        .min(self.config.top)
-                        .saturating_sub(1);
-                    self.result_cursor = (self.result_cursor + 1).min(max);
-                    self.scroll = self.scroll.max(self.result_cursor);
+                    self.move_scan_cursor(1);
                 } else if self.screen == Screen::SpeedResults {
                     let max = self.speed_results.len().saturating_sub(1);
                     self.speed_result_cursor = (self.speed_result_cursor + 1).min(max);
@@ -3427,6 +4346,14 @@ impl App {
                         }
                     }
                 } else if self.screen == Screen::Scanning {
+                    if let Some((_, view)) = self
+                        .dashboard_tabs
+                        .iter()
+                        .find(|(rect, _)| point_in(*rect, p))
+                    {
+                        self.dashboard_view = *view;
+                        return;
+                    }
                     if let Some(header) = self.table_header {
                         if point_in(header, p) {
                             if let Some(col) = col_at(&self.table_col_bounds, m.column) {
@@ -3443,12 +4370,26 @@ impl App {
                     if let Some(inner) = self.table_inner {
                         if p.1 > inner.y && point_in(inner, p) {
                             let row = self.scroll + (p.1 - inner.y - 1) as usize;
-                            let max = self
-                                .sorted_results()
-                                .len()
-                                .min(self.config.top)
-                                .saturating_sub(1);
-                            self.result_cursor = row.min(max);
+                            match self.dashboard_view {
+                                ScanDashboardView::Results => {
+                                    let max = self
+                                        .sorted_results()
+                                        .len()
+                                        .min(self.config.top)
+                                        .saturating_sub(1);
+                                    self.result_cursor = row.min(max);
+                                }
+                                ScanDashboardView::LiveTargets => {
+                                    self.target_cursor = (self.target_render_start
+                                        + (p.1 - inner.y - 1) as usize)
+                                        .min(self.visible_target_ips().len().saturating_sub(1));
+                                }
+                                ScanDashboardView::RunLog => {
+                                    self.run_cursor = (self.run_render_start
+                                        + (p.1 - inner.y - 1) as usize)
+                                        .min(self.run_log_len().saturating_sub(1));
+                                }
+                            }
                         }
                     }
                 } else if self.screen == Screen::SpeedSelect {
@@ -3529,11 +4470,17 @@ impl App {
                 if self.screen == Screen::Wizard && self.wizard_step == WizardStep::Review {
                     // Re-run start via the spawn closure is not accessible here;
                     // instead set a flag handled by the run loop.
+                    self.pending_run_kind = RunKind::Full;
+                    self.pending_source_run_id = None;
                     self.pending_start = true;
                 }
             }
             ButtonAction::Quit => {
-                if self.screen == Screen::Scanning && !self.scan_complete {
+                if self.screen == Screen::Scanning
+                    && (!self.scan_complete
+                        || self.investigation.is_some()
+                        || self.pending_isolation.is_some())
+                {
                     self.confirm_quit = true;
                 } else if self.screen == Screen::Wizard && self.return_to_results {
                     self.return_to_results();
@@ -3543,13 +4490,17 @@ impl App {
             }
             ButtonAction::Save => self.save(),
             ButtonAction::PauseResume => {
-                let next = !self.paused.load(Ordering::Relaxed);
-                self.paused.store(next, Ordering::Relaxed);
-                self.scan_lifecycle = if next {
-                    ScanLifecycle::Paused
+                if self.paused.load(Ordering::Relaxed) {
+                    self.send_scan_control(ScanControl::ResumeScheduling);
                 } else {
-                    ScanLifecycle::Running
-                };
+                    self.send_scan_control(ScanControl::PauseScheduling);
+                }
+            }
+            ButtonAction::WorkerDown => self.adjust_runtime_worker_override(-1),
+            ButtonAction::WorkerUp => self.adjust_runtime_worker_override(1),
+            ButtonAction::WorkerAuto => self.clear_runtime_worker_override(),
+            ButtonAction::StopKeepResults => {
+                self.send_scan_control(ScanControl::StopAndKeepResults)
             }
             ButtonAction::SpeedTest => self.open_speed_selection(),
             ButtonAction::CustomizeScan => {
@@ -3608,15 +4559,16 @@ impl Drop for RestoreGuard {
 mod tests {
     use super::{
         build_current_manifest, export_tsv_line, ranked_export_results, Action, App, FocusTarget,
-        ProbeResult, ScanLifecycle, Screen, WizardStep,
+        InvestigationState, ProbeResult, RunKind, RunRecord, ScanDashboardView, ScanLifecycle,
+        Screen, TargetFilter, TargetSort, TargetStage, WizardStep,
     };
     use crate::config::AppConfig;
     use crate::scanner::{
-        DiagnosticCategory, DiagnosticPhase, ProbeDiagnostic, ProbeFailureCounts, ScanPhase,
-        ScanProgress,
+        DiagnosticCategory, DiagnosticPhase, ProbeDiagnostic, ProbeFailureCounts, ScanControl,
+        ScanEvent, ScanEventKind, ScanPhase, ScanProgress,
     };
     use crate::watch::{WatchPolicy, WatchState};
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::{backend::TestBackend, Terminal};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -3669,6 +4621,19 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(16));
     }
 
+    fn rendered(app: &mut App, w: u16, h: u16) -> String {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
     #[test]
     fn export_ranks_successes_and_applies_top_limit() {
         let results = vec![
@@ -3707,18 +4672,25 @@ mod tests {
     }
 
     #[test]
-    fn scanning_focus_map_keeps_quit_reachable() {
+    fn scanning_focus_map_keeps_stop_and_quit_reachable() {
         let mut app = App::new(
             AppConfig::default(),
             false,
             Arc::new(AtomicBool::new(false)),
         );
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        app.set_scan_control(control_tx);
         app.begin_scan(1);
-        assert_eq!(app.focus_count(), 3);
+        assert_eq!(app.focus_count(), 4);
         app.focus_index = 2;
         app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
-        assert!(app.confirm_quit);
+        assert_eq!(
+            control_rx.try_recv().unwrap(),
+            ScanControl::StopAndKeepResults
+        );
 
+        app.handle_key(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert!(app.confirm_quit);
         app.confirm_quit = false;
         app.scan_complete = true;
         assert_eq!(app.focus_count(), 5);
@@ -4301,6 +5273,7 @@ mod tests {
             adaptive_reason: None,
             targets_total: Some(500),
             failure_counts: ProbeFailureCounts::default(),
+            event: None,
         });
         assert!(app.results.is_empty());
         assert!(app.scan_started_ips.contains("192.0.2.1"));
@@ -4319,6 +5292,7 @@ mod tests {
             adaptive_reason: Some("steady".to_string()),
             targets_total: None,
             failure_counts: ProbeFailureCounts::default(),
+            event: None,
         });
         assert_eq!(app.scan_progress.targets_total, Some(500));
 
@@ -4327,6 +5301,590 @@ mod tests {
         assert_eq!(app.scan_progress.phase, ScanPhase::Starting);
         assert_eq!(app.scan_progress.probes_started, 0);
         assert_eq!(app.scan_progress.targets_completed, 0);
+    }
+
+    #[test]
+    fn structured_events_drive_live_target_activity_and_stay_bounded() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.set_scan_targets(vec!["192.0.2.7".to_string()]);
+        app.begin_scan(1);
+        let progress = |event| ScanProgress {
+            phase: ScanPhase::Probing,
+            probes_started: 1,
+            probes_completed: 1,
+            active_probes: 0,
+            targets_completed: 0,
+            latest_target: Some("192.0.2.7".to_string()),
+            current_workers: Some(1),
+            adaptive_reason: None,
+            targets_total: Some(1),
+            failure_counts: ProbeFailureCounts::default(),
+            event: Some(event),
+        };
+        app.apply_scan_progress(progress(ScanEvent {
+            kind: ScanEventKind::ProbeStarted,
+            target: Some("192.0.2.7".to_string()),
+            message: "probe started".to_string(),
+            diagnostic_category: None,
+            probe_succeeded: None,
+        }));
+        app.apply_scan_progress(progress(ScanEvent {
+            kind: ScanEventKind::ProbeCompleted,
+            target: Some("192.0.2.7".to_string()),
+            message: "request timeout".to_string(),
+            diagnostic_category: Some(DiagnosticCategory::Timeout),
+            probe_succeeded: Some(false),
+        }));
+        let target = app.target_activity.get("192.0.2.7").unwrap();
+        assert_eq!(target.stage, TargetStage::Probing);
+        assert_eq!(target.probes_started, 1);
+        assert_eq!(target.probes_completed, 1);
+        assert_eq!(target.failures, 1);
+        assert!(app.last_completion_at.is_some());
+        app.apply_scan_progress(progress(ScanEvent {
+            kind: ScanEventKind::TargetFinalized,
+            target: Some("192.0.2.7".to_string()),
+            message: "target finalized".to_string(),
+            diagnostic_category: Some(DiagnosticCategory::Timeout),
+            probe_succeeded: Some(false),
+        }));
+        let target = app.target_activity.get("192.0.2.7").unwrap();
+        assert_eq!(target.stage, TargetStage::Finalized);
+        assert_eq!(target.probes_completed, 1);
+        assert_eq!(target.failures, 1);
+
+        for index in 0..1_005 {
+            app.apply_scan_event(ScanEvent {
+                kind: ScanEventKind::WorkerChanged,
+                target: None,
+                message: format!("worker event {index}"),
+                diagnostic_category: None,
+                probe_succeeded: None,
+            });
+        }
+        assert_eq!(app.scan_events.len(), 1_000);
+        assert_eq!(
+            app.scan_events.front().unwrap().event.message,
+            "worker event 1004"
+        );
+    }
+
+    #[test]
+    fn scan_views_render_at_wide_compact_and_micro_sizes() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.set_scan_targets(vec!["192.0.2.1".to_string(), "192.0.2.2".to_string()]);
+        app.begin_scan(2);
+        app.add_result(result("192.0.2.1", 0, 0.02));
+        app.dashboard_view = ScanDashboardView::Results;
+        let wide = rendered(&mut app, 200, 40);
+        assert!(wide.contains("Results"));
+        assert!(wide.contains("Stop + keep"));
+        assert!(wide.contains("Quit"));
+
+        app.dashboard_view = ScanDashboardView::LiveTargets;
+        let compact = rendered(&mut app, 120, 28);
+        assert!(compact.contains("Live targets"));
+        assert!(compact.contains("filter all"));
+        assert!(compact.contains("sort attention"));
+        assert!(compact.contains("Stop + keep"));
+        assert!(compact.contains("Quit"));
+
+        let micro_targets = rendered(&mut app, 60, 20);
+        for label in ["Sel", "IP", "Stage", "Age"] {
+            assert!(micro_targets.contains(label), "missing {label}");
+        }
+        assert!(micro_targets.contains("stop"));
+        assert!(micro_targets.contains("quit"));
+
+        app.dashboard_view = ScanDashboardView::RunLog;
+        let micro_runs = rendered(&mut app, 60, 20);
+        for label in ["Run", "Kind", "State", "Results", "Elapsed"] {
+            assert!(micro_runs.contains(label), "missing {label}");
+        }
+        assert!(!micro_runs.contains("Run details & deltas"));
+    }
+
+    #[test]
+    fn isolate_and_targeted_rerun_use_selected_target_without_overwriting_results() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        app.set_scan_control(control_tx);
+        app.set_scan_targets(vec!["192.0.2.1".to_string()]);
+        app.begin_scan(1);
+        app.add_result(result("192.0.2.1", 0, 0.02));
+        app.handle_key(KeyCode::Char(' '), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('i'), KeyModifiers::NONE);
+        assert_eq!(
+            control_rx.try_recv().unwrap(),
+            ScanControl::IsolateTarget("192.0.2.1".to_string())
+        );
+        assert_eq!(app.results.len(), 1);
+
+        app.scan_complete = true;
+        app.handle_key(KeyCode::Char('R'), KeyModifiers::NONE);
+        assert_eq!(app.rescan_targets, Some(vec!["192.0.2.1".to_string()]));
+        assert_eq!(app.pending_run_kind, RunKind::Targeted);
+        assert_eq!(app.pending_source_run_id, Some(app.current_run_id));
+        assert!(app.pending_start);
+        assert_eq!(app.results.len(), 1);
+    }
+
+    #[test]
+    fn investigation_telemetry_is_separate_and_stop_cancels_every_job() {
+        let paused = Arc::new(AtomicBool::new(false));
+        let primary_cancel = Arc::new(AtomicBool::new(false));
+        let mut app = App::new(AppConfig::default(), false, paused.clone());
+        app.set_scan_targets(vec!["192.0.2.7".to_string()]);
+        app.begin_scan(1);
+        app.apply_scan_event(ScanEvent {
+            kind: ScanEventKind::ProbeStarted,
+            target: Some("192.0.2.7".to_string()),
+            message: "primary probe".to_string(),
+            diagnostic_category: None,
+            probe_succeeded: None,
+        });
+        let primary_activity = app.target_activity.get("192.0.2.7").unwrap().clone();
+        let primary_events = app.scan_events.len();
+
+        let mut investigation = InvestigationState::new(2, "192.0.2.7".to_string(), 1);
+        investigation.apply_event(ScanEvent {
+            kind: ScanEventKind::ProbeCompleted,
+            target: Some("192.0.2.7".to_string()),
+            message: "isolated timeout".to_string(),
+            diagnostic_category: Some(DiagnosticCategory::Timeout),
+            probe_succeeded: Some(false),
+        });
+        let investigation_cancel = investigation.cancel.clone();
+        app.investigation = Some(investigation);
+        app.pending_isolation = Some("198.51.100.9".to_string());
+
+        assert_eq!(
+            app.target_activity
+                .get("192.0.2.7")
+                .unwrap()
+                .probes_completed,
+            primary_activity.probes_completed
+        );
+        assert_eq!(app.scan_events.len(), primary_events);
+        assert_eq!(app.investigation.as_ref().unwrap().events.len(), 1);
+        assert_eq!(app.investigation.as_ref().unwrap().activity.failures, 1);
+
+        app.apply_runtime_control(ScanControl::StopAndKeepResults, &primary_cancel, &paused);
+        assert!(primary_cancel.load(Ordering::Relaxed));
+        assert!(investigation_cancel.load(Ordering::Relaxed));
+        assert!(app.pending_isolation.is_none());
+        assert_eq!(app.scan_lifecycle, ScanLifecycle::Cancelling);
+    }
+
+    #[test]
+    fn resume_clears_pending_isolation_but_never_interrupts_a_running_investigation() {
+        let paused = Arc::new(AtomicBool::new(true));
+        let primary_cancel = Arc::new(AtomicBool::new(false));
+        let mut app = App::new(AppConfig::default(), false, paused.clone());
+        app.set_scan_targets(vec!["192.0.2.7".to_string()]);
+        app.begin_scan(1);
+        app.pending_isolation = Some("192.0.2.7".to_string());
+        app.scan_lifecycle = ScanLifecycle::Paused;
+
+        app.apply_runtime_control(ScanControl::ResumeScheduling, &primary_cancel, &paused);
+        assert!(app.pending_isolation.is_none());
+        assert!(!paused.load(Ordering::Relaxed));
+        assert_eq!(app.scan_lifecycle, ScanLifecycle::Running);
+
+        let investigation = InvestigationState::new(2, "192.0.2.7".to_string(), 1);
+        let investigation_cancel = investigation.cancel.clone();
+        app.investigation = Some(investigation);
+        paused.store(true, Ordering::Relaxed);
+        app.apply_runtime_control(ScanControl::ResumeScheduling, &primary_cancel, &paused);
+        assert!(paused.load(Ordering::Relaxed));
+        assert!(!investigation_cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn completed_run_isolation_holds_watch_scheduling_until_explicit_resume() {
+        let paused = Arc::new(AtomicBool::new(false));
+        let primary_cancel = Arc::new(AtomicBool::new(false));
+        let mut app = App::new(AppConfig::default(), false, paused.clone());
+        app.set_scan_targets(vec!["192.0.2.7".to_string()]);
+        app.begin_scan(1);
+        app.scan_complete = true;
+        app.scan_lifecycle = ScanLifecycle::Completed;
+        app.apply_runtime_control(
+            ScanControl::IsolateTarget("192.0.2.7".to_string()),
+            &primary_cancel,
+            &paused,
+        );
+        assert!(paused.load(Ordering::Relaxed));
+        assert_eq!(app.scan_lifecycle, ScanLifecycle::Completed);
+        assert_eq!(app.pending_isolation.as_deref(), Some("192.0.2.7"));
+        let controls = rendered(&mut app, 120, 28);
+        assert!(controls.contains("Resume"));
+        assert!(controls.contains("Stop"));
+
+        app.apply_runtime_control(ScanControl::ResumeScheduling, &primary_cancel, &paused);
+        assert!(!paused.load(Ordering::Relaxed));
+        assert!(app.pending_isolation.is_none());
+    }
+
+    #[test]
+    fn watch_relaunch_requires_explicitly_resumed_idle_coordinator() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let now = Instant::now();
+        app.watch_due = Some(now);
+        assert!(app.watch_relaunch_ready(now, false));
+        assert!(!app.watch_relaunch_ready(now, true));
+
+        app.pending_isolation = Some("192.0.2.1".to_string());
+        assert!(!app.watch_relaunch_ready(now, false));
+        app.pending_isolation = None;
+        app.investigation = Some(InvestigationState::new(2, "192.0.2.1".to_string(), 1));
+        assert!(!app.watch_relaunch_ready(now, false));
+    }
+
+    #[test]
+    fn live_targets_attention_filter_sort_search_and_navigation_are_independent() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let targets = (1..=30)
+            .map(|index| format!("192.0.2.{index}"))
+            .collect::<Vec<_>>();
+        app.set_scan_targets(targets);
+        app.begin_scan(30);
+        let now = Instant::now();
+        {
+            let active = app.target_activity.get_mut("192.0.2.20").unwrap();
+            active.stage = TargetStage::Probing;
+            active.first_activity = Some(now - Duration::from_secs(30));
+        }
+        {
+            let active = app.target_activity.get_mut("192.0.2.10").unwrap();
+            active.stage = TargetStage::WarmingUp;
+            active.first_activity = Some(now - Duration::from_secs(60));
+        }
+        {
+            let failed = app.target_activity.get_mut("192.0.2.3").unwrap();
+            failed.stage = TargetStage::Finalized;
+            failed.failures = 1;
+        }
+        {
+            let done = app.target_activity.get_mut("192.0.2.4").unwrap();
+            done.stage = TargetStage::Finalized;
+        }
+        assert_eq!(app.visible_target_ips()[0], "192.0.2.10");
+        assert_eq!(app.visible_target_ips()[1], "192.0.2.20");
+
+        app.dashboard_view = ScanDashboardView::LiveTargets;
+        app.handle_key(KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(app.target_cursor, 10);
+        assert_eq!(app.result_cursor, 0);
+        app.handle_key(KeyCode::End, KeyModifiers::NONE);
+        assert_eq!(app.target_cursor, 29);
+        app.handle_key(KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(app.target_cursor, 0);
+
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::NONE);
+        assert_eq!(app.target_filter, TargetFilter::Active);
+        assert_eq!(app.visible_target_ips().len(), 2);
+        app.handle_key(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(app.target_sort, TargetSort::ActivityAge);
+        app.handle_key(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(app.target_sort, TargetSort::Stage);
+        app.handle_key(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(app.target_sort, TargetSort::Ip);
+        app.handle_key(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(app.target_sort, TargetSort::Attention);
+
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::NONE);
+        assert_eq!(app.target_filter, TargetFilter::Problems);
+        assert_eq!(app.visible_target_ips(), vec!["192.0.2.3"]);
+        app.selected_targets.insert("192.0.2.4".to_string());
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::NONE);
+        assert_eq!(app.target_filter, TargetFilter::Selected);
+        assert_eq!(app.visible_target_ips(), vec!["192.0.2.4"]);
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::NONE);
+        assert_eq!(app.target_filter, TargetFilter::All);
+
+        app.open_command_palette();
+        app.command_query = "target:.20".to_string();
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.dashboard_view, ScanDashboardView::LiveTargets);
+        assert_eq!(app.target_query, ".20");
+        assert_eq!(app.visible_target_ips(), vec!["192.0.2.20"]);
+    }
+
+    #[test]
+    fn mouse_target_selection_uses_the_rendered_scroll_origin() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.set_scan_targets((1..=40).map(|index| format!("192.0.2.{index}")).collect());
+        app.begin_scan(40);
+        app.dashboard_view = ScanDashboardView::LiveTargets;
+        app.target_cursor = 30;
+        draw(&mut app, 120, 20);
+        let inner = app.table_inner.unwrap();
+        let rendered_start = app.target_render_start;
+        assert!(rendered_start > 0);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x + 2,
+            row: inner.y + 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.target_cursor, rendered_start + 2);
+    }
+
+    #[test]
+    fn mouse_results_and_run_log_selection_follow_each_view_scroll() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.begin_scan(40);
+        for index in 1..=40 {
+            app.add_result(result(
+                &format!("192.0.2.{index}"),
+                0,
+                index as f64 / 1000.0,
+            ));
+        }
+        app.result_cursor = 30;
+        draw(&mut app, 120, 20);
+        let result_inner = app.table_inner.unwrap();
+        let result_start = app.scroll;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: result_inner.x + 2,
+            row: result_inner.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.result_cursor, result_start + 1);
+
+        for id in 2..=30 {
+            app.run_history.push_back(RunRecord {
+                id,
+                source_run_id: None,
+                kind: RunKind::Full,
+                targets: Vec::new(),
+                results: Vec::new(),
+                elapsed: Duration::from_secs(id),
+                lifecycle: ScanLifecycle::Completed,
+            });
+        }
+        app.dashboard_view = ScanDashboardView::RunLog;
+        app.run_cursor = 20;
+        draw(&mut app, 120, 20);
+        let run_inner = app.table_inner.unwrap();
+        let run_start = app.run_render_start;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: run_inner.x + 2,
+            row: run_inner.y + 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.run_cursor, run_start + 2);
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: run_inner.x + 2,
+            row: run_inner.y + 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.run_cursor, run_start + 3);
+    }
+
+    #[test]
+    fn run_comparison_uses_only_linked_provenance_and_displays_every_delta() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.set_scan_targets(vec!["192.0.2.1".to_string()]);
+        app.begin_scan(1);
+        let mut source = result("192.0.2.1", 0, 0.020);
+        source.avg = 0.010;
+        source.packet_loss = 0.10;
+        source.success_rate = 0.80;
+        source.colo = Some("FRA".to_string());
+        source.diagnostics.push(ProbeDiagnostic {
+            category: DiagnosticCategory::Timeout,
+            phase: DiagnosticPhase::ResponseHeaders,
+            message: "source timeout".to_string(),
+            status: None,
+            location: None,
+            elapsed_ms: Some(20.0),
+        });
+        app.results = vec![source];
+        let mut rerun = result("192.0.2.1", 1, 0.030);
+        rerun.avg = 0.015;
+        rerun.packet_loss = 0.20;
+        rerun.success_rate = 0.60;
+        rerun.colo = Some("AMS".to_string());
+        app.run_history.push_front(RunRecord {
+            id: 2,
+            source_run_id: Some(app.current_run_id),
+            kind: RunKind::Targeted,
+            targets: vec!["192.0.2.1".to_string()],
+            results: vec![rerun],
+            elapsed: Duration::from_secs(2),
+            lifecycle: ScanLifecycle::Completed,
+        });
+        app.dashboard_view = ScanDashboardView::RunLog;
+        app.run_cursor = 1;
+        let output = rendered(&mut app, 160, 40);
+        assert!(output.contains("Compared with source run #1"));
+        assert!(output.contains("avg +5.0ms"));
+        assert!(output.contains("p95 +10.0ms"));
+        assert!(output.contains("loss +10.0pp"));
+        assert!(output.contains("success -20.0pp"));
+        assert!(output.contains("colo FRA→AMS"));
+        assert!(output.contains("diagnostics -1"));
+
+        app.run_history[0].source_run_id = Some(2);
+        let self_output = rendered(&mut app, 160, 40);
+        assert!(self_output.contains("No source run is linked."));
+        app.run_history[0].source_run_id = Some(999);
+        let evicted_output = rendered(&mut app, 160, 40);
+        assert!(evicted_output.contains("Source run #999 is no longer retained."));
+    }
+
+    #[test]
+    fn history_eviction_preserves_linked_sources_when_an_unlinked_run_can_be_removed() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        for id in (1..=11).rev() {
+            app.run_history.push_back(RunRecord {
+                id,
+                source_run_id: (id == 11).then_some(1),
+                kind: RunKind::Full,
+                targets: vec![format!("192.0.2.{id}")],
+                results: Vec::new(),
+                elapsed: Duration::from_secs(1),
+                lifecycle: ScanLifecycle::Completed,
+            });
+        }
+        app.evict_run_history();
+        assert_eq!(app.run_history.len(), 10);
+        assert!(app.run_history.iter().any(|run| run.id == 1));
+        assert!(!app.run_history.iter().any(|run| run.id == 2));
+    }
+
+    #[test]
+    fn run_log_navigation_does_not_move_results_or_live_targets() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.screen = Screen::Scanning;
+        app.result_cursor = 3;
+        app.target_cursor = 4;
+        for id in 1..=20 {
+            app.run_history.push_back(RunRecord {
+                id,
+                source_run_id: None,
+                kind: RunKind::Full,
+                targets: Vec::new(),
+                results: Vec::new(),
+                elapsed: Duration::from_secs(id),
+                lifecycle: ScanLifecycle::Completed,
+            });
+        }
+        app.dashboard_view = ScanDashboardView::RunLog;
+        app.handle_key(KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(app.run_cursor, 10);
+        assert_eq!(app.result_cursor, 3);
+        assert_eq!(app.target_cursor, 4);
+        app.handle_key(KeyCode::End, KeyModifiers::NONE);
+        assert_eq!(app.run_cursor, 20);
+        app.handle_key(KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(app.run_cursor, 0);
+    }
+
+    #[test]
+    fn quit_and_edit_actions_stop_completed_scan_investigations() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        app.set_scan_control(control_tx);
+        app.begin_scan(1);
+        app.scan_complete = true;
+        app.scan_lifecycle = ScanLifecycle::Completed;
+        app.investigation = Some(InvestigationState::new(
+            2,
+            "192.0.2.1".to_string(),
+            app.current_run_id,
+        ));
+
+        app.activate_action(Action::CustomizeScan);
+        assert!(app.edit_after_stop);
+        assert_eq!(
+            control_rx.try_recv().unwrap(),
+            ScanControl::StopAndKeepResults
+        );
+
+        app.activate_button(super::ButtonAction::Quit);
+        assert!(app.confirm_quit);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.quit_after_cancel);
+        assert!(app
+            .investigation
+            .as_ref()
+            .unwrap()
+            .cancel
+            .load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn session_run_history_keeps_only_ten_runs() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        for index in 0..12 {
+            app.set_scan_targets(vec![format!("192.0.2.{index}")]);
+            app.begin_scan(1);
+            app.add_result(result(&format!("192.0.2.{index}"), 0, 0.02));
+            app.scan_complete = true;
+            app.scan_lifecycle = ScanLifecycle::Completed;
+        }
+        app.set_scan_targets(vec!["198.51.100.1".to_string()]);
+        app.begin_scan(1);
+        assert_eq!(app.run_history.len(), 10);
+        assert!(app
+            .run_history
+            .iter()
+            .all(|run| !run.targets.contains(&"192.0.2.0".to_string())));
     }
 
     #[test]

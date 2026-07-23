@@ -50,6 +50,53 @@ pub struct ScanProgress {
     pub targets_total: Option<usize>,
     #[serde(default)]
     pub failure_counts: ProbeFailureCounts,
+    /// The most recent structured scheduler event. Progress snapshots remain
+    /// lossy telemetry; consumers must not use this for work completion.
+    #[serde(default)]
+    pub event: Option<ScanEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanEventKind {
+    TargetQueued,
+    WarmupStarted,
+    ProbeStarted,
+    ProbeCompleted,
+    TargetFinalized,
+    WorkerChanged,
+    ScanFinalizing,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScanEvent {
+    pub kind: ScanEventKind,
+    pub target: Option<String>,
+    pub message: String,
+    pub diagnostic_category: Option<DiagnosticCategory>,
+    pub probe_succeeded: Option<bool>,
+}
+
+impl ScanEvent {
+    fn new(kind: ScanEventKind, target: Option<String>, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            target,
+            message: message.into(),
+            diagnostic_category: None,
+            probe_succeeded: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanControl {
+    PauseScheduling,
+    ResumeScheduling,
+    SetWorkers(usize),
+    AutomaticWorkers,
+    IsolateTarget(String),
+    StopAndKeepResults,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
@@ -114,6 +161,13 @@ fn send_progress(
             adaptive_reason: None,
             targets_total,
             failure_counts,
+            event: (phase == ScanPhase::Finalizing).then(|| {
+                ScanEvent::new(
+                    ScanEventKind::ScanFinalizing,
+                    None,
+                    "finalizing scan results",
+                )
+            }),
         };
         let _ = tx.try_send(snapshot);
     }
@@ -131,6 +185,7 @@ fn send_progress_with_workers(
     current_workers: usize,
     adaptive_reason: Option<&str>,
     failure_counts: ProbeFailureCounts,
+    event: Option<ScanEvent>,
 ) {
     if let Some(tx) = progress {
         let _ = tx.try_send(ScanProgress {
@@ -144,6 +199,7 @@ fn send_progress_with_workers(
             adaptive_reason: adaptive_reason.map(str::to_string),
             targets_total: None,
             failure_counts,
+            event,
         });
     }
 }
@@ -1664,6 +1720,15 @@ fn reconcile_worker_permits(sem: &Semaphore, workers: usize, active_futures: usi
     }
 }
 
+fn scheduler_can_launch(
+    cancelled: bool,
+    paused: bool,
+    active_futures: usize,
+    workers: usize,
+) -> bool {
+    !cancelled && !paused && active_futures < workers
+}
+
 fn adaptive_progress_reason(
     decision: &crate::adaptive::Decision,
     applied: crate::adaptive::ApplyResult,
@@ -1752,7 +1817,31 @@ async fn run_scan_port(
         workers,
         adaptive_reason.as_deref(),
         failure_counts,
+        Some(ScanEvent::new(
+            ScanEventKind::WorkerChanged,
+            None,
+            format!("scheduler using {workers} workers"),
+        )),
     );
+    if let Some(state) = states.first() {
+        send_progress_with_workers(
+            progress.as_ref(),
+            warming_phase,
+            probes_started,
+            probes_completed,
+            futs.len(),
+            targets_completed,
+            Some(state.ip.clone()),
+            workers,
+            adaptive_reason.as_deref(),
+            failure_counts,
+            Some(ScanEvent::new(
+                ScanEventKind::TargetQueued,
+                Some(state.ip.clone()),
+                format!("{} targets queued", states.len()),
+            )),
+        );
+    }
 
     for state in &mut states {
         if state.completed == probe_count {
@@ -1786,11 +1875,21 @@ async fn run_scan_port(
             adaptive_reason = Some(format!("manual worker override: {workers}"));
             reconcile_worker_permits(&sem, workers, futs.len());
         }
-        while !cancel.load(Ordering::Relaxed) && futs.len() < workers {
-            while paused.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            if cancel.load(Ordering::Relaxed) {
+        while scheduler_can_launch(
+            cancel.load(Ordering::Relaxed),
+            paused.load(Ordering::Relaxed),
+            futs.len(),
+            workers,
+        ) {
+            // Pausing stops new scheduling, but completed in-flight futures
+            // must still be polled below so the dashboard can observe a
+            // truthful drain to zero active probes.
+            if !scheduler_can_launch(
+                cancel.load(Ordering::Relaxed),
+                paused.load(Ordering::Relaxed),
+                futs.len(),
+                workers,
+            ) {
                 break;
             }
 
@@ -1844,6 +1943,11 @@ async fn run_scan_port(
                     workers,
                     adaptive_reason.as_deref(),
                     failure_counts,
+                    Some(ScanEvent::new(
+                        ScanEventKind::WarmupStarted,
+                        Some(state.ip.clone()),
+                        "warmup probe started",
+                    )),
                 );
                 let sem = sem.clone();
                 let cancel = cancel.clone();
@@ -1881,6 +1985,11 @@ async fn run_scan_port(
                 workers,
                 adaptive_reason.as_deref(),
                 failure_counts,
+                Some(ScanEvent::new(
+                    ScanEventKind::ProbeStarted,
+                    Some(state.ip.clone()),
+                    format!("probe {} started", state.scheduled),
+                )),
             );
             let sem = sem.clone();
             let cancel = cancel.clone();
@@ -1898,6 +2007,10 @@ async fn run_scan_port(
         }
 
         if futs.is_empty() {
+            if paused.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
             break;
         }
 
@@ -1979,6 +2092,16 @@ async fn run_scan_port(
                         }
                         probes_completed += 1;
                         state.completed += 1;
+                        let mut progress_event = ScanEvent::new(
+                            ScanEventKind::ProbeCompleted,
+                            Some(state.ip.clone()),
+                            format!("probe {} completed", state.completed),
+                        );
+                        progress_event.probe_succeeded = Some(sample.is_ok());
+                        if let Err(diagnostic) = &sample {
+                            progress_event.diagnostic_category = Some(diagnostic.category);
+                            progress_event.message = diagnostic.message.clone();
+                        }
                         let construction_failed = matches!(
                             &sample,
                             Err(diagnostic)
@@ -2138,11 +2261,33 @@ async fn run_scan_port(
                             probes_completed,
                             futs.len(),
                             targets_completed,
-                            completed_target,
+                            completed_target.clone(),
                             workers,
                             adaptive_reason.as_deref(),
                             failure_counts,
+                            Some(progress_event.clone()),
                         );
+                        if completed_target.is_some() {
+                            send_progress_with_workers(
+                                progress.as_ref(),
+                                probing_phase,
+                                probes_started,
+                                probes_completed,
+                                futs.len(),
+                                targets_completed,
+                                completed_target.clone(),
+                                workers,
+                                adaptive_reason.as_deref(),
+                                failure_counts,
+                                Some(ScanEvent {
+                                    kind: ScanEventKind::TargetFinalized,
+                                    target: completed_target.clone(),
+                                    message: "target finalized".to_string(),
+                                    diagnostic_category: progress_event.diagnostic_category,
+                                    probe_succeeded: progress_event.probe_succeeded,
+                                }),
+                            );
+                        }
                     }
                 }
             }
@@ -2833,14 +2978,19 @@ mod tests {
         adaptive_progress_reason, bootstrap_score_interval, cidr_valid,
         collect_from_cidrs_with_seed, https_authority, merge_port_results, merge_profile_results,
         parse_colo, reconcile_worker_permits, record_best, remaining_measured_work,
-        resolve_host_for_ip, result_confidence, result_status, score_from_samples,
-        select_focus_cidrs, select_next_scan_index, select_next_target, select_next_warmup,
-        should_stop_early, validate_response, wilson_interval, DiagnosticCategory, DiagnosticPhase,
-        ProbeDiagnostic, ProbeFailureCounts, ProbeResult, ReadyQueue, TargetState,
+        resolve_host_for_ip, result_confidence, result_status, scheduler_can_launch,
+        score_from_samples, select_focus_cidrs, select_next_scan_index, select_next_target,
+        select_next_warmup, should_stop_early, validate_response, wilson_interval,
+        DiagnosticCategory, DiagnosticPhase, ProbeDiagnostic, ProbeFailureCounts, ProbeResult,
+        ReadyQueue, TargetState,
     };
     use crate::adaptive::{Action, ApplyResult, Decision, SignalDirection};
     use crate::config::{AppConfig, HealthCheck};
-    use tokio::sync::Semaphore;
+    use futures::{stream::FuturesUnordered, StreamExt};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{oneshot, Semaphore};
 
     fn diagnostic(category: DiagnosticCategory, phase: DiagnosticPhase) -> ProbeDiagnostic {
         ProbeDiagnostic {
@@ -3055,6 +3205,71 @@ mod tests {
         reconcile_worker_permits(&sem, 4, 1);
         assert_eq!(sem.available_permits(), 3);
         drop(second);
+    }
+
+    #[tokio::test]
+    async fn paused_scheduler_drains_in_flight_work_without_replacement() {
+        let paused = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let workers = 2;
+        let mut scheduled = 0usize;
+        let mut completions = FuturesUnordered::new();
+        let mut releases = Vec::new();
+
+        while scheduler_can_launch(
+            cancelled.load(Ordering::Relaxed),
+            paused.load(Ordering::Relaxed),
+            completions.len(),
+            workers,
+        ) {
+            let (release, completion) = oneshot::channel();
+            releases.push(release);
+            completions.push(async move {
+                completion.await.expect("completion signal");
+            });
+            scheduled += 1;
+        }
+        assert_eq!(scheduled, 2);
+
+        paused.store(true, Ordering::Relaxed);
+        for release in releases {
+            release.send(()).expect("release in-flight work");
+            completions.next().await.expect("drained completion");
+            assert!(!scheduler_can_launch(
+                cancelled.load(Ordering::Relaxed),
+                paused.load(Ordering::Relaxed),
+                completions.len(),
+                workers,
+            ));
+        }
+        assert_eq!(scheduled, 2);
+        assert!(completions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_isolated_profile_terminates_without_starting_network_work() {
+        let config = Arc::new(AppConfig {
+            warmup: true,
+            probes: 10,
+            ..AppConfig::default()
+        });
+        let cancel = Arc::new(AtomicBool::new(true));
+        let paused = Arc::new(AtomicBool::new(false));
+        let (tx, _rx) = std::sync::mpsc::channel();
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            super::run_profile_scan_with_progress(
+                vec!["192.0.2.1".to_string()],
+                config,
+                tx,
+                cancel,
+                paused,
+                None,
+            ),
+        )
+        .await
+        .expect("cancelled investigation should terminate promptly");
     }
 
     #[test]
