@@ -244,20 +244,29 @@ fn render_scan_tabs(app: &mut App, frame: &mut Frame, area: Rect) {
         .iter()
         .position(|view| *view == app.dashboard_view)
         .unwrap_or(0);
-    let tab_width = area.width / ScanDashboardView::ALL.len() as u16;
+
+    // Compute actual rendered tab widths: each tab is " label " (padding on both sides),
+    // separated by "│" divider (1 char). Layout is: " label1 │ label2 │ label3 "
+    let mut x_offset = area.x;
     app.dashboard_tabs = ScanDashboardView::ALL
         .iter()
         .enumerate()
         .map(|(index, view)| {
-            let x = area.x + tab_width.saturating_mul(index as u16);
-            let width = if index + 1 == ScanDashboardView::ALL.len() {
-                area.right().saturating_sub(x)
+            let label = view.label();
+            // Tab width: 1 (left padding) + label length + 1 (right padding)
+            let tab_width = 1 + label.len() as u16 + 1;
+            // Add divider width (1 char) if not the last tab
+            let width_with_divider = if index + 1 < ScanDashboardView::ALL.len() {
+                tab_width + 1
             } else {
                 tab_width
             };
-            (Rect::new(x, area.y, width, area.height), *view)
+            let rect = Rect::new(x_offset, area.y, width_with_divider, area.height);
+            x_offset = x_offset.saturating_add(width_with_divider);
+            (rect, *view)
         })
         .collect();
+
     frame.render_widget(
         Tabs::new(labels)
             .select(selected)
