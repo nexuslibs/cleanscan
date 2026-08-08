@@ -114,8 +114,11 @@ rather than the discontinued Play Store build. Then install the required tools:
 
 ```sh
 pkg update
-pkg install curl tar
+pkg install curl tar ca-certificates
 ```
+
+`ca-certificates` provides the system TLS roots that cleanscan loads for HTTPS
+probes; without it, TLS verification has no trust anchors.
 
 Install the latest cleanscan release directly into Termux's `$PREFIX/bin`:
 

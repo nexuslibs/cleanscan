@@ -436,6 +436,9 @@ pub fn result_status(result: &ProbeResult) -> &'static str {
 }
 
 pub fn result_confidence(result: &ProbeResult) -> &'static str {
+    if result.ok == 0 {
+        return "UNKNOWN";
+    }
     match result.completed {
         0..=2 => "UNKNOWN",
         3..=7 => "LOW",
@@ -3444,6 +3447,15 @@ mod tests {
         assert_eq!(result_status(&result), "READY");
         assert_eq!(result_confidence(&result), "HIGH");
         assert_eq!(result.success_rate, 1.0);
+    }
+
+    #[test]
+    fn dead_targets_never_report_confidence() {
+        let mut state = state("192.0.2.1", 20, 20, &[], 20);
+        let result = state.result();
+        assert_eq!(result.ok, 0);
+        assert_eq!(result.completed, 20);
+        assert_eq!(result_confidence(&result), "UNKNOWN");
     }
 
     #[test]

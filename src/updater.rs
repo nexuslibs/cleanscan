@@ -67,7 +67,12 @@ fn release_update(release: &Release) -> Result<UpdateInfo> {
 }
 
 fn target() -> Option<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
+    target_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn target_for(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("android", "aarch64") => Some("aarch64-unknown-linux-musl"),
         ("linux", "x86_64") => Some("x86_64-unknown-linux-musl"),
         ("linux", "aarch64") => Some("aarch64-unknown-linux-musl"),
         ("linux", "arm") => Some("armv7-unknown-linux-musleabihf"),
@@ -322,6 +327,27 @@ mod tests {
             parse_version(env!("CARGO_PKG_VERSION")).unwrap(),
             current_version()
         );
+    }
+
+    #[test]
+    fn target_maps_every_release_platform() {
+        assert_eq!(target_for("linux", "x86_64"), Some("x86_64-unknown-linux-musl"));
+        assert_eq!(
+            target_for("linux", "aarch64"),
+            Some("aarch64-unknown-linux-musl")
+        );
+        assert_eq!(
+            target_for("linux", "arm"),
+            Some("armv7-unknown-linux-musleabihf")
+        );
+        assert_eq!(target_for("linux", "x86"), Some("i686-unknown-linux-musl"));
+        assert_eq!(target_for("macos", "x86_64"), Some("x86_64-apple-darwin"));
+        assert_eq!(target_for("macos", "aarch64"), Some("aarch64-apple-darwin"));
+        assert_eq!(
+            target_for("android", "aarch64"),
+            Some("aarch64-unknown-linux-musl")
+        );
+        assert_eq!(target_for("windows", "aarch64"), None);
     }
 
     #[test]

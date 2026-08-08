@@ -789,6 +789,23 @@ pub(crate) fn write_manifest(path: &str, manifest: &Manifest) -> Result<()> {
     result
 }
 
+/// Whether `--colo`/`--country` filtering can read the `colo=` field the
+/// probe body must expose. The default `/cdn-cgi/trace` path provides it;
+/// other paths usually do not, so the filtered output would silently be empty.
+fn colo_filter_may_be_empty(path: &str, colo: &Option<String>, country: &Option<String>) -> bool {
+    (colo.is_some() || country.is_some()) && !path.contains("cdn-cgi/trace")
+}
+
+fn warn_if_colo_filter_uninformative(path: &str, colo: &Option<String>, country: &Option<String>) {
+    if colo_filter_may_be_empty(path, colo, country) {
+        eprintln!(
+            "warning: --colo/--country filters rely on the `colo=` field in the probe body; \
+             the configured path {path:?} usually does not expose it, so the filtered output \
+             may be empty"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cli_mode(
     config: AppConfig,
@@ -911,6 +928,7 @@ fn cli_mode(
     // that were never sampled.
     let mut results: Vec<scanner::ProbeResult> = rx.iter().collect();
 
+    warn_if_colo_filter_uninformative(&config.path, &colo, &country);
     if let Some(colo) = &colo {
         let want = colo.to_ascii_uppercase();
         results.retain(|r| {
@@ -932,41 +950,40 @@ fn cli_mode(
     results.sort_by(crate::tui::App::natural_cmp);
 
     if let Some(raw_proxy_url) = proxy_url {
-        if let Ok(transport) = proxy::parse_share_url(raw_proxy_url) {
-            let checks = results
-                .iter()
-                .filter(|result| result.ok > 0)
-                .take(protocol_check_top)
-                .map(|result| proxy::check_candidate(&transport, &result.ip, config.timeout_ms))
-                .collect::<Vec<_>>();
-            let checks = rt.block_on(
-                futures::stream::iter(checks)
-                    .buffer_unordered(config.concurrency.max(1))
-                    .collect::<Vec<_>>(),
-            );
+        let transport = proxy::parse_share_url(raw_proxy_url)?;
+        let checks = results
+            .iter()
+            .filter(|result| result.ok > 0)
+            .take(protocol_check_top)
+            .map(|result| proxy::check_candidate(&transport, &result.ip, config.timeout_ms))
+            .collect::<Vec<_>>();
+        let checks = rt.block_on(
+            futures::stream::iter(checks)
+                .buffer_unordered(config.concurrency.max(1))
+                .collect::<Vec<_>>(),
+        );
+        eprintln!(
+            "protocol transport: {} {}:{} via {} (top {})",
+            transport.protocol,
+            transport.address,
+            transport.port,
+            transport.network,
+            protocol_check_top
+        );
+        for check in checks {
             eprintln!(
-                "protocol transport: {} {}:{} via {} (top {})",
-                transport.protocol,
-                transport.address,
-                transport.port,
-                transport.network,
-                protocol_check_top
+                "protocol_check\tip={}\ttcp={}\ttls={}\tlong_tls={}\tws_reached={}\tws_accepted={}\telapsed_ms={:.1}\terror={}",
+                check.ip,
+                check.tcp_ok,
+                check.tls_ok,
+                check.long_tls_ok,
+                check.websocket_reached
+                    .map_or_else(|| "-".into(), |v| v.to_string()),
+                check.websocket_accepted
+                    .map_or_else(|| "-".into(), |v| v.to_string()),
+                check.elapsed_ms,
+                check.error.unwrap_or_default()
             );
-            for check in checks {
-                eprintln!(
-                    "protocol_check\tip={}\ttcp={}\ttls={}\tlong_tls={}\tws_reached={}\tws_accepted={}\telapsed_ms={:.1}\terror={}",
-                    check.ip,
-                    check.tcp_ok,
-                    check.tls_ok,
-                    check.long_tls_ok,
-                    check.websocket_reached
-                        .map_or_else(|| "-".into(), |v| v.to_string()),
-                    check.websocket_accepted
-                        .map_or_else(|| "-".into(), |v| v.to_string()),
-                    check.elapsed_ms,
-                    check.error.unwrap_or_default()
-                );
-            }
         }
     }
     let healthy = results.iter().any(|result| {
@@ -1136,6 +1153,7 @@ fn cli_watch(
             Arc::new(AtomicBool::new(false)),
         ));
         let mut results: Vec<scanner::ProbeResult> = rx.iter().collect();
+        warn_if_colo_filter_uninformative(&config.path, &colo, &country);
         if let Some(want) = &colo {
             results.retain(|r| {
                 r.colo
@@ -1303,8 +1321,8 @@ fn cli_watch(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_manifest, healthy_result, normalize_config, write_manifest, Args, Command,
-        HealthThresholds,
+        build_manifest, colo_filter_may_be_empty, healthy_result, normalize_config, write_manifest,
+        Args, Command, HealthThresholds,
     };
     use crate::config::AppConfig;
     use crate::scanner;
@@ -1455,6 +1473,21 @@ mod tests {
             },
             "UNKNOWN"
         ));
+    }
+
+    #[test]
+    fn colo_filters_only_warn_when_path_cannot_expose_colo() {
+        let colo = Some("FRA".to_string());
+        let country = None;
+        assert!(!colo_filter_may_be_empty("/cdn-cgi/trace", &colo, &country));
+        assert!(!colo_filter_may_be_empty("/cdn-cgi/trace", &None, &None));
+        assert!(colo_filter_may_be_empty("/health", &colo, &country));
+        assert!(!colo_filter_may_be_empty(
+            "/cdn-cgi/trace",
+            &None,
+            &Some("x".to_string())
+        ));
+        assert!(!colo_filter_may_be_empty("/health", &None, &None));
     }
 
     #[test]

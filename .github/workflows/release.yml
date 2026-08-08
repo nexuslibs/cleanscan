@@ -139,9 +139,26 @@ jobs:
         if: contains(matrix.target, 'linux-musl')
         run: cargo install cargo-zigbuild
 
-      - name: Build (Linux musl, static)
+      - name: Build (Linux musl, static PIE)
         if: contains(matrix.target, 'linux-musl')
+        env:
+          RUSTFLAGS: -C relocation-model=pie -C link-arg=-static -C link-arg=-pie
         run: cargo zigbuild --release --target ${{ matrix.target }}
+
+      - name: Verify musl artifact is a static PIE
+        if: contains(matrix.target, 'linux-musl')
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/cleanscan"
+          e_type="$(readelf -h "$binary" | awk '/Type:/{print $2}')"
+          test "$e_type" = "DYN" || {
+            echo "expected DYN (position-independent executable), got: $e_type" >&2
+            exit 1
+          }
+          test -z "$(readelf -l "$binary" | awk '/INTERP/{print $2}')" || {
+            echo "expected a fully static binary without an interpreter" >&2
+            exit 1
+          }
 
       - name: Build (macOS)
         if: contains(matrix.target, 'apple-darwin')
