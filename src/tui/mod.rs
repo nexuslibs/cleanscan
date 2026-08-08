@@ -3254,6 +3254,7 @@ fn col_at(bounds: &[(u16, u16)], x: u16) -> Option<usize> {
 }
 
 /// Restores the terminal when dropped, guaranteeing cleanup on every exit path.
+/// yeah
 struct RestoreGuard;
 
 impl Drop for RestoreGuard {
