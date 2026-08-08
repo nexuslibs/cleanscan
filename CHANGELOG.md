@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.28.0](https://github.com/nexuslibs/cleanscan/compare/v0.27.0...v0.28.0) (2026-08-08)
+
+
+### Features
+
+* enhance argument validation and deduplication logic in main and TUI modules ([82ffeb0](https://github.com/nexuslibs/cleanscan/commit/82ffeb000f9a21723b5734be0b5031ba4f8235aa))
+
 ## [0.27.0](https://github.com/nexuslibs/cleanscan/compare/v0.26.0...v0.27.0) (2026-08-08)
 
 
