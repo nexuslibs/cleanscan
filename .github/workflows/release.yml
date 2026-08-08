@@ -190,7 +190,7 @@ jobs:
             echo "expected DYN (static PIE; Termux/Bionic rejects ET_EXEC), got: $e_type" >&2
             exit 1
           }
-          test -z "$(readelf -l "$binary" | awk '/INTERP/{print $2}')" || {
+          test -z "$(readelf -W -l "$binary" | awk '/INTERP/{print $2}')" || {
             echo "expected a fully static binary without an interpreter" >&2
             exit 1
           }
@@ -200,7 +200,7 @@ jobs:
             *) min_tls_align=0 ;;
           esac
           if [ "$min_tls_align" -gt 0 ]; then
-            tls="$(readelf -l "$binary" | awk '/  TLS  /{print $3, $NF; exit}')"
+            tls="$(readelf -W -l "$binary" | awk '/  TLS  /{print $3, $NF; exit}')"
             test -n "$tls" || { echo "no TLS segment found" >&2; exit 1; }
             set -- $tls
             vaddr="${1#0x}"
@@ -254,12 +254,12 @@ jobs:
             echo "expected DYN (PIE), got: $e_type" >&2
             exit 1
           }
-          actual_interp="$(readelf -l "$binary" | awk '/interpreter/{print $NF}' | tr -d ']')"
+          actual_interp="$(readelf -W -l "$binary" | awk '/interpreter/{print $NF}' | tr -d ']')"
           test "$actual_interp" = "$expected_interp" || {
             echo "expected interpreter $expected_interp, got: $actual_interp" >&2
             exit 1
           }
-          align="$(readelf -l "$binary" | awk '/LOAD/{print $NF; exit}')"
+          align="$(readelf -W -l "$binary" | awk '/LOAD/{print $NF; exit}')"
           align="${align#0x}"
           test $(( 16#$align )) -ge 16384 || {
             echo "LOAD alignment $align is below 16K required by Android 15+ devices" >&2
