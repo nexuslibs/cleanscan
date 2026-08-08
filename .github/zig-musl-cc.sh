@@ -17,7 +17,7 @@ esac
 args=()
 for a in "$@"; do
   case "$a" in
-    --target=*) : ;;
+    --target=*|-melf_i386|-Wl,-melf_i386) : ;;
     *) args+=("$a") ;;
   esac
 done
