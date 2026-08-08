@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.30.3](https://github.com/nexuslibs/cleanscan/compare/v0.30.2...v0.30.3) (2026-08-08)
+
+
+### Bug Fixes
+
+* update RUSTFLAGS to specify linker for Android build ([7d2cb12](https://github.com/nexuslibs/cleanscan/commit/7d2cb123f4fc864a1c38d02911d5a9486676708b))
+
 ## [0.30.2](https://github.com/nexuslibs/cleanscan/compare/v0.30.1...v0.30.2) (2026-08-08)
 
 
