@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.30.0](https://github.com/nexuslibs/cleanscan/compare/v0.29.0...v0.30.0) (2026-08-08)
+
+
+### Features
+
+* add Android build support and update related documentation ([c90af02](https://github.com/nexuslibs/cleanscan/commit/c90af02dbff78297968d38b4197354086166c7a7))
+
 ## [0.29.0](https://github.com/nexuslibs/cleanscan/compare/v0.28.4...v0.29.0) (2026-08-08)
 
 
