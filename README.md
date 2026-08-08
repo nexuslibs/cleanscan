@@ -105,8 +105,8 @@ the current supported target. It validates the archive contents and performs
 an atomic replacement; it never invokes a shell installer or `sudo`. Use
 `--no-update-check` or `CLEANSCAN_NO_UPDATE_CHECK=1` when a normal scan must not
 attempt the release check at all. Supported targets are Linux x86_64, ARM64,
-ARMv7, and i686, Android (Termux) ARM64/ARMv7/x86_64/i686, plus macOS Intel
-and Apple Silicon.
+and ARMv7, Android (Termux) ARM64/ARMv7/x86_64, plus macOS Intel and Apple
+Silicon.
 
 ### Termux (Android terminal)
 

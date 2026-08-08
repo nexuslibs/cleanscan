@@ -52,15 +52,13 @@ case "$ARCH" in
   x86_64|amd64)  ARCH_KIND=x86_64 ;;
   aarch64|arm64) ARCH_KIND=aarch64 ;;
   armv7l|armv7)  ARCH_KIND=armv7 ;;
-  i686|i386|x86) ARCH_KIND=i686 ;;
-  *) err "unsupported architecture: $ARCH (supported: x86_64, aarch64, armv7, i686)" ;;
+  *) err "unsupported architecture: $ARCH (supported: x86_64, aarch64, armv7)" ;;
 esac
 
 if [ "$IS_TERMUX" -eq 1 ]; then
   [ "$OS_KIND" = "linux" ] || err "Termux must run on Linux"
   case "$ARCH_KIND" in
     armv7) TARGET="armv7-linux-androideabi" ;;
-    i686) TARGET="i686-linux-android" ;;
     *) TARGET="${ARCH_KIND}-linux-android" ;;
   esac
 elif [ "$OS_KIND" = "darwin" ]; then

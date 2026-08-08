@@ -99,15 +99,11 @@ jobs:
             os: ubuntu-latest
           - target: armv7-unknown-linux-musleabihf
             os: ubuntu-latest
-          - target: i686-unknown-linux-musl
-            os: ubuntu-latest
           - target: aarch64-linux-android
             os: ubuntu-latest
           - target: armv7-linux-androideabi
             os: ubuntu-latest
           - target: x86_64-linux-android
-            os: ubuntu-latest
-          - target: i686-linux-android
             os: ubuntu-latest
           - target: x86_64-apple-darwin
             os: macos-latest
@@ -225,7 +221,6 @@ jobs:
             aarch64-*)  cc="$tc/aarch64-linux-android24-clang" ;;
             armv7-*)    cc="$tc/armv7a-linux-androideabi24-clang" ;;
             x86_64-*)   cc="$tc/x86_64-linux-android24-clang" ;;
-            i686-*)     cc="$tc/i686-linux-android24-clang" ;;
           esac
           cc_var="CC_${target//-/_}"
           cxx_var="CXX_${target//-/_}"
@@ -246,7 +241,7 @@ jobs:
         run: |
           binary="target/${{ matrix.target }}/release/cleanscan"
           case "${{ matrix.target }}" in
-            armv7-*|i686-*) expected_interp="/system/bin/linker" ;;
+            armv7-*) expected_interp="/system/bin/linker" ;;
             *) expected_interp="/system/bin/linker64" ;;
           esac
           e_type="$(readelf -h "$binary" | awk '/Type:/{print $2}')"
