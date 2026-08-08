@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.30.5](https://github.com/nexuslibs/cleanscan/compare/v0.30.4...v0.30.5) (2026-08-08)
+
+
+### Bug Fixes
+
+* update readelf commands for static binary checks to ensure Android compatibility ([2f16669](https://github.com/nexuslibs/cleanscan/commit/2f166692392112d53f633a49c9a7044c490e8325))
+
 ## [0.30.4](https://github.com/nexuslibs/cleanscan/compare/v0.30.3...v0.30.4) (2026-08-08)
 
 
