@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.30.1](https://github.com/nexuslibs/cleanscan/compare/v0.30.0...v0.30.1) (2026-08-08)
+
+
+### Bug Fixes
+
+* remove i686 target support from build and installation scripts ([15b40c7](https://github.com/nexuslibs/cleanscan/commit/15b40c763c5a6e3b7d8eda207035c901a44f053c))
+
 ## [0.30.0](https://github.com/nexuslibs/cleanscan/compare/v0.29.0...v0.30.0) (2026-08-08)
 
 
