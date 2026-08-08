@@ -1559,7 +1559,13 @@ impl App {
         activity.last_activity = Some(now);
         activity.last_outcome = crate::scanner::result_status(&result).to_string();
         self.last_completion_at = Some(now);
-        self.results.push(result);
+        // Multi-port and multi-check scans forward per-port/per-check rows and
+        // then the merged aggregate; keep only the latest (merged) row per IP.
+        if let Some(existing) = self.results.iter_mut().find(|r| r.ip == result.ip) {
+            *existing = result;
+        } else {
+            self.results.push(result);
+        }
         self.results_revision = self.results_revision.wrapping_add(1);
         self.sorted_cache.borrow_mut().take();
     }

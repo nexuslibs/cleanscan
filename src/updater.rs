@@ -72,7 +72,10 @@ fn target() -> Option<&'static str> {
 
 fn target_for(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
+        ("android", "x86_64") => Some("x86_64-unknown-linux-musl"),
         ("android", "aarch64") => Some("aarch64-unknown-linux-musl"),
+        ("android", "arm") => Some("armv7-unknown-linux-musleabihf"),
+        ("android", "x86") => Some("i686-unknown-linux-musl"),
         ("linux", "x86_64") => Some("x86_64-unknown-linux-musl"),
         ("linux", "aarch64") => Some("aarch64-unknown-linux-musl"),
         ("linux", "arm") => Some("armv7-unknown-linux-musleabihf"),

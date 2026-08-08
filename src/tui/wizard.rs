@@ -69,6 +69,10 @@ const MAX_SPEED_REPETITIONS: usize = 100;
 const MAX_SPEED_TIMEOUT_MS: u64 = 3_600_000;
 
 impl SettingField {
+    /// Values the adaptive score intervals accept. `main` rejects any other
+    /// value, so the wizard must never persist anything outside this set.
+    const CONFIDENCE_LEVELS: [f64; 3] = [0.90, 0.95, 0.99];
+
     /// All settings fields in display order, grouped by concern. Group
     /// boundaries are described by [`SettingField::GROUPS`].
     pub const ALL: [SettingField; 36] = [
@@ -204,7 +208,7 @@ impl SettingField {
             SettingField::AdaptiveConcurrency => "Adjust worker concurrency from recent timeout, failure, and latency signals; fixed concurrency remains the default.",
             SettingField::MinConcurrency => "Lower worker bound used by adaptive concurrency.",
             SettingField::MaxConcurrency => "Upper worker bound used by adaptive concurrency.",
-            SettingField::Confidence => "Confidence level used by adaptive score intervals, from 0 to 1.",
+            SettingField::Confidence => "Confidence level used by adaptive score intervals. Must be exactly 0.90, 0.95, or 0.99.",
         }
     }
 
@@ -364,26 +368,35 @@ impl SettingField {
         match self {
             SettingField::StabilityWeight | SettingField::LossWeight => 0.1,
             SettingField::EarlyStopPruneMargin | SettingField::DiscoverFraction => 0.05,
-            SettingField::Confidence => 0.05,
             _ => unreachable!("fractional_step called for an integer field"),
         }
     }
 
     fn nudged_fractional_value(&self, value: f64, direction: i64) -> f64 {
-        let lower = if matches!(self, SettingField::Confidence) {
-            0.01
+        if matches!(self, SettingField::Confidence) {
+            let current = Self::CONFIDENCE_LEVELS
+                .iter()
+                .copied()
+                .min_by(|a, b| (a - value).abs().total_cmp(&(b - value).abs()))
+                .unwrap_or(0.95);
+            let index = Self::CONFIDENCE_LEVELS
+                .iter()
+                .position(|level| (*level - current).abs() < 1e-9)
+                .unwrap_or(1) as i64;
+            let next = index + direction;
+            if next >= 0 && next < Self::CONFIDENCE_LEVELS.len() as i64 {
+                Self::CONFIDENCE_LEVELS[next as usize]
+            } else {
+                current
+            }
         } else {
-            0.0
-        };
-        let upper = if matches!(
-            self,
-            SettingField::DiscoverFraction | SettingField::Confidence
-        ) {
-            1.0
-        } else {
-            f64::MAX
-        };
-        (value + direction as f64 * self.fractional_step()).clamp(lower, upper)
+            let upper = if matches!(self, SettingField::DiscoverFraction) {
+                1.0
+            } else {
+                f64::MAX
+            };
+            (value + direction as f64 * self.fractional_step()).clamp(0.0, upper)
+        }
     }
 
     fn nudged_text(&self, value: &str, direction: i64) -> Option<String> {
@@ -808,10 +821,12 @@ impl SettingField {
                 let v = raw
                     .parse::<f64>()
                     .map_err(|_| "invalid number".to_string())?;
-                if !v.is_finite() || !(0.0..=1.0).contains(&v) || v == 0.0 {
-                    return Err("must be a number between 0 and 1".to_string());
-                }
-                args.confidence = v;
+                let level = Self::CONFIDENCE_LEVELS
+                    .iter()
+                    .copied()
+                    .find(|level| (level - v).abs() < 1e-9)
+                    .ok_or_else(|| "must be exactly 0.90, 0.95, or 0.99".to_string())?;
+                args.confidence = level;
             }
         }
         Ok(())
@@ -2303,13 +2318,34 @@ mod tests {
     }
 
     #[test]
-    fn confidence_nudge_never_reaches_uncommittable_zero() {
+    fn confidence_nudge_and_apply_stay_within_supported_levels() {
         assert_eq!(
-            SettingField::Confidence.nudged_fractional_value(0.05, -1),
-            0.01
+            SettingField::Confidence.nudged_fractional_value(0.95, -1),
+            0.90
+        );
+        assert_eq!(
+            SettingField::Confidence.nudged_fractional_value(0.90, -1),
+            0.90
+        );
+        assert_eq!(
+            SettingField::Confidence.nudged_fractional_value(0.95, 1),
+            0.99
+        );
+        assert_eq!(
+            SettingField::Confidence.nudged_fractional_value(0.99, 1),
+            0.99
+        );
+        assert_eq!(
+            SettingField::Confidence.nudged_text("0.90", 1),
+            Some("0.95".to_string())
         );
         let mut config = AppConfig::default();
-        assert!(SettingField::Confidence.apply("0.01", &mut config).is_ok());
+        assert!(SettingField::Confidence.apply("0.90", &mut config).is_ok());
+        assert!(SettingField::Confidence.apply("0.95", &mut config).is_ok());
+        assert!(SettingField::Confidence.apply("0.99", &mut config).is_ok());
+        assert!(SettingField::Confidence.apply("0.85", &mut config).is_err());
+        assert!(SettingField::Confidence.apply("1.00", &mut config).is_err());
+        assert!(SettingField::Confidence.apply("0.01", &mut config).is_err());
     }
 
     #[test]

@@ -457,6 +457,12 @@ fn main() -> Result<()> {
     if args.cli && args.watch.is_some() && args.format != "ndjson" {
         anyhow::bail!("--watch requires --cli --format ndjson");
     }
+    if args.watch == Some(0) {
+        anyhow::bail!("--watch must be at least 1 second");
+    }
+    if !args.cli && (args.format != "tsv" || args.output.is_some()) {
+        anyhow::bail!("--format and --output require --cli");
+    }
     if let Some(value) = args.alert_p95_increase_ms {
         if !value.is_finite() || value < 0.0 {
             anyhow::bail!("--alert-p95-increase-ms must be finite and non-negative");
@@ -674,6 +680,17 @@ fn confidence_rank(value: &str) -> u8 {
         "LOW" => 1,
         _ => 0,
     }
+}
+
+/// Multi-port and multi-check scans forward per-port/per-check rows and then
+/// the merged aggregate per IP; keep only the latest (merged) row per IP while
+/// preserving relative order.
+fn dedup_results(mut results: Vec<scanner::ProbeResult>) -> Vec<scanner::ProbeResult> {
+    let mut seen = std::collections::HashSet::new();
+    results.reverse();
+    results.retain(|result| seen.insert(result.ip.clone()));
+    results.reverse();
+    results
 }
 
 fn healthy_result(
@@ -926,7 +943,7 @@ fn cli_mode(
     // Keep fully failed targets in machine-readable output so callers can
     // inspect their categorized diagnostics and distinguish them from targets
     // that were never sampled.
-    let mut results: Vec<scanner::ProbeResult> = rx.iter().collect();
+    let mut results: Vec<scanner::ProbeResult> = dedup_results(rx.iter().collect());
 
     warn_if_colo_filter_uninformative(&config.path, &colo, &country);
     if let Some(colo) = &colo {
@@ -999,6 +1016,13 @@ fn cli_mode(
     let health_error = fail_if_no_healthy_target && !healthy;
 
     let rows = results.iter().take(config.top).collect::<Vec<_>>();
+    if results.len() > config.top {
+        eprintln!(
+            "warning: {} results truncated to --top {}; pass --top to show more",
+            results.len(),
+            config.top
+        );
+    }
     let rendered = match format {
         "json" => serde_json::to_string_pretty(&rows)?,
         "ndjson" => rows
@@ -1152,7 +1176,7 @@ fn cli_watch(
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         ));
-        let mut results: Vec<scanner::ProbeResult> = rx.iter().collect();
+        let mut results: Vec<scanner::ProbeResult> = dedup_results(rx.iter().collect());
         warn_if_colo_filter_uninformative(&config.path, &colo, &country);
         if let Some(want) = &colo {
             results.retain(|r| {
@@ -1321,8 +1345,8 @@ fn cli_watch(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_manifest, colo_filter_may_be_empty, healthy_result, normalize_config, write_manifest,
-        Args, Command, HealthThresholds,
+        build_manifest, colo_filter_may_be_empty, dedup_results, healthy_result, normalize_config,
+        write_manifest, Args, Command, HealthThresholds,
     };
     use crate::config::AppConfig;
     use crate::scanner;
@@ -1473,6 +1497,67 @@ mod tests {
             },
             "UNKNOWN"
         ));
+    }
+
+    #[test]
+    fn dedup_results_keeps_latest_row_per_ip_in_order() {
+        fn row(ip: &str, port: u16) -> scanner::ProbeResult {
+            scanner::ProbeResult {
+                ip: ip.to_string(),
+                port,
+                ..unchecked_default_result()
+            }
+        }
+        fn unchecked_default_result() -> scanner::ProbeResult {
+            scanner::ProbeResult {
+                ip: String::new(),
+                port: 0,
+                protocol: String::new(),
+                ok: 0,
+                fail: 0,
+                completed: 0,
+                avg: 0.0,
+                p50: 0.0,
+                p90: 0.0,
+                p95: 0.0,
+                max: 0.0,
+                jitter: 0.0,
+                stddev: 0.0,
+                loss: 0,
+                packet_loss: 0.0,
+                samples: Vec::new(),
+                failures: Vec::new(),
+                diagnostics: Vec::new(),
+                success_rate: 0.0,
+                score: 0.0,
+                colo: None,
+                country: None,
+                cold_ms: None,
+                stopped_early: false,
+                min_score: 0.0,
+                max_score: 0.0,
+                success_rate_lower: 0.0,
+                success_rate_upper: 0.0,
+                score_confidence: 0.95,
+                decision: "competitive".to_string(),
+                checks: Vec::new(),
+                health_ok: false,
+                port_results: Vec::new(),
+            }
+        }
+
+        let input = vec![
+            row("10.0.0.1", 443),
+            row("10.0.0.2", 443),
+            row("10.0.0.1", 8443),
+            row("10.0.0.1", 2053),
+            row("10.0.0.3", 443),
+            row("10.0.0.1", 2053),
+        ];
+        let deduped = dedup_results(input);
+        let ips: Vec<&str> = deduped.iter().map(|r| r.ip.as_str()).collect();
+        assert_eq!(ips, ["10.0.0.2", "10.0.0.3", "10.0.0.1"]);
+        assert_eq!(deduped[2].port, 2053);
     }
 
     #[test]
