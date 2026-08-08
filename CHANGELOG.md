@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.28.4](https://github.com/nexuslibs/cleanscan/compare/v0.28.3...v0.28.4) (2026-08-08)
+
+
+### Bug Fixes
+
+* update RUSTFLAGS to use relocation-model=static for better static linking ([d93cffe](https://github.com/nexuslibs/cleanscan/commit/d93cffe10fcfcd38fb3c603b0c9c07a411417c31))
+
 ## [0.28.3](https://github.com/nexuslibs/cleanscan/compare/v0.28.2...v0.28.3) (2026-08-08)
 
 
