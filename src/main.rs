@@ -281,6 +281,7 @@ pub enum Command {
 }
 
 fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let args = Args::parse();
     if let Some(Command::Update { check }) = args.command.clone() {
         return updater::run_explicit(check);

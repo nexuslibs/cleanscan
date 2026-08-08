@@ -398,6 +398,7 @@ mod tests {
 
     #[tokio::test]
     async fn unavailable_release_service_is_reported_to_explicit_callers() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let result = latest_release("http://127.0.0.1:9/latest").await;
         assert!(result.is_err());
     }

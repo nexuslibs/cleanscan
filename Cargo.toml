@@ -9,13 +9,13 @@ clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 ipnet = "2"
 rand = "0.8"
-reqwest = { version = "0.13.4", default-features = false, features = ["http2", "json", "rustls", "stream"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["http2", "json", "rustls-no-provider", "stream"] }
 semver = "1"
 sha2 = "0.10"
 flate2 = "1"
 tar = "0.4"
-rustls = "0.23.42"
-tokio-rustls = "0.26.4"
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
 url = "2"
 rustls-platform-verifier = "0.7.0"
 tokio = { version = "1", features = ["full"] }

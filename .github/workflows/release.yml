@@ -128,24 +128,40 @@ jobs:
             exit 1
           }
 
-      - name: Install zig (cross musl linker)
+      - name: Install zig (musl C/asm cross-compiler)
         if: contains(matrix.target, 'linux-musl')
         uses: mlugg/setup-zig@v2 # v2
         with:
           version: latest
           use-cache: false
 
-      - name: Install cargo-zigbuild
+      - name: Compile TLS alignment pad
         if: contains(matrix.target, 'linux-musl')
-        run: cargo install cargo-zigbuild
+        shell: bash
+        run: |
+          target="${{ matrix.target }}"
+          zig cc -target "${target/unknown-}" -fno-sanitize=all -c \
+            .github/tls_pad.c -o "tls_pad_${target}.o"
 
       - name: Build (Linux musl, static PIE)
         if: contains(matrix.target, 'linux-musl')
-        env:
-          RUSTFLAGS: -C relocation-model=pie -C link-arg=-static -C link-arg=-pie
-        run: cargo zigbuild --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          target="${{ matrix.target }}"
+          cc_var="CC_${target//-/_}"
+          cxx_var="CXX_${target//-/_}"
+          ar_var="AR_${target//-/_}"
+          ranlib_var="RANLIB_${target//-/_}"
+          export "$cc_var=$PWD/.github/zig-musl-cc.sh"
+          export "$cxx_var=$PWD/.github/zig-musl-cxx.sh"
+          export "$ar_var=zig ar"
+          export "$ranlib_var=zig ranlib"
+          export ZIG_MUSL_TARGET="$target"
+          lld="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/rust-lld"
+          export RUSTFLAGS="-C relocation-model=pie -C link-arg=-static -C link-arg=-pie -C linker=$lld -C link-arg=$PWD/tls_pad_${target}.o -C link-arg=--undefined=cleanscan_tls_pad_tdata -C link-arg=--undefined=cleanscan_tls_pad_tbss"
+          cargo build --release --locked --target "$target"
 
-      - name: Verify musl artifact is a static PIE
+      - name: Verify musl artifact is a static PIE with Bionic-compatible TLS
         if: contains(matrix.target, 'linux-musl')
         shell: bash
         run: |
@@ -159,6 +175,27 @@ jobs:
             echo "expected a fully static binary without an interpreter" >&2
             exit 1
           }
+          case "${{ matrix.target }}" in
+            aarch64-*) min_tls_align=64 ;;
+            armv7-*) min_tls_align=32 ;;
+            *) min_tls_align=0 ;;
+          esac
+          if [ "$min_tls_align" -gt 0 ]; then
+            tls="$(readelf -l "$binary" | awk '/  TLS  /{print $3, $NF; exit}')"
+            test -n "$tls" || { echo "no TLS segment found" >&2; exit 1; }
+            set -- $tls
+            vaddr="${1#0x}"
+            align="${2#0x}"
+            skew=$(( 16#$vaddr % 16#$align ))
+            test "$skew" -eq 0 || {
+              echo "TLS segment skew is $skew; p_vaddr must be aligned to p_align" >&2
+              exit 1
+            }
+            test $(( 16#$align )) -ge "$min_tls_align" || {
+              echo "TLS alignment $align is below the $min_tls_align required by Bionic" >&2
+              exit 1
+            }
+          fi
 
       - name: Build (macOS)
         if: contains(matrix.target, 'apple-darwin')
