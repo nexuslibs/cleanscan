@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.30.4](https://github.com/nexuslibs/cleanscan/compare/v0.30.3...v0.30.4) (2026-08-08)
+
+
+### Bug Fixes
+
+* correct LOAD alignment check for Android compatibility ([467639a](https://github.com/nexuslibs/cleanscan/commit/467639aa4292430d00393197bcba386a4119903b))
+
 ## [0.30.3](https://github.com/nexuslibs/cleanscan/compare/v0.30.2...v0.30.3) (2026-08-08)
 
 
