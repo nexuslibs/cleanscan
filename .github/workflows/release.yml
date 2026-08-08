@@ -147,8 +147,13 @@ jobs:
         if: contains(matrix.target, '-android')
         shell: bash
         run: |
-          yes | sdkmanager "ndk;28.2.13676358" >/dev/null
-          test -x "$ANDROID_HOME/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          ndk_dir="$ANDROID_HOME/ndk/28.2.13676358"
+          clang="$ndk_dir/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
+          if [ ! -d "$ndk_dir" ]; then
+            yes 2>/dev/null | sdkmanager --licenses >/dev/null 2>&1 || true
+            yes 2>/dev/null | sdkmanager "ndk;28.2.13676358" >/dev/null || true
+          fi
+          test -x "$clang"
 
       - name: Compile TLS alignment pad
         if: contains(matrix.target, 'linux-musl')
