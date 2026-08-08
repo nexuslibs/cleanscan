@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.27.0](https://github.com/nexuslibs/cleanscan/compare/v0.26.0...v0.27.0) (2026-08-08)
+
+
+### Features
+
+* enhance build process for Linux musl and improve README instructions ([051cf61](https://github.com/nexuslibs/cleanscan/commit/051cf6136e4206f5acb1ed971107cb17c7f03188))
+
 ## [0.26.0](https://github.com/nexuslibs/cleanscan/compare/v0.25.0...v0.26.0) (2026-07-23)
 
 
