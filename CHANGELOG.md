@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.28.3](https://github.com/nexuslibs/cleanscan/compare/v0.28.2...v0.28.3) (2026-08-08)
+
+
+### Bug Fixes
+
+* add target handling for i686 architecture in zig-musl-cc.sh ([a21bf71](https://github.com/nexuslibs/cleanscan/commit/a21bf71407bd88f011f3dd7a672fc985a95e950b))
+
 ## [0.28.2](https://github.com/nexuslibs/cleanscan/compare/v0.28.1...v0.28.2) (2026-08-08)
 
 
