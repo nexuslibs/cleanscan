@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use rustls::{pki_types::ServerName, ClientConfig};
+#[cfg(not(target_os = "android"))]
 use rustls_platform_verifier::ConfigVerifierExt;
 use serde::Serialize;
 use tokio::{
@@ -91,11 +92,40 @@ pub fn parse_share_url(raw: &str) -> Result<ProxyTransport> {
     })
 }
 
+pub(crate) fn client_config() -> Result<ClientConfig, rustls::Error> {
+    #[cfg(target_os = "android")]
+    {
+        let mut roots = rustls::RootCertStore::empty();
+        for der in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
+            roots.add(der.clone())?;
+        }
+        Ok(ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        ClientConfig::with_platform_verifier()
+    }
+}
+
+pub(crate) fn apply_rustls_backend(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    #[cfg(target_os = "android")]
+    {
+        builder
+            .tls_backend_preconfigured(client_config().expect("failed to build Android TLS config"))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        builder
+    }
+}
+
 fn tls_config() -> Result<TlsConnector> {
     static CONNECTOR: OnceLock<std::result::Result<TlsConnector, String>> = OnceLock::new();
     CONNECTOR
         .get_or_init(|| {
-            ClientConfig::with_platform_verifier()
+            client_config()
                 .map(|config| TlsConnector::from(Arc::new(config)))
                 .map_err(|error| error.to_string())
         })

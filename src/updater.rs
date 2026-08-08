@@ -38,12 +38,14 @@ struct UpdateInfo {
 }
 
 fn client(timeout: Duration) -> Result<Client> {
-    Ok(Client::builder()
-        .user_agent(concat!("cleanscan/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()?)
+    Ok(crate::proxy::apply_rustls_backend(
+        Client::builder()
+            .user_agent(concat!("cleanscan/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::limited(10)),
+    )
+    .build()?)
 }
 
 async fn latest_release(endpoint: &str) -> Result<Release> {

@@ -810,18 +810,20 @@ fn client_for_ip(host: &str, ip: &str, args: &AppConfig, port: u16) -> Result<Cl
     let ip_addr = IpAddr::from_str(ip)?;
     let socket = SocketAddr::new(ip_addr, port);
 
-    let client = reqwest::Client::builder()
-        .http2_adaptive_window(true)
-        .no_proxy()
-        .resolve_to_addrs(resolve_host_for_ip(host), &[socket])
-        .redirect(if args.follow_redirects {
-            reqwest::redirect::Policy::limited(10)
-        } else {
-            reqwest::redirect::Policy::none()
-        })
-        .connect_timeout(Duration::from_millis(args.connect_timeout_ms))
-        .timeout(Duration::from_millis(args.timeout_ms))
-        .build()?;
+    let client = crate::proxy::apply_rustls_backend(
+        reqwest::Client::builder()
+            .http2_adaptive_window(true)
+            .no_proxy()
+            .resolve_to_addrs(resolve_host_for_ip(host), &[socket])
+            .redirect(if args.follow_redirects {
+                reqwest::redirect::Policy::limited(10)
+            } else {
+                reqwest::redirect::Policy::none()
+            })
+            .connect_timeout(Duration::from_millis(args.connect_timeout_ms))
+            .timeout(Duration::from_millis(args.timeout_ms)),
+    )
+    .build()?;
 
     Ok(client)
 }

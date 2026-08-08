@@ -57,14 +57,16 @@ pub struct SpeedResult {
 fn client_for_ip(host: &str, ip: &str, args: &AppConfig, port: u16) -> Result<Client> {
     let ip_addr = IpAddr::from_str(ip)?;
     let socket = SocketAddr::new(ip_addr, port);
-    Ok(reqwest::Client::builder()
-        .http2_adaptive_window(true)
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .resolve_to_addrs(resolve_host_for_ip(host), &[socket])
-        .connect_timeout(Duration::from_millis(args.connect_timeout_ms))
-        .timeout(Duration::from_millis(args.speed_timeout_ms))
-        .build()?)
+    Ok(crate::proxy::apply_rustls_backend(
+        reqwest::Client::builder()
+            .http2_adaptive_window(true)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(resolve_host_for_ip(host), &[socket])
+            .connect_timeout(Duration::from_millis(args.connect_timeout_ms))
+            .timeout(Duration::from_millis(args.speed_timeout_ms)),
+    )
+    .build()?)
 }
 
 async fn download_once(

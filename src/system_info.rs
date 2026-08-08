@@ -34,10 +34,12 @@ pub fn lookup_sync(enabled: bool) -> SystemNetworkInfo {
 }
 
 async fn lookup() -> SystemNetworkInfo {
-    let client = match reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(3))
-        .build()
+    let client = match crate::proxy::apply_rustls_backend(
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3)),
+    )
+    .build()
     {
         Ok(client) => client,
         Err(_) => return SystemNetworkInfo::default(),
