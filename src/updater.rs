@@ -331,7 +331,10 @@ mod tests {
 
     #[test]
     fn target_maps_every_release_platform() {
-        assert_eq!(target_for("linux", "x86_64"), Some("x86_64-unknown-linux-musl"));
+        assert_eq!(
+            target_for("linux", "x86_64"),
+            Some("x86_64-unknown-linux-musl")
+        );
         assert_eq!(
             target_for("linux", "aarch64"),
             Some("aarch64-unknown-linux-musl")
