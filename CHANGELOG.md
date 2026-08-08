@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.31.0](https://github.com/nexuslibs/cleanscan/compare/v0.30.5...v0.31.0) (2026-08-08)
+
+
+### Features
+
+* add Android support with webpki-root-certs and update client configuration ([03dc083](https://github.com/nexuslibs/cleanscan/commit/03dc08312bb6954ddb72c5264249dbe320bb28c1))
+
 ## [0.30.5](https://github.com/nexuslibs/cleanscan/compare/v0.30.4...v0.30.5) (2026-08-08)
 
 
