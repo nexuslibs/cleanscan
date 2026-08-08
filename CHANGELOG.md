@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.29.0](https://github.com/nexuslibs/cleanscan/compare/v0.28.4...v0.29.0) (2026-08-08)
+
+
+### Features
+
+* add TLS alignment pad for static musl artifacts and update build process ([da5e3a8](https://github.com/nexuslibs/cleanscan/commit/da5e3a830e98a67675b7e06e02c242e4a88f6934))
+
 ## [0.28.4](https://github.com/nexuslibs/cleanscan/compare/v0.28.3...v0.28.4) (2026-08-08)
 
 
