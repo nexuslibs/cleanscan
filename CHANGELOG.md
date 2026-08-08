@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.31.1](https://github.com/nexuslibs/cleanscan/compare/v0.31.0...v0.31.1) (2026-08-08)
+
+
+### Bug Fixes
+
+* enhance ports editing with dedicated row mapping and mouse interaction ([1d8bb3e](https://github.com/nexuslibs/cleanscan/commit/1d8bb3e8590d7a091942c41d13f052f4a9f3eb26))
+
 ## [0.31.0](https://github.com/nexuslibs/cleanscan/compare/v0.30.5...v0.31.0) (2026-08-08)
 
 
