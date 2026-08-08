@@ -1235,6 +1235,15 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     // maps to which field index (headers map to `None`) for mouse hit-testing.
     let mut lines: Vec<Line> = Vec::new();
     let mut row_map: Vec<Option<usize>> = Vec::new();
+    let mut ports_row_map: Vec<Option<usize>> = Vec::new();
+    let ports_field_index = SettingField::ALL
+        .iter()
+        .position(|field| *field == SettingField::Ports)
+        .expect("ports setting field must exist");
+    let editing_ports = matches!(
+        app.edit_field,
+        Some(i) if i == ports_field_index
+    );
     let mut field_idx = 0usize;
     for (header, count) in SettingField::GROUPS {
         let group_start = field_idx;
@@ -1245,6 +1254,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
                 theme::hint_style().add_modifier(Modifier::BOLD),
             )));
             row_map.push(None);
+            ports_row_map.push(None);
             field_idx += count;
             continue;
         }
@@ -1253,42 +1263,53 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
             theme::subtitle_style().add_modifier(Modifier::BOLD),
         )));
         row_map.push(None);
+        ports_row_map.push(None);
         for _ in 0..count {
             let i = field_idx;
             let f = SettingField::ALL[i];
+            if editing_ports && i == ports_field_index {
+                // One row per port keeps the full list visible and tappable
+                // even on narrow (phone) terminals, where the inline form
+                // overflowed the panel and hid the later ports.
+                for (index, port) in CLOUDFLARE_HTTPS_PORTS.iter().enumerate() {
+                    let selected = app
+                        .edit_buffer
+                        .split(',')
+                        .filter_map(|v| v.trim().parse::<u16>().ok())
+                        .any(|value| value == *port);
+                    let cursor_here = index == app.port_cursor;
+                    let style = if cursor_here {
+                        theme::row_selected_style()
+                    } else {
+                        Style::default().fg(theme::palette().subtitle)
+                    };
+                    let row = format!(
+                        "{}{}{}",
+                        if cursor_here {
+                            widgets::focus_marker()
+                        } else {
+                            " "
+                        },
+                        port,
+                        if selected {
+                            widgets::checked_marker()
+                        } else {
+                            widgets::unchecked_marker()
+                        }
+                    );
+                    lines.push(Line::from(format!("  {row}")).style(style));
+                    row_map.push(Some(i));
+                    ports_row_map.push(Some(index));
+                }
+                field_idx += 1;
+                continue;
+            }
             let style = if i == app.cursor {
                 theme::row_selected_style()
             } else {
                 Style::default().fg(theme::palette().subtitle)
             };
-            let value = if app.edit_field == Some(i) && f == SettingField::Ports {
-                CLOUDFLARE_HTTPS_PORTS
-                    .iter()
-                    .enumerate()
-                    .map(|(index, port)| {
-                        let selected = app
-                            .edit_buffer
-                            .split(',')
-                            .filter_map(|v| v.trim().parse::<u16>().ok())
-                            .any(|value| value == *port);
-                        format!(
-                            "{}{}{}",
-                            if index == app.port_cursor {
-                                widgets::focus_marker()
-                            } else {
-                                " "
-                            },
-                            port,
-                            if selected {
-                                widgets::checked_marker()
-                            } else {
-                                widgets::unchecked_marker()
-                            }
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            } else if app.edit_field == Some(i) {
+            let value = if app.edit_field == Some(i) {
                 let (before, after) = app
                     .edit_buffer
                     .split_at(app.edit_caret.min(app.edit_buffer.len()));
@@ -1313,12 +1334,23 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
             let label = format!("{:20}", f.label());
             lines.push(Line::from(format!("{} = {}", label, value)).style(style));
             row_map.push(Some(i));
+            ports_row_map.push(None);
             field_idx += 1;
         }
     }
 
     let items = lines.into_iter().map(ListItem::new).collect::<Vec<_>>();
-    let selected_row = row_map.iter().position(|field| *field == Some(app.cursor));
+    let selected_row = if editing_ports {
+        // While editing, the list highlight follows the focused port row so
+        // the List widget keeps it inside the viewport as the port cursor
+        // moves and the row map slices stay aligned with the scroll.
+        row_map
+            .iter()
+            .position(|field| *field == Some(app.cursor))
+            .map(|row| row + app.port_cursor)
+    } else {
+        row_map.iter().position(|field| *field == Some(app.cursor))
+    };
     app.settings_list_state = app
         .settings_list_state
         .with_offset(app.settings_scroll)
@@ -1327,7 +1359,11 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         List::new(items)
             .block(block)
             .highlight_style(theme::row_selected_style())
-            .highlight_symbol(widgets::focus_marker()),
+            .highlight_symbol(if editing_ports {
+                ""
+            } else {
+                widgets::focus_marker()
+            }),
         main_layout[0],
         &mut app.settings_list_state,
     );
@@ -1335,6 +1371,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     let start = app.settings_scroll.min(row_map.len());
     let end = (start + inner.height as usize).min(row_map.len());
     app.settings_row_map = row_map[start..end].to_vec();
+    app.ports_row_map = ports_row_map[start..end].to_vec();
 
     // Right Side Description Panel
     let current_field = SettingField::ALL[app.cursor.min(SettingField::ALL.len() - 1)];
@@ -2036,7 +2073,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
     app.ensure_settings_visible();
 }
 
-fn toggle_port_buffer(app: &mut App) {
+pub(super) fn toggle_port_buffer(app: &mut App) {
     let port = CLOUDFLARE_HTTPS_PORTS[app.port_cursor];
     let mut ports = app
         .edit_buffer

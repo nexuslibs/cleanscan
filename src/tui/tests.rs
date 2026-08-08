@@ -1,4 +1,5 @@
 use super::run::build_current_manifest;
+use super::wizard::SettingField;
 use super::{
     export_tsv_line, ranked_export_results, Action, App, FocusTarget, InvestigationState, RunKind,
     RunRecord, ScanDashboardView, ScanLifecycle, Screen, TargetFilter, TargetSort, TargetStage,
@@ -1593,4 +1594,79 @@ fn help_overlay_closes_only_on_dedicated_keys() {
     // Esc dismisses it.
     app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
     assert!(!app.show_help);
+}
+
+#[test]
+fn ports_editor_renders_one_row_per_port_on_narrow_terminals() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.wizard_step = WizardStep::Settings;
+    let ports_idx = SettingField::ALL
+        .iter()
+        .position(|field| *field == SettingField::Ports)
+        .unwrap();
+    app.start_edit(ports_idx);
+
+    let output = rendered(&mut app, 40, 30);
+    // Every port must be on screen: the inline single-line form overflowed
+    // this width and clipped everything past the first few ports.
+    for port in [443u16, 2053, 2083, 2087, 2096, 8443] {
+        assert!(
+            output.contains(&port.to_string()),
+            "port {port} not rendered at 40 columns"
+        );
+    }
+    // The row map exposes exactly one row per port for mouse hit-testing.
+    let mapped: Vec<usize> = app.ports_row_map.iter().flatten().copied().collect();
+    assert_eq!(mapped, vec![0, 1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn mouse_tap_toggles_the_clicked_port_while_editing() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.wizard_step = WizardStep::Settings;
+    let ports_idx = SettingField::ALL
+        .iter()
+        .position(|field| *field == SettingField::Ports)
+        .unwrap();
+    app.start_edit(ports_idx);
+    assert_eq!(app.edit_buffer, "443");
+
+    draw(&mut app, 120, 36);
+    let inner = app.settings_inner.unwrap();
+    let row = app
+        .ports_row_map
+        .iter()
+        .position(|p| *p == Some(1))
+        .unwrap();
+
+    let tap = |app: &mut App, row: usize| {
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x + 2,
+            row: inner.y + row as u16,
+            modifiers: KeyModifiers::NONE,
+        });
+    };
+
+    tap(&mut app, row);
+    assert_eq!(app.edit_field, Some(ports_idx));
+    assert_eq!(app.port_cursor, 1);
+    assert!(
+        app.edit_buffer.split(',').any(|value| value == "2053"),
+        "tap should have selected port 2053"
+    );
+
+    tap(&mut app, row);
+    assert!(
+        !app.edit_buffer.split(',').any(|value| value == "2053"),
+        "second tap should have deselected port 2053"
+    );
 }

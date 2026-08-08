@@ -208,6 +208,9 @@ pub struct App {
     pub settings_inner: Option<Rect>,
     /// Maps each rendered settings row to a field index (`None` for headers).
     pub settings_row_map: Vec<Option<usize>>,
+    /// Maps each rendered settings row to a Cloudflare HTTPS port index while
+    /// the ports field is being edited (`None` otherwise), for mouse hit-testing.
+    pub ports_row_map: Vec<Option<usize>>,
     pub table_inner: Option<Rect>,
     pub table_header: Option<Rect>,
     pub table_col_bounds: Vec<(u16, u16)>,
@@ -589,6 +592,7 @@ impl App {
             ranges_inner: None,
             settings_inner: None,
             settings_row_map: Vec::new(),
+            ports_row_map: Vec::new(),
             table_inner: None,
             table_header: None,
             table_col_bounds: Vec::new(),
@@ -1962,6 +1966,7 @@ impl App {
         self.ranges_inner = None;
         self.settings_inner = None;
         self.settings_row_map.clear();
+        self.ports_row_map.clear();
         self.table_inner = None;
         self.table_header = None;
         self.table_col_bounds.clear();
@@ -3036,6 +3041,23 @@ impl App {
                         if let Some(inner) = self.settings_inner {
                             if point_in(inner, p) {
                                 let row = (m.row - inner.y) as usize;
+                                // While editing the ports field, taps toggle
+                                // individual ports instead of committing the
+                                // whole edit. Other rows keep the normal
+                                // commit-and-activate behavior.
+                                if self
+                                    .edit_field
+                                    .map(|i| SettingField::ALL[i] == SettingField::Ports)
+                                    .unwrap_or(false)
+                                {
+                                    if let Some(Some(port_idx)) =
+                                        self.ports_row_map.get(row).copied()
+                                    {
+                                        self.port_cursor = port_idx;
+                                        wizard::toggle_port_buffer(self);
+                                        return;
+                                    }
+                                }
                                 if let Some(Some(idx)) = self.settings_row_map.get(row).copied() {
                                     if self.edit_field.is_some() && !self.commit_edit() {
                                         return;
