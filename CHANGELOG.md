@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.28.1](https://github.com/nexuslibs/cleanscan/compare/v0.28.0...v0.28.1) (2026-08-08)
+
+
+### Bug Fixes
+
+* add comment clarification in RestoreGuard implementation ([d0958fb](https://github.com/nexuslibs/cleanscan/commit/d0958fb8efd4606d6fd297e006fd7e7bf7f16dc0))
+
 ## [0.28.0](https://github.com/nexuslibs/cleanscan/compare/v0.27.0...v0.28.0) (2026-08-08)
 
 
