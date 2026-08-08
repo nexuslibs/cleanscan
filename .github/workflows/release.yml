@@ -140,7 +140,7 @@ jobs:
         shell: bash
         run: |
           target="${{ matrix.target }}"
-          zig cc -target "${target/unknown-}" -fno-sanitize=all -c \
+          ZIG_MUSL_TARGET="$target" "$PWD/.github/zig-musl-cc.sh" -c \
             .github/tls_pad.c -o "tls_pad_${target}.o"
 
       - name: Build (Linux musl, static PIE)
