@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.30.2](https://github.com/nexuslibs/cleanscan/compare/v0.30.1...v0.30.2) (2026-08-08)
+
+
+### Bug Fixes
+
+* improve Android NDK installation check in release workflow ([fb67d7b](https://github.com/nexuslibs/cleanscan/commit/fb67d7bd763ad011c383f725689c3623ec43a45b))
+
 ## [0.30.1](https://github.com/nexuslibs/cleanscan/compare/v0.30.0...v0.30.1) (2026-08-08)
 
 
