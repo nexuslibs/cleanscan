@@ -6,6 +6,7 @@ set -euo pipefail
 target="${ZIG_MUSL_TARGET/unknown-}"
 case "$target" in
   armv7-*) target="arm-linux-musleabihf" ;;
+  i686-*) target="x86-linux-musl" ;;
 esac
 
 mode="cc"
