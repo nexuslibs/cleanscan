@@ -59,9 +59,9 @@ esac
 if [ "$IS_TERMUX" -eq 1 ]; then
   [ "$OS_KIND" = "linux" ] || err "Termux must run on Linux"
   case "$ARCH_KIND" in
-    armv7) TARGET="armv7-unknown-linux-musleabihf" ;;
-    i686) TARGET="i686-unknown-linux-musl" ;;
-    *) TARGET="${ARCH_KIND}-unknown-linux-musl" ;;
+    armv7) TARGET="armv7-linux-androideabi" ;;
+    i686) TARGET="i686-linux-android" ;;
+    *) TARGET="${ARCH_KIND}-linux-android" ;;
   esac
 elif [ "$OS_KIND" = "darwin" ]; then
   case "$ARCH_KIND" in

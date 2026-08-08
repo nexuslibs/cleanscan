@@ -38,8 +38,9 @@ cargo build --release
 ## Install
 
 Download a prebuilt binary from a GitHub release. Linux artifacts are
-statically linked musl binaries; macOS artifacts are native binaries for Intel
-and Apple Silicon.
+statically linked musl binaries; Android (Termux) artifacts are native
+binaries linked against the system Bionic C library; macOS artifacts are
+native binaries for Intel and Apple Silicon.
 
 Once a release has been published, install the latest version with:
 
@@ -104,11 +105,12 @@ the current supported target. It validates the archive contents and performs
 an atomic replacement; it never invokes a shell installer or `sudo`. Use
 `--no-update-check` or `CLEANSCAN_NO_UPDATE_CHECK=1` when a normal scan must not
 attempt the release check at all. Supported targets are Linux x86_64, ARM64,
-ARMv7, and i686, plus macOS Intel and Apple Silicon.
+ARMv7, and i686, Android (Termux) ARM64/ARMv7/x86_64/i686, plus macOS Intel
+and Apple Silicon.
 
 ### Termux (Android terminal)
 
-cleanscan runs in [Termux](https://termux.dev/) using the static Linux/musl
+cleanscan runs in [Termux](https://termux.dev/) using the Android (Bionic)
 release artifacts. Install Termux from [F-Droid](https://f-droid.org/en/packages/com.termux/)
 rather than the discontinued Play Store build. Then install the required tools:
 
@@ -153,7 +155,8 @@ use the exported TSV or target manifest files if clipboard access is unavailable
 For long scans, keep Termux in the foreground or use `termux-wake-lock` from the
 `termux-api` package to reduce interruptions when the device sleeps.
 
-Termux support is delivered through static Linux binaries. This release does
+Termux support is delivered through native Android binaries built with the
+Android NDK (linked against Bionic, the system C library). This release does
 not include an Android APK or a separate Termux package-manager formula.
 
 If installation reports an unsupported architecture, check `uname -m` and use a

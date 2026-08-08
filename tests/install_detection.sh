@@ -33,13 +33,13 @@ run_detection Linux aarch64 aarch64-unknown-linux-musl "$TEST_ROOT/linux-arm64" 
 run_detection Darwin x86_64 x86_64-apple-darwin "$TEST_ROOT/macos-x86" CLEANSCAN_TEST_TERMUX=0
 
 TERMUX_PREFIX="$TEST_ROOT/termux/usr"
-run_detection Linux aarch64 aarch64-unknown-linux-musl "$TERMUX_PREFIX/bin" \
+run_detection Linux aarch64 aarch64-linux-android "$TERMUX_PREFIX/bin" \
   CLEANSCAN_TEST_TERMUX=1 CLEANSCAN_TEST_PREFIX="$TERMUX_PREFIX" INSTALL_DIR=
-run_detection Linux armv7l armv7-unknown-linux-musleabihf "$TERMUX_PREFIX/bin" \
+run_detection Linux armv7l armv7-linux-androideabi "$TERMUX_PREFIX/bin" \
   CLEANSCAN_TEST_TERMUX=1 CLEANSCAN_TEST_PREFIX="$TERMUX_PREFIX" INSTALL_DIR=
-run_detection Linux x86_64 x86_64-unknown-linux-musl "$TERMUX_PREFIX/bin" \
+run_detection Linux x86_64 x86_64-linux-android "$TERMUX_PREFIX/bin" \
   CLEANSCAN_TEST_TERMUX=1 CLEANSCAN_TEST_PREFIX="$TERMUX_PREFIX" INSTALL_DIR=
-run_detection Linux i686 i686-unknown-linux-musl "$TERMUX_PREFIX/bin" \
+run_detection Linux i686 i686-linux-android "$TERMUX_PREFIX/bin" \
   CLEANSCAN_TEST_TERMUX=1 CLEANSCAN_TEST_PREFIX="$TERMUX_PREFIX" INSTALL_DIR=
 
 termux_output="$({
@@ -47,7 +47,7 @@ termux_output="$({
     CLEANSCAN_TEST_TERMUX=1 CLEANSCAN_TEST_PREFIX="$TERMUX_PREFIX" \
     INSTALL_DIR= CLEANSCAN_INSTALLER_DRY_RUN=1 bash "$INSTALLER"
 })"
-grep -qx "target=aarch64-unknown-linux-musl" <<<"$termux_output"
+grep -qx "target=aarch64-linux-android" <<<"$termux_output"
 grep -qx "install_dir=$TERMUX_PREFIX/bin" <<<"$termux_output"
 
 if env CLEANSCAN_TEST_OS=Linux CLEANSCAN_TEST_ARCH=mips \

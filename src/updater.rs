@@ -72,10 +72,10 @@ fn target() -> Option<&'static str> {
 
 fn target_for(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
-        ("android", "x86_64") => Some("x86_64-unknown-linux-musl"),
-        ("android", "aarch64") => Some("aarch64-unknown-linux-musl"),
-        ("android", "arm") => Some("armv7-unknown-linux-musleabihf"),
-        ("android", "x86") => Some("i686-unknown-linux-musl"),
+        ("android", "x86_64") => Some("x86_64-linux-android"),
+        ("android", "aarch64") => Some("aarch64-linux-android"),
+        ("android", "arm") => Some("armv7-linux-androideabi"),
+        ("android", "x86") => Some("i686-linux-android"),
         ("linux", "x86_64") => Some("x86_64-unknown-linux-musl"),
         ("linux", "aarch64") => Some("aarch64-unknown-linux-musl"),
         ("linux", "arm") => Some("armv7-unknown-linux-musleabihf"),
@@ -351,8 +351,17 @@ mod tests {
         assert_eq!(target_for("macos", "aarch64"), Some("aarch64-apple-darwin"));
         assert_eq!(
             target_for("android", "aarch64"),
-            Some("aarch64-unknown-linux-musl")
+            Some("aarch64-linux-android")
         );
+        assert_eq!(
+            target_for("android", "x86_64"),
+            Some("x86_64-linux-android")
+        );
+        assert_eq!(
+            target_for("android", "arm"),
+            Some("armv7-linux-androideabi")
+        );
+        assert_eq!(target_for("android", "x86"), Some("i686-linux-android"));
         assert_eq!(target_for("windows", "aarch64"), None);
     }
 

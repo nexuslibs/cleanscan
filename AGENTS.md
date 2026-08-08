@@ -42,6 +42,10 @@ cargo test --locked
 
 Releases are automated by Release Please and driven by **Conventional Commits**. PR titles / squash commits must use prefixes: `fix:` (patch), `feat:` (minor; note: below `1.0.0` `feat` bumps the minor), `feat!:` or `BREAKING CHANGE:` (major), `docs:`/`chore:` (no release). Merging the auto-opened version PR publishes the release; no custom secret required.
 
+## Android (Termux) builds
+
+`*-linux-android` targets are built with the NDK (installed via Android Studio at `~/Library/Android/sdk/ndk/<version>`; CI installs `28.2.13676358` via `sdkmanager`). The `<triple>24-clang` wrappers serve as both CC and linker, plus `-Wl,-z,max-page-size=16384` for Android 15+ 16K-page devices. Termux installs (install.sh, updater.rs) prefer `*-linux-android` assets; the musl static-PIE builds serve non-Termux Linux. Android binaries link against Bionic and cannot run on non-Android hosts — verify them structurally (INTERP `/system/bin/linker64`, DYN, 16K LOAD alignment).
+
 ## Conventions worth knowing
 
 - Country filtering (`--country`) is a Unicode-aware substring match using `to_lowercase()` on both sides (e.g. `Côte d'Ivoire` matches); do not switch it back to `to_ascii_lowercase()`.

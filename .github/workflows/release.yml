@@ -101,6 +101,14 @@ jobs:
             os: ubuntu-latest
           - target: i686-unknown-linux-musl
             os: ubuntu-latest
+          - target: aarch64-linux-android
+            os: ubuntu-latest
+          - target: armv7-linux-androideabi
+            os: ubuntu-latest
+          - target: x86_64-linux-android
+            os: ubuntu-latest
+          - target: i686-linux-android
+            os: ubuntu-latest
           - target: x86_64-apple-darwin
             os: macos-latest
           - target: aarch64-apple-darwin
@@ -134,6 +142,17 @@ jobs:
         with:
           version: latest
           use-cache: false
+
+      - name: Install Android SDK command line tools
+        if: contains(matrix.target, '-android')
+        uses: android-actions/setup-android@v3 # v3
+
+      - name: Install Android NDK
+        if: contains(matrix.target, '-android')
+        shell: bash
+        run: |
+          yes | sdkmanager "ndk;28.2.13676358" >/dev/null
+          test -x "$ANDROID_HOME/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
 
       - name: Compile TLS alignment pad
         if: contains(matrix.target, 'linux-musl')
@@ -195,6 +214,56 @@ jobs:
               exit 1
             }
           fi
+
+      - name: Build (Android)
+        if: contains(matrix.target, '-android')
+        shell: bash
+        run: |
+          target="${{ matrix.target }}"
+          tc="$ANDROID_HOME/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          case "$target" in
+            aarch64-*)  cc="$tc/aarch64-linux-android24-clang" ;;
+            armv7-*)    cc="$tc/armv7a-linux-androideabi24-clang" ;;
+            x86_64-*)   cc="$tc/x86_64-linux-android24-clang" ;;
+            i686-*)     cc="$tc/i686-linux-android24-clang" ;;
+          esac
+          cc_var="CC_${target//-/_}"
+          cxx_var="CXX_${target//-/_}"
+          ar_var="AR_${target//-/_}"
+          ranlib_var="RANLIB_${target//-/_}"
+          linker_var="CARGO_TARGET_${target//-/_}_LINKER"
+          export "$cc_var=$cc"
+          export "$cxx_var=${cc}++"
+          export "$ar_var=$tc/llvm-ar"
+          export "$ranlib_var=$tc/llvm-ranlib"
+          export "$linker_var=$cc"
+          export RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384"
+          cargo build --release --locked --target "$target"
+
+      - name: Verify Android artifact is a PIE for the Bionic loader
+        if: contains(matrix.target, '-android')
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/cleanscan"
+          case "${{ matrix.target }}" in
+            armv7-*|i686-*) expected_interp="/system/bin/linker" ;;
+            *) expected_interp="/system/bin/linker64" ;;
+          esac
+          e_type="$(readelf -h "$binary" | awk '/Type:/{print $2}')"
+          test "$e_type" = "DYN" || {
+            echo "expected DYN (PIE), got: $e_type" >&2
+            exit 1
+          }
+          actual_interp="$(readelf -l "$binary" | awk '/interpreter/{print $NF}' | tr -d ']')"
+          test "$actual_interp" = "$expected_interp" || {
+            echo "expected interpreter $expected_interp, got: $actual_interp" >&2
+            exit 1
+          }
+          align="$(readelf -l "$binary" | awk '/LOAD/{print $NF; exit}')"
+          test $(( 16#$align )) -ge 16384 || {
+            echo "LOAD alignment $align is below 16K required by Android 15+ devices" >&2
+            exit 1
+          }
 
       - name: Build (macOS)
         if: contains(matrix.target, 'apple-darwin')
