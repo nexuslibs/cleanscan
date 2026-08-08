@@ -237,7 +237,7 @@ jobs:
           export "$ar_var=$tc/llvm-ar"
           export "$ranlib_var=$tc/llvm-ranlib"
           export "$linker_var=$cc"
-          export RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384"
+          export RUSTFLAGS="-C linker=$cc -C link-arg=-Wl,-z,max-page-size=16384"
           cargo build --release --locked --target "$target"
 
       - name: Verify Android artifact is a PIE for the Bionic loader
