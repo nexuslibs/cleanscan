@@ -260,6 +260,7 @@ jobs:
             exit 1
           }
           align="$(readelf -l "$binary" | awk '/LOAD/{print $NF; exit}')"
+          align="${align#0x}"
           test $(( 16#$align )) -ge 16384 || {
             echo "LOAD alignment $align is below 16K required by Android 15+ devices" >&2
             exit 1
