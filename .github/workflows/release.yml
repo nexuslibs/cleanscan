@@ -150,7 +150,7 @@ jobs:
           export "$ranlib_var=zig ranlib"
           export ZIG_MUSL_TARGET="$target"
           lld="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/rust-lld"
-          export RUSTFLAGS="-C link-arg=-static -C linker=$lld"
+          export RUSTFLAGS="-C relocation-model=static -C link-arg=-static -C linker=$lld"
           cargo build --release --locked --target "$target"
 
       - name: Verify musl artifact is a fully static executable
