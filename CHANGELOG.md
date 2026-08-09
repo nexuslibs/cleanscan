@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.32.0](https://github.com/nexuslibs/cleanscan/compare/v0.31.1...v0.32.0) (2026-08-09)
+
+
+### Features
+
+* introduce discovery driver options and enhance scanning logic ([e89098f](https://github.com/nexuslibs/cleanscan/commit/e89098f731c9d18111295f5271d60d77c7c07b51))
+
 ## [0.31.1](https://github.com/nexuslibs/cleanscan/compare/v0.31.0...v0.31.1) (2026-08-08)
 
 
