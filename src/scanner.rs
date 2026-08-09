@@ -20,7 +20,7 @@ use tokio::sync::Semaphore;
 type ProgressSender = std::sync::mpsc::SyncSender<ScanProgress>;
 
 use crate::adaptive::{AdaptivePolicy, ObservationKind, ProbeObservation};
-use crate::config::{AppConfig, HealthCheck};
+use crate::config::{AppConfig, DiscoveryDriver, HealthCheck};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ScanPhase {
@@ -2975,6 +2975,120 @@ pub async fn run_scan_two_phase_with_progress(
         .await;
     }
     Ok(actual_targets.into_iter().collect())
+}
+
+/// Sweep the candidate sources with a connect scan to find addresses with a
+/// reachable probe port, before any HTTP(S) probing happens. Emits
+/// `ScanPhase::Discovery` progress snapshots with the candidate total.
+pub async fn run_connect_discovery(
+    cidrs: Vec<String>,
+    ips_file: Option<String>,
+    args: Arc<AppConfig>,
+    progress: Option<ProgressSender>,
+    cancel: Arc<AtomicBool>,
+) -> Result<Vec<String>> {
+    let sources = crate::discovery::parse_target_sources(ips_file.as_deref(), &cidrs)?;
+    let ports = if args.ports.is_empty() {
+        vec![443]
+    } else {
+        args.ports.clone()
+    };
+    let discovered = crate::discovery::connect_sweep(
+        &sources,
+        &ports,
+        args.connect_timeout_ms,
+        args.concurrency,
+        cancel,
+        progress,
+    )
+    .await;
+    Ok(discovered)
+}
+
+/// Sweep the candidate sources with a raw SYN sweep (feature `syn`). Requires
+/// root; emits `ScanPhase::Discovery` progress like the connect driver. Runs
+/// the blocking pcap engine on a blocking-pool thread.
+#[cfg(feature = "syn")]
+pub async fn run_syn_discovery(
+    cidrs: Vec<String>,
+    ips_file: Option<String>,
+    args: Arc<AppConfig>,
+    progress: Option<ProgressSender>,
+    cancel: Arc<AtomicBool>,
+) -> Result<Vec<String>> {
+    let sources = crate::discovery::parse_target_sources(ips_file.as_deref(), &cidrs)?;
+    let ports = if args.ports.is_empty() {
+        vec![443]
+    } else {
+        args.ports.clone()
+    };
+    let params = crate::syn::SynSweepParams {
+        rate_pps: args.syn_rate,
+        retransmits: args.syn_retransmits,
+        reply_wait_ms: args.connect_timeout_ms.clamp(100, 500),
+        interface: args.interface.clone(),
+    };
+    let discovered = tokio::task::spawn_blocking(move || {
+        crate::syn::syn_sweep(&sources, &ports, params, cancel, progress)
+    })
+    .await??;
+    Ok(discovered)
+}
+
+/// Run the configured discovery driver over the candidate sources and return
+/// the deduplicated, sorted list of reachable addresses.
+pub async fn run_discovery(
+    cidrs: Vec<String>,
+    ips_file: Option<String>,
+    args: Arc<AppConfig>,
+    progress: Option<ProgressSender>,
+    cancel: Arc<AtomicBool>,
+) -> Result<Vec<String>> {
+    match args.discovery_driver {
+        DiscoveryDriver::Connect => {
+            run_connect_discovery(cidrs, ips_file, args, progress, cancel).await
+        }
+        DiscoveryDriver::Syn => {
+            #[cfg(feature = "syn")]
+            {
+                run_syn_discovery(cidrs, ips_file, args, progress, cancel).await
+            }
+            #[cfg(not(feature = "syn"))]
+            {
+                Err(anyhow!(
+                    "SYN discovery requires a build with the `syn` cargo feature"
+                ))
+            }
+        }
+        DiscoveryDriver::Sampling => Err(anyhow!("the sampling driver has no discovery sweep")),
+    }
+}
+
+/// Run a discovery stage followed by the full probe engine over the discovered
+/// addresses. Returns the discovered target list, which the caller uses as
+/// the authoritative unique-target total.
+pub async fn run_discovery_scan_with_progress(
+    cidrs: Vec<String>,
+    ips_file: Option<String>,
+    args: Arc<AppConfig>,
+    tx: std::sync::mpsc::Sender<ProbeResult>,
+    cancel: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    progress: Option<ProgressSender>,
+) -> Result<Vec<String>> {
+    let discovered = run_discovery(
+        cidrs,
+        ips_file,
+        args.clone(),
+        progress.clone(),
+        cancel.clone(),
+    )
+    .await?;
+    if discovered.is_empty() {
+        return Ok(discovered);
+    }
+    run_profile_scan_with_progress(discovered.clone(), args, tx, cancel, paused, progress).await;
+    Ok(discovered)
 }
 
 #[cfg(test)]

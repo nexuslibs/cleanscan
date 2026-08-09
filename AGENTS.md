@@ -17,6 +17,25 @@ cargo test --locked
 - Clippy uses `-D warnings`; unused fields/vars break the build, not just lint.
 - Run one test: `cargo test <test_name>` (substring match). `cargo test --lib` does **not** work in this bin crate.
 
+## Optional `syn` feature
+
+- `--discover syn` (masscan-style raw SYN sweep) is compiled only with
+  `--features syn`, which adds the `pcap` and `libc` dependencies. It is
+  **not** in `default`, so Android/Termux builds stay free of libpcap.
+- CI covers it: `ci.yml` installs `libpcap-dev` and runs syn-featured clippy +
+  tests; `release.yml` statically builds libpcap 1.10.5 with the zig wrapper
+  for the `linux-musl` targets (`LIBPCAP_LIBDIR`) and enables `--features syn`
+  for the Linux and macOS release binaries. Android targets deliberately stay
+  without the feature (no libpcap for Android).
+- Local verification: `cargo clippy --features syn --locked --all-targets -- -D warnings`
+  and `cargo test --features syn` (host builds need libpcap headers:
+  `libpcap-dev` on Debian/Ubuntu, `brew install libpcap` on macOS). At runtime
+  the engine needs root (`euid 0`); its loopback end-to-end test skips itself
+  when not root.
+- SYN sweeps are IPv4-only and Ethernet-only and need a reachable IPv4 default
+  gateway; the TUI wizard deliberately keeps the `syn` driver unreachable
+  (CLI-only).
+
 ## Branch and commit enforcement
 
 - `.github/workflows/conventional-commits.yml` validates PR titles, not branch

@@ -163,6 +163,30 @@ jobs:
           ZIG_MUSL_TARGET="$target" "$PWD/.github/zig-musl-cc.sh" -c \
             .github/tls_pad.c -o "tls_pad_${target}.o"
 
+      - name: Build static musl libpcap
+        if: contains(matrix.target, 'linux-musl')
+        shell: bash
+        run: |
+          target="${{ matrix.target }}"
+          host="${target/unknown-}"
+          case "$host" in
+            armv7-*) host="arm-linux-musleabihf" ;;
+          esac
+          export ZIG_MUSL_TARGET="$target"
+          export CC="$PWD/.github/zig-musl-cc.sh"
+          export AR="zig ar"
+          export RANLIB="zig ranlib"
+          export CFLAGS="-O2"
+          curl -sSL -o "$RUNNER_TEMP/libpcap.tar.gz" \
+            https://www.tcpdump.org/release/libpcap-1.10.5.tar.gz
+          tar xzf "$RUNNER_TEMP/libpcap.tar.gz" -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/libpcap-1.10.5"
+          ./configure --host="$host" --disable-shared --without-libnl \
+            --prefix="$PWD/install"
+          make -j2
+          make install
+          test -f "$PWD/install/lib/libpcap.a"
+
       - name: Build (Linux musl, static PIE)
         if: contains(matrix.target, 'linux-musl')
         shell: bash
@@ -177,8 +201,9 @@ jobs:
           export "$ar_var=zig ar"
           export "$ranlib_var=zig ranlib"
           export ZIG_MUSL_TARGET="$target"
+          export LIBPCAP_LIBDIR="$RUNNER_TEMP/libpcap-1.10.5/install/lib"
           export RUSTFLAGS="-C linker=$PWD/.github/zig-musl-cc.sh -C link-self-contained=no -C link-arg=-static -C link-arg=-pie -C link-arg=$PWD/tls_pad_${target}.o -C link-arg=-Wl,-u,cleanscan_tls_pad_tdata -C link-arg=-Wl,-u,cleanscan_tls_pad_tbss"
-          cargo build --release --locked --target "$target"
+          cargo build --release --locked --target "$target" --features syn
 
       - name: Verify musl artifact is a static PIE with Termux-compatible TLS
         if: contains(matrix.target, 'linux-musl')
@@ -268,7 +293,7 @@ jobs:
 
       - name: Build (macOS)
         if: contains(matrix.target, 'apple-darwin')
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --features syn
 
       - name: Package
         shell: bash

@@ -8,7 +8,9 @@ use ratatui::{
 };
 use std::collections::HashSet;
 
-use crate::config::{validate_ports, AppConfig, HealthCheck, CLOUDFLARE_HTTPS_PORTS};
+use crate::config::{
+    validate_ports, AppConfig, DiscoveryDriver, HealthCheck, CLOUDFLARE_HTTPS_PORTS,
+};
 use crate::tui::theme;
 use crate::tui::{widgets, App, ButtonAction, ButtonKind, WizardStep};
 use tui_slider::{Slider, SliderState};
@@ -44,6 +46,7 @@ pub enum SettingField {
     EarlyStopPrune,
     EarlyStopPruneMargin,
     TwoPhase,
+    DiscoveryDriver,
     DiscoverFraction,
     AdaptiveProbing,
     MinProbes,
@@ -75,7 +78,7 @@ impl SettingField {
 
     /// All settings fields in display order, grouped by concern. Group
     /// boundaries are described by [`SettingField::GROUPS`].
-    pub const ALL: [SettingField; 36] = [
+    pub const ALL: [SettingField; 37] = [
         // Target
         SettingField::Host,
         SettingField::Path,
@@ -103,6 +106,7 @@ impl SettingField {
         SettingField::EarlyStopPrune,
         SettingField::EarlyStopPruneMargin,
         SettingField::TwoPhase,
+        SettingField::DiscoveryDriver,
         SettingField::DiscoverFraction,
         SettingField::AdaptiveProbing,
         SettingField::MinProbes,
@@ -126,7 +130,7 @@ impl SettingField {
         ("Validation", 6),
         ("Latency scan", 6),
         ("Ranking quality", 2),
-        ("Adaptive scan", 14),
+        ("Adaptive scan", 15),
         ("Speed test", 5),
     ];
 
@@ -160,6 +164,7 @@ impl SettingField {
             SettingField::EarlyStopPrune => "Prune to top-N",
             SettingField::EarlyStopPruneMargin => "Prune margin",
             SettingField::TwoPhase => "Two-phase scan",
+            SettingField::DiscoveryDriver => "Discovery driver",
             SettingField::DiscoverFraction => "Discover fraction",
             SettingField::AdaptiveProbing => "Adaptive probing",
             SettingField::MinProbes => "Minimum probes",
@@ -200,7 +205,8 @@ impl SettingField {
             SettingField::EarlyStopMinSamples => "Minimum number of measured probes before any early-stop rule may fire, so a single first-timeout does not abort an otherwise-good target.",
             SettingField::EarlyStopPrune => "Once at least 'Top results' READY candidates exist, stop probing targets whose current score remains worse than the current top-N boundary after applying the margin tolerance.",
             SettingField::EarlyStopPruneMargin => "How much worse (as a fraction) a target may be than the worst current top-N candidate before the prune rule stops probing it.",
-            SettingField::TwoPhase => "Run a sparse discovery pass first, then spend the rest of the probe budget focusing on the CIDRs that produced the best Cloudflare colos. Finds good edges faster and densifies there.",
+            SettingField::TwoPhase => "Run a sparse discovery pass first, then spend the rest of the probe budget focusing on the CIDRs that produced the best Cloudflare colos. Finds good edges faster and densifies there. Not available with the connect discovery driver.",
+            SettingField::DiscoveryDriver => "How the target set is produced before probing: `sampling` picks random IPs from each selected CIDR; `connect` sweeps every address in the selected ranges with plain TCP connects and only addresses with a reachable probe port become targets (masscan-style discovery without raw sockets). A raw SYN sweep (`syn`) is a CLI-only option for root builds with the `syn` feature. Selecting connect disables two-phase scanning.",
             SettingField::DiscoverFraction => "Fraction of sample_per_cidr used for the discovery pass when two-phase scanning is enabled; the remainder is spent on the focused CIDRs.",
             SettingField::AdaptiveProbing => "Allocate probes adaptively using confidence intervals instead of probing every target equally.",
             SettingField::MinProbes => "Minimum measured probes before adaptive stopping can occur.",
@@ -296,6 +302,11 @@ impl SettingField {
                     "Off".to_string()
                 }
             }
+            SettingField::DiscoveryDriver => match args.discovery_driver {
+                DiscoveryDriver::Sampling => "Sampling".to_string(),
+                DiscoveryDriver::Connect => "Connect".to_string(),
+                DiscoveryDriver::Syn => "Syn".to_string(),
+            },
             SettingField::DiscoverFraction => args.discover_fraction.to_string(),
             SettingField::AdaptiveProbing => {
                 if args.adaptive_probing {
@@ -335,6 +346,7 @@ impl SettingField {
                 | SettingField::EarlyStop
                 | SettingField::EarlyStopPrune
                 | SettingField::TwoPhase
+                | SettingField::DiscoveryDriver
                 | SettingField::Warmup
                 | SettingField::AdaptiveProbing
                 | SettingField::AdaptiveConcurrency
@@ -442,6 +454,7 @@ impl SettingField {
             | SettingField::EarlyStop
             | SettingField::EarlyStopPrune
             | SettingField::TwoPhase
+            | SettingField::DiscoveryDriver
             | SettingField::Warmup
             | SettingField::AdaptiveProbing
             | SettingField::AdaptiveConcurrency
@@ -755,6 +768,28 @@ impl SettingField {
                     "off" | "false" | "0" | "no" => false,
                     _ => return Err("enter on or off".to_string()),
                 };
+                if args.two_phase && args.discovery_driver != DiscoveryDriver::Sampling {
+                    args.discovery_driver = DiscoveryDriver::Sampling;
+                }
+            }
+            SettingField::DiscoveryDriver => {
+                let lowered = raw.trim().to_ascii_lowercase();
+                match lowered.as_str() {
+                    "sampling" | "random" => args.discovery_driver = DiscoveryDriver::Sampling,
+                    "connect" | "sweep" => {
+                        args.discovery_driver = DiscoveryDriver::Connect;
+                        // Connect discovery and the two-phase sampling pass are
+                        // alternative target-selection strategies.
+                        args.two_phase = false;
+                    }
+                    "syn" => {
+                        return Err(
+                            "syn requires root and a CLI build with the `syn` feature; use sampling or connect"
+                                .to_string(),
+                        )
+                    }
+                    _ => return Err("enter sampling, connect, or syn".to_string()),
+                }
             }
             SettingField::DiscoverFraction => {
                 let v = raw
@@ -848,6 +883,7 @@ impl SettingField {
                 | SettingField::EarlyStop
                 | SettingField::EarlyStopPrune
                 | SettingField::TwoPhase
+                | SettingField::DiscoveryDriver
                 | SettingField::AdaptiveProbing
                 | SettingField::AdaptiveConcurrency
         )
@@ -858,7 +894,21 @@ impl SettingField {
             SettingField::Warmup => args.warmup = !args.warmup,
             SettingField::EarlyStop => args.early_stop = !args.early_stop,
             SettingField::EarlyStopPrune => args.early_stop_prune = !args.early_stop_prune,
-            SettingField::TwoPhase => args.two_phase = !args.two_phase,
+            SettingField::TwoPhase => {
+                args.two_phase = !args.two_phase;
+                if args.two_phase && args.discovery_driver != DiscoveryDriver::Sampling {
+                    args.discovery_driver = DiscoveryDriver::Sampling;
+                }
+            }
+            SettingField::DiscoveryDriver => {
+                args.discovery_driver = match args.discovery_driver {
+                    DiscoveryDriver::Sampling => DiscoveryDriver::Connect,
+                    _ => DiscoveryDriver::Sampling,
+                };
+                if args.discovery_driver == DiscoveryDriver::Connect {
+                    args.two_phase = false;
+                }
+            }
             SettingField::AdaptiveProbing => args.adaptive_probing = !args.adaptive_probing,
             SettingField::AdaptiveConcurrency => {
                 args.adaptive_concurrency = !args.adaptive_concurrency
@@ -1482,20 +1532,30 @@ fn numeric_slider_bounds(field: SettingField) -> (f64, f64) {
 
 fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
     let (selected, workload) = selected_cidrs_and_workload(app);
+    let connect_mode = app.config.discovery_driver == DiscoveryDriver::Connect;
 
     let selected_count = selected.len();
     let preview_ready = !app.preview_targets.is_empty();
     // A generated preview is deduplicated by the scanner and is therefore
     // authoritative for the actual target workload. Before generation, the
-    // deterministic per-CIDR cap is the stable upper-bound estimate.
-    let total_ips = if preview_ready {
+    // deterministic per-CIDR cap is the stable upper-bound estimate. In
+    // connect mode the sweep enumerates every address in the selected ranges.
+    let total_ips = if connect_mode {
+        crate::discovery::enumerated_address_count(
+            &crate::discovery::parse_target_sources(None, &selected).unwrap_or_default(),
+        )
+    } else if preview_ready {
         app.preview_targets.len() as u128
     } else {
         workload.total_ips
     };
-    let total_probes = total_ips
-        .saturating_mul(app.config.probes as u128)
-        .saturating_mul(app.config.ports.len().max(1) as u128);
+    let total_probes = if connect_mode {
+        total_ips.saturating_mul(app.config.ports.len().max(1) as u128)
+    } else {
+        total_ips
+            .saturating_mul(app.config.probes as u128)
+            .saturating_mul(app.config.ports.len().max(1) as u128)
+    };
 
     // Ideal scan duration estimate
     let ideal_seconds =
@@ -1569,6 +1629,14 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
             Span::raw(format_ip_count(app.config.sample_per_cidr as u128)),
         ]),
         Line::from(vec![
+            Span::styled("Driver      : ", theme::title_style()),
+            Span::raw(match app.config.discovery_driver {
+                DiscoveryDriver::Sampling => "sampling (random per-CIDR)".to_string(),
+                DiscoveryDriver::Connect => "connect sweep (full range)".to_string(),
+                DiscoveryDriver::Syn => "syn (not implemented)".to_string(),
+            }),
+        ]),
+        Line::from(vec![
             Span::styled("Probes/IP   : ", theme::title_style()),
             Span::raw(format_ip_count(app.config.probes as u128)),
         ]),
@@ -1622,7 +1690,9 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            if !preview_ready {
+            if connect_mode {
+                "Ready: sweep will find reachable ports, then probe them"
+            } else if !preview_ready {
                 "Unavailable: target preview could not be generated"
             } else if app.config.concurrency > 500 {
                 "Warning: very high concurrency may trigger rate limits"
@@ -1631,7 +1701,10 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
             } else {
                 "Ready: sampled targets are stable for this review"
             },
-            if !preview_ready || app.config.concurrency > 500 || total_ips > 10_000 {
+            if (!connect_mode && !preview_ready)
+                || app.config.concurrency > 500
+                || total_ips > 10_000
+            {
                 theme::warn_style()
             } else {
                 theme::good_style()
@@ -2045,6 +2118,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             app.config.early_stop_prune = true;
             app.config.early_stop_prune_margin = 0.2;
             app.config.two_phase = true;
+            app.config.discovery_driver = DiscoveryDriver::Sampling;
             app.config.discover_fraction = 0.25;
             app.invalidate_preview();
             app.toast_success("Preset Applied: Fast Scan");
@@ -2237,7 +2311,7 @@ mod tests {
         handle_settings_key, ideal_scan_seconds, next_char_boundary, numeric_slider_bounds,
         previous_char_boundary, SettingField,
     };
-    use crate::config::AppConfig;
+    use crate::config::{AppConfig, DiscoveryDriver};
     use crate::tui::App;
     use std::sync::{atomic::AtomicBool, Arc};
 
@@ -2400,6 +2474,58 @@ mod tests {
         assert!(SettingField::RequiredHeaders
             .apply("bad header=value", &mut config)
             .is_err());
+    }
+
+    #[test]
+    fn discovery_driver_cycles_between_sampling_and_connect() {
+        let mut config = AppConfig::default();
+        assert_eq!(config.discovery_driver, DiscoveryDriver::Sampling);
+        SettingField::DiscoveryDriver.toggle(&mut config);
+        assert_eq!(config.discovery_driver, DiscoveryDriver::Connect);
+        SettingField::DiscoveryDriver.toggle(&mut config);
+        assert_eq!(config.discovery_driver, DiscoveryDriver::Sampling);
+    }
+
+    #[test]
+    fn discovery_driver_and_two_phase_are_mutually_exclusive() {
+        let mut config = AppConfig {
+            two_phase: true,
+            ..AppConfig::default()
+        };
+        SettingField::DiscoveryDriver.toggle(&mut config);
+        assert_eq!(config.discovery_driver, DiscoveryDriver::Connect);
+        assert!(!config.two_phase);
+
+        let mut config = AppConfig {
+            discovery_driver: DiscoveryDriver::Connect,
+            ..AppConfig::default()
+        };
+        SettingField::TwoPhase.toggle(&mut config);
+        assert!(config.two_phase);
+        assert_eq!(config.discovery_driver, DiscoveryDriver::Sampling);
+    }
+
+    #[test]
+    fn discovery_driver_edit_accepts_names_and_rejects_syn() {
+        let mut config = AppConfig::default();
+        assert!(SettingField::DiscoveryDriver
+            .apply("connect", &mut config)
+            .is_ok());
+        assert_eq!(config.discovery_driver, DiscoveryDriver::Connect);
+        assert!(!config.two_phase);
+
+        assert!(SettingField::DiscoveryDriver
+            .apply("sampling", &mut config)
+            .is_ok());
+        assert_eq!(config.discovery_driver, DiscoveryDriver::Sampling);
+
+        assert!(SettingField::DiscoveryDriver
+            .apply("syn", &mut config)
+            .is_err());
+        assert!(SettingField::DiscoveryDriver
+            .apply("bogus", &mut config)
+            .is_err());
+        assert_eq!(config.discovery_driver, DiscoveryDriver::Sampling);
     }
 
     #[test]

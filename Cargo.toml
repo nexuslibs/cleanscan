@@ -3,6 +3,11 @@ name = "cleanscan"
 version = "0.31.1"
 edition = "2021"
 
+[features]
+# Raw SYN discovery driver (masscan-style). Opt-in so Android/Termux and CI
+# builds stay free of libpcap; needs libpcap headers on the build host.
+syn = ["dep:pcap", "dep:libc"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -27,6 +32,8 @@ dirs = "6.0.0"
 tui-slider = "0.3.3"
 tui-overlay = "0.1.2"
 tui-checkbox = "0.4.6"
+pcap = { version = "2", optional = true }
+libc = { version = "0.2", optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 webpki-root-certs = "1.0.9"

@@ -1,9 +1,12 @@
 mod adaptive;
 mod colo;
 mod config;
+mod discovery;
 mod proxy;
 mod scanner;
 mod speed;
+#[cfg(feature = "syn")]
+mod syn;
 mod system_info;
 mod tui;
 mod updater;
@@ -14,7 +17,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use anyhow::Result;
-use config::{validate_ports, AppConfig, HealthCheck};
+use config::{validate_ports, AppConfig, DiscoveryDriver, HealthCheck};
 use futures::StreamExt;
 
 #[derive(Parser, Debug, Clone)]
@@ -78,6 +81,24 @@ pub struct Args {
     /// Number of random IPs to sample from each CIDR
     #[arg(long)]
     pub sample_per_cidr: Option<usize>,
+
+    /// Discovery driver for the target set: sampling (random per-CIDR sample),
+    /// connect (full-range TCP connect sweep for reachable ports), or syn
+    /// (raw SYN sweep; requires root and a build with the `syn` feature).
+    #[arg(long, value_parser = ["sampling", "connect", "syn"])]
+    pub discover: Option<String>,
+
+    /// Interface for the raw SYN sweep (`--discover syn`); defaults to the default device.
+    #[arg(long)]
+    pub interface: Option<String>,
+
+    /// Pacing for the raw SYN sweep (`--discover syn`) in packets per second.
+    #[arg(long)]
+    pub rate: Option<u32>,
+
+    /// Extra retransmit passes per window for the raw SYN sweep (`--discover syn`).
+    #[arg(long)]
+    pub syn_retrans: Option<u32>,
 
     /// Number of repeated probes per IP
     #[arg(long)]
@@ -333,6 +354,24 @@ fn main() -> Result<()> {
     if let Some(sample_per_cidr) = args.sample_per_cidr {
         config.sample_per_cidr = sample_per_cidr;
     }
+    if let Some(driver) = args.discover.as_deref() {
+        config.discovery_driver = driver.parse().map_err(anyhow::Error::msg)?;
+    }
+    if let Some(interface) = args.interface.clone() {
+        config.interface = Some(interface);
+    }
+    if let Some(rate) = args.rate {
+        if rate == 0 || rate > 1_000_000 {
+            anyhow::bail!("--rate must be between 1 and 1000000");
+        }
+        config.syn_rate = rate;
+    }
+    if let Some(retrans) = args.syn_retrans {
+        if retrans > 10 {
+            anyhow::bail!("--syn-retrans must be between 0 and 10");
+        }
+        config.syn_retransmits = retrans;
+    }
     if let Some(probes) = args.probes {
         config.probes = probes;
     }
@@ -455,6 +494,26 @@ fn main() -> Result<()> {
     if args.watch.is_some() && config.two_phase {
         anyhow::bail!("--watch cannot be combined with --two-phase");
     }
+    if config.discovery_driver == DiscoveryDriver::Syn {
+        #[cfg(not(feature = "syn"))]
+        anyhow::bail!(
+            "--discover syn requires a build with the `syn` cargo feature: `cargo build --features syn`"
+        );
+        #[cfg(feature = "syn")]
+        if !syn::is_root() {
+            anyhow::bail!(
+                "--discover syn requires root privileges (raw sockets); run as root or with sudo"
+            );
+        }
+    }
+    if config.discovery_driver != DiscoveryDriver::Syn
+        && (args.interface.is_some() || args.rate.is_some() || args.syn_retrans.is_some())
+    {
+        anyhow::bail!("--interface, --rate and --syn-retrans require --discover syn");
+    }
+    if config.discovery_driver != DiscoveryDriver::Sampling && config.two_phase {
+        anyhow::bail!("--discover cannot be combined with --two-phase");
+    }
     if args.cli && args.watch.is_some() && args.format != "ndjson" {
         anyhow::bail!("--watch requires --cli --format ndjson");
     }
@@ -508,6 +567,9 @@ fn main() -> Result<()> {
 
     if args.targets_file.is_some() && (args.ips.is_some() || !args.cidr.is_empty()) {
         anyhow::bail!("--targets-file cannot be combined with --ips or --cidr");
+    }
+    if config.discovery_driver != DiscoveryDriver::Sampling && args.targets_file.is_some() {
+        anyhow::bail!("--discover cannot be combined with --targets-file");
     }
     if !args.cli && args.targets_file.is_some() {
         anyhow::bail!("--targets-file requires --cli");
@@ -864,10 +926,81 @@ fn cli_mode(
         ips_identity,
         targets_file_identity,
         config.sample_per_cidr,
+        config.discovery_driver,
         effective_seed,
     );
     let source_fingerprint = watch::fingerprint(&source_identity);
-    let targets = if let Some(path) = targets_file {
+
+    let use_discovery = config.discovery_driver != DiscoveryDriver::Sampling;
+    let use_two_phase = config.two_phase && !has_explicit_targets && !use_discovery;
+    if use_two_phase && !config.health_checks.is_empty() {
+        anyhow::bail!("--two-phase cannot be combined with configured health checks");
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let config_arc = Arc::new(config.clone());
+    let selected_cidrs: Vec<String> = if !cidr.is_empty() {
+        cidr.clone()
+    } else {
+        config.selected_cidrs.clone()
+    };
+    // The sweep enumerates CIDRs fully; when only an --ips file is given,
+    // nothing else may be pulled in, and without any explicit source the
+    // configured CIDR selection is the sweep range.
+    let sweep_cidrs: Vec<String> = if !cidr.is_empty() {
+        cidr.clone()
+    } else if ips.is_some() {
+        Vec::new()
+    } else {
+        config.selected_cidrs.clone()
+    };
+    let rt = tokio::runtime::Runtime::new()?;
+
+    let targets = if use_discovery {
+        let sources = discovery::parse_target_sources(ips.as_deref(), &sweep_cidrs)?;
+        let total_addresses = discovery::enumerated_address_count(&sources);
+        match config.discovery_driver {
+            DiscoveryDriver::Connect => eprintln!(
+                "Connect discovery: {} candidate addresses × {} ports, concurrency={}",
+                total_addresses,
+                config.ports.len().max(1),
+                config.concurrency
+            ),
+            DiscoveryDriver::Syn => eprintln!(
+                "SYN discovery: {} candidate addresses × {} ports, rate={} pps, retransmits={}{}",
+                total_addresses,
+                config.ports.len().max(1),
+                config.syn_rate,
+                config.syn_retransmits,
+                config
+                    .interface
+                    .as_deref()
+                    .map(|interface| format!(", interface={interface}"))
+                    .unwrap_or_default()
+            ),
+            DiscoveryDriver::Sampling => unreachable!("discovery branch reached in sampling mode"),
+        }
+        let driver_label = match config.discovery_driver {
+            DiscoveryDriver::Connect => "connect",
+            DiscoveryDriver::Syn => "syn",
+            DiscoveryDriver::Sampling => unreachable!("discovery branch reached in sampling mode"),
+        };
+        let discovered = rt.block_on(scanner::run_discovery(
+            sweep_cidrs,
+            ips.clone(),
+            config_arc.clone(),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        ))?;
+        if discovered.is_empty() {
+            anyhow::bail!("{driver_label} discovery found no reachable targets");
+        }
+        eprintln!(
+            "Discovery sweep complete: {} reachable target(s)",
+            discovered.len()
+        );
+        discovered
+    } else if let Some(path) = targets_file {
         scanner::load_ip_manifest(&path)?
     } else {
         scanner::collect_targets_with_optional_seed(&config, &cidr, &ips, Some(effective_seed))?
@@ -896,10 +1029,6 @@ fn cli_mode(
     }
     let mut manifest_targets = targets.clone();
     let total = targets.len();
-    let use_two_phase = config.two_phase && !has_explicit_targets;
-    if use_two_phase && !config.health_checks.is_empty() {
-        anyhow::bail!("--two-phase cannot be combined with configured health checks");
-    }
 
     if !use_two_phase {
         eprintln!(
@@ -912,16 +1041,6 @@ fn cli_mode(
         );
     }
 
-    let (tx, rx) = std::sync::mpsc::channel();
-    let config_arc = Arc::new(config.clone());
-
-    let selected_cidrs: Vec<String> = if !cidr.is_empty() {
-        cidr.clone()
-    } else {
-        config.selected_cidrs.clone()
-    };
-
-    let rt = tokio::runtime::Runtime::new()?;
     if use_two_phase {
         manifest_targets = rt.block_on(scanner::run_scan_two_phase(
             selected_cidrs,

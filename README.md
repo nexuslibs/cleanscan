@@ -12,6 +12,10 @@ the best Cloudflare edge IPs to reach a given origin host.
 
 - **TUI by default** — a live, interactive terminal dashboard with a progress
   gauge and a results table that updates as each IP is probed.
+- **Target discovery modes** — `--discover connect` sweeps every address in
+  the selected ranges with plain TCP connects and keeps only addresses with a
+  reachable probe port; `--discover syn` does the same masscan-style with raw
+  SYN packets (root + the optional `syn` build feature).
 - **CLI mode** — drop-in tab-separated table output for piping / scripting via
   the `--cli` flag.
 - **Safe self-updates** — `cleanscan update` verifies release checksums before
@@ -34,6 +38,25 @@ cargo build --release
 
 > If your environment cannot reach the crates.io git index, force the sparse
 > protocol: `CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse cargo build`.
+
+### Raw SYN discovery (optional feature)
+
+`--discover syn` performs a masscan-style raw SYN sweep: it crafts
+Ethernet/IPv4/TCP SYN frames itself (via libpcap), paces them with `--rate`,
+retransmits each window with `--syn-retrans`, and keeps the addresses that
+answer with a SYN-ACK. It requires root, an Ethernet interface with a
+reachable IPv4 default gateway, and a build with the `syn` feature:
+
+```sh
+sudo cargo build --release --features syn
+sudo cleanscan --cli --discover syn --host example.com --rate 10000
+```
+
+`--interface <name>` pins the network interface (defaults to the default
+device). Prebuilt Linux (musl) and macOS release binaries include the SYN
+driver; Android/Termux binaries exclude it (no libpcap for Android). Building
+from source enables it with `--features syn` and needs libpcap headers
+(`libpcap-dev` on Debian/Ubuntu, `brew install libpcap` on macOS).
 
 ## Install
 

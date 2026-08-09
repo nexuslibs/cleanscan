@@ -52,6 +52,35 @@ fn default_health_check_weight() -> f64 {
     1.0
 }
 
+/// How the target set is produced before the probe engine runs.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryDriver {
+    /// Random sampling of each CIDR (legacy behavior).
+    #[default]
+    Sampling,
+    /// Full-range TCP connect sweep: only addresses with a reachable probe
+    /// port become targets for the probe engine.
+    Connect,
+    /// Raw SYN sweep (masscan-style; requires root and the `syn` build feature).
+    Syn,
+}
+
+impl std::str::FromStr for DiscoveryDriver {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "sampling" => Ok(Self::Sampling),
+            "connect" => Ok(Self::Connect),
+            "syn" => Ok(Self::Syn),
+            _ => Err(format!(
+                "unknown discovery driver {s:?}; expected sampling, connect, or syn"
+            )),
+        }
+    }
+}
+
 /// Parse and validate a required response-header expression.
 ///
 /// The first `=` separates the header name from its expected value; additional
@@ -93,6 +122,20 @@ pub struct AppConfig {
     #[serde(default)]
     pub follow_redirects: bool,
     pub sample_per_cidr: usize,
+    /// How the target set is produced before probing: sample CIDRs randomly,
+    /// or sweep them for reachable ports first (connect sweep, or raw SYN
+    /// sweep with the `syn` build feature).
+    #[serde(default)]
+    pub discovery_driver: DiscoveryDriver,
+    /// Pacing of the raw SYN sweep (`--discover syn`) in packets per second.
+    #[serde(default = "default_syn_rate")]
+    pub syn_rate: u32,
+    /// Extra SYN passes (retransmissions) per window in the raw SYN sweep.
+    #[serde(default = "default_syn_retransmits")]
+    pub syn_retransmits: u32,
+    /// Interface for the raw SYN sweep; `None` picks the default device.
+    #[serde(default)]
+    pub interface: Option<String>,
     pub probes: usize,
     pub concurrency: usize,
     pub timeout_ms: u64,
@@ -277,6 +320,12 @@ fn default_runtime_worker_override() -> Arc<AtomicUsize> {
 fn default_confidence() -> f64 {
     0.95
 }
+fn default_syn_rate() -> u32 {
+    5_000
+}
+fn default_syn_retransmits() -> u32 {
+    1
+}
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -290,6 +339,10 @@ impl Default for AppConfig {
             required_headers: Vec::new(),
             follow_redirects: false,
             sample_per_cidr: 100,
+            discovery_driver: DiscoveryDriver::default(),
+            syn_rate: default_syn_rate(),
+            syn_retransmits: default_syn_retransmits(),
+            interface: None,
             probes: 8,
             concurrency: 120,
             timeout_ms: 2500,
@@ -457,6 +510,34 @@ mod port_tests {
 #[cfg(test)]
 mod tests {
     use super::{parse_config, parse_required_header, AppConfig};
+
+    #[test]
+    fn discovery_driver_parses_and_serializes() {
+        use crate::config::DiscoveryDriver;
+        use std::str::FromStr;
+        assert_eq!(
+            DiscoveryDriver::from_str("sampling").unwrap(),
+            DiscoveryDriver::Sampling
+        );
+        assert_eq!(
+            DiscoveryDriver::from_str("CONNECT").unwrap(),
+            DiscoveryDriver::Connect
+        );
+        assert_eq!(
+            DiscoveryDriver::from_str("syn").unwrap(),
+            DiscoveryDriver::Syn
+        );
+        assert!(DiscoveryDriver::from_str("grep").is_err());
+        assert_eq!(
+            serde_json::to_string(&DiscoveryDriver::Connect).unwrap(),
+            "\"connect\""
+        );
+        assert_eq!(
+            serde_json::from_str::<DiscoveryDriver>("\"sampling\"").unwrap(),
+            DiscoveryDriver::Sampling
+        );
+        assert!(AppConfig::default().discovery_driver == DiscoveryDriver::Sampling);
+    }
 
     #[test]
     fn required_header_parser_validates_names_and_values() {

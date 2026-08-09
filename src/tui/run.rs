@@ -169,6 +169,7 @@ pub fn run_tui(
         app.set_explicit_target_source(cli_cidr.clone(), cli_ips.clone());
     }
 
+    let spawn_ips = cli_ips.clone();
     let spawn_scanner = |targets: Vec<String>,
                          selected_cidrs: Vec<String>,
                          scan_config: Arc<AppConfig>|
@@ -178,6 +179,7 @@ pub fn run_tui(
         let scanner_cancel = cancel.clone();
         let scanner_tx = tx.clone();
         let scanner_progress = progress_sender.clone();
+        let scanner_ips = spawn_ips.clone();
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(r) => r,
@@ -186,7 +188,20 @@ pub fn run_tui(
                     return Err(format!("failed to create tokio runtime: {e}"));
                 }
             };
-            if scanner_config.two_phase
+            if scanner_config.discovery_driver != crate::config::DiscoveryDriver::Sampling
+                && targets.is_empty()
+            {
+                rt.block_on(crate::scanner::run_discovery_scan_with_progress(
+                    selected_cidrs,
+                    scanner_ips,
+                    scanner_config,
+                    scanner_tx,
+                    scanner_cancel,
+                    scanner_paused,
+                    Some(scanner_progress.clone()),
+                ))
+                .map_err(|e| e.to_string())
+            } else if scanner_config.two_phase
                 && !selected_cidrs.is_empty()
                 && scanner_config.health_checks.is_empty()
             {
@@ -243,6 +258,19 @@ pub fn run_tui(
     if has_cli_targets {
         if app.config.host.is_empty() {
             app.toast_warn("Set a Host before starting the scan");
+        } else if config_arc.discovery_driver != crate::config::DiscoveryDriver::Sampling {
+            let sources = crate::discovery::parse_target_sources(cli_ips.as_deref(), &cli_cidr)?;
+            let total = crate::discovery::enumerated_address_count(&sources);
+            app.toast_info(format!(
+                "Discovery sweep: {total} candidate addresses; reachable ports become targets"
+            ));
+            app.set_scan_targets(Vec::new());
+            app.begin_scan(total.min(usize::MAX as u128) as usize);
+            scanner = Some(spawn_scanner(
+                Vec::new(),
+                cli_cidr.clone(),
+                config_arc.clone(),
+            ));
         } else {
             let targets = crate::scanner::collect_targets_with_seed(
                 &config_arc,
@@ -306,11 +334,30 @@ pub fn run_tui(
                 app.toast_warn("Set a Host before starting the scan");
                 return;
             }
-            if app.preview_pending {
+            let use_discovery = !use_exact_targets
+                && app.config.discovery_driver != crate::config::DiscoveryDriver::Sampling;
+            if app.preview_pending && !use_discovery {
                 app.toast_info("Target preview is still generating");
                 return;
             }
-            let targets = if let Some(targets) = exact_targets {
+            let discovery_total = if use_discovery {
+                match crate::discovery::parse_target_sources(None, &cidrs) {
+                    Ok(sources) => Some(crate::discovery::enumerated_address_count(&sources)),
+                    Err(e) => {
+                        app.toast_error(format!("Error: {e}"));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let targets = if use_discovery {
+                app.toast_info(format!(
+                    "Discovery sweep: {} candidate addresses; reachable ports become targets",
+                    discovery_total.expect("discovery total set")
+                ));
+                Ok(Vec::new())
+            } else if let Some(targets) = exact_targets {
                 Ok(targets)
             } else if app.preview_targets.is_empty() {
                 crate::scanner::collect_from_cidrs_with_seed(
@@ -331,6 +378,7 @@ pub fn run_tui(
                     let computed_source_fingerprint = crate::watch::fingerprint(&(
                         cidrs.clone(),
                         app.config.sample_per_cidr,
+                        app.config.discovery_driver,
                         explicit_seed,
                         app.scan_seed,
                     ));
@@ -341,8 +389,14 @@ pub fn run_tui(
                         computed_source_fingerprint
                     };
                     app.watch_source_fingerprint = Some(source_fingerprint);
-                    let targets = prepare_watch_targets(app, targets, source_fingerprint);
-                    let total = targets.len();
+                    let targets = if use_discovery {
+                        targets
+                    } else {
+                        prepare_watch_targets(app, targets, source_fingerprint)
+                    };
+                    let total = discovery_total
+                        .map(|count| count.min(usize::MAX as u128) as usize)
+                        .unwrap_or(targets.len());
                     let scan_config = Arc::new(app.config.clone());
                     app.set_scan_targets(targets.clone());
                     let scan_cidrs = if use_exact_targets {
@@ -502,6 +556,13 @@ pub fn run_tui(
                             app.scan_complete = true;
                             app.scan_lifecycle =
                                 app.resolve_terminal_lifecycle(ScanLifecycle::Completed);
+                            if app.last_targets.is_empty()
+                                && app.scan_lifecycle == ScanLifecycle::Completed
+                                && app.config.discovery_driver
+                                    != crate::config::DiscoveryDriver::Sampling
+                            {
+                                app.toast_warn("Discovery sweep found no reachable targets");
+                            }
                         }
                         Ok(Err(e)) => {
                             app.scan_complete = true;

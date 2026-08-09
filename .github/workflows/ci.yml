@@ -38,5 +38,14 @@ jobs:
       - name: Test
         run: cargo test --locked --verbose
 
+      - name: Install libpcap headers
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      - name: Clippy (syn feature)
+        run: cargo clippy --locked --all-targets --features syn -- -D warnings
+
+      - name: Test (syn feature)
+        run: cargo test --locked --features syn
+
       - name: Test installer platform detection
         run: bash tests/install_detection.sh
