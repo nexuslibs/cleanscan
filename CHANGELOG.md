@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.33.0](https://github.com/nexuslibs/cleanscan/compare/v0.32.0...v0.33.0) (2026-08-10)
+
+
+### Features
+
+* add network interface selection and listing functionality ([ff9a747](https://github.com/nexuslibs/cleanscan/commit/ff9a747e88bb2bd4290b09ac48d33c4ebb28f561))
+
 ## [0.32.0](https://github.com/nexuslibs/cleanscan/compare/v0.31.1...v0.32.0) (2026-08-09)
 
 
