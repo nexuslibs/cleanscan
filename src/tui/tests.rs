@@ -1670,3 +1670,94 @@ fn mouse_tap_toggles_the_clicked_port_while_editing() {
         "second tap should have deselected port 2053"
     );
 }
+
+#[test]
+fn interface_editor_renders_auto_row_and_interface_addresses() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.wizard_step = WizardStep::Settings;
+    let interface_idx = SettingField::ALL
+        .iter()
+        .position(|field| *field == SettingField::Interface)
+        .unwrap();
+    app.start_edit(interface_idx);
+    let interfaces = app.interface_list.clone();
+    assert!(
+        !interfaces.is_empty(),
+        "expected at least a loopback interface"
+    );
+
+    let output = rendered(&mut app, 160, 40);
+    assert!(
+        output.contains("Auto (default)"),
+        "the Auto row must always be listed"
+    );
+    // The row map exposes one row per selectable entry (Auto first) for
+    // mouse hit-testing, but only for rows in the viewport. On hosts with
+    // many interfaces the map is a leading window of the picker list, not
+    // the whole list, so only assert that property.
+    let mapped: Vec<usize> = app.interface_row_map.iter().flatten().copied().collect();
+    assert!(
+        mapped.iter().enumerate().all(|(index, row)| *row == index),
+        "mapped rows must be the leading window of the picker list"
+    );
+    for (index, entry) in interfaces.iter().enumerate() {
+        if !mapped.contains(&(index + 1)) {
+            continue;
+        }
+        assert!(
+            output.contains(&entry.name),
+            "interface {} not rendered",
+            entry.name
+        );
+        for addr in &entry.addresses {
+            assert!(
+                output.contains(&addr.to_string()),
+                "address {} of {} not rendered",
+                addr,
+                entry.name
+            );
+        }
+    }
+}
+
+#[test]
+fn mouse_tap_commits_the_clicked_interface_while_editing() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.wizard_step = WizardStep::Settings;
+    let interface_idx = SettingField::ALL
+        .iter()
+        .position(|field| *field == SettingField::Interface)
+        .unwrap();
+    app.start_edit(interface_idx);
+    assert_eq!(app.interface_cursor, 0);
+
+    draw(&mut app, 120, 36);
+    let inner = app.settings_inner.unwrap();
+    let row = app
+        .interface_row_map
+        .iter()
+        .position(|entry| *entry == Some(1))
+        .unwrap();
+
+    let tap = |app: &mut App, row: usize| {
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x + 2,
+            row: inner.y + row as u16,
+            modifiers: KeyModifiers::NONE,
+        });
+    };
+
+    let expected = app.interface_list.first().map(|entry| entry.name.clone());
+    tap(&mut app, row);
+    assert_eq!(app.edit_field, None, "tap should commit the selection");
+    assert_eq!(app.config.interface, expected);
+}

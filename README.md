@@ -52,11 +52,14 @@ sudo cargo build --release --features syn
 sudo cleanscan --cli --discover syn --host example.com --rate 10000
 ```
 
-`--interface <name>` pins the network interface (defaults to the default
-device). Prebuilt Linux (musl) and macOS release binaries include the SYN
-driver; Android/Termux binaries exclude it (no libpcap for Android). Building
-from source enables it with `--features syn` and needs libpcap headers
-(`libpcap-dev` on Debian/Ubuntu, `brew install libpcap` on macOS).
+`--interface <name>` also selects the capture device for the SYN sweep
+(defaults to the default device). Outbound connections are bound to the
+interface's address; on Linux the kernel still picks the egress path from the
+routing table, so the pinned interface must have its own route to the target
+(VPN tunnels do). Prebuilt Linux (musl) and macOS release binaries include the
+SYN driver; Android/Termux binaries exclude it (no libpcap for Android).
+Building from source enables it with `--features syn` and needs libpcap
+headers (`libpcap-dev` on Debian/Ubuntu, `brew install libpcap` on macOS).
 
 ## Install
 
@@ -199,6 +202,13 @@ cleanscan --ips ips.txt
 # Pipe-friendly tab-separated output
 cleanscan --cli --cidr 188.114.96.0/20 --top 20
 
+# List the machine's network interfaces (name + IPs), then exit
+cleanscan --list-interfaces
+
+# Run every probe, discovery sweep, and speed test through one interface
+# (e.g. a VPN tunnel or a secondary uplink); "auto" is the default
+cleanscan --cli --host example.com --cidr 188.114.96.0/20 --interface utun6
+
 # Check transport survivability for the top 10 healthy candidates
 cleanscan --cli --host example.com --cidr 188.114.96.0/20 \
   --proxy-url 'vless://UUID@example.com:443?type=ws&security=tls&sni=example.com&host=example.com&path=%2Fws'
@@ -275,7 +285,10 @@ counterparts: `Host` (`--host`), `Path` (`--path`), `HTTPS ports` (`--port`, rep
 `Top results` (`--top`), `Stability weight` (`--stability-weight`, default `1.0`),
 and `Loss weight` (`--loss-weight`, default `1.0`). Validation settings are also editable:
 expected statuses, required body markers, required headers, and redirect behavior.
-Comma-separated values are used for repeatable marker/header fields. Speed-test settings are also editable: download
+Comma-separated values are used for repeatable marker/header fields. `Network interface`
+(`--interface`) defaults to `Auto`; press `Enter` to open the interface picker, which lists
+every interface with its IP addresses, then `↑`/`↓` to choose and `Enter` to confirm.
+Speed-test settings are also editable: download
 path, upload path, payload size in MB, repetition count, and speed timeout (ms).
 Target-source flags such as `--cidr` and `--ips` are selected before launching
 the TUI and are not edited in this screen.
@@ -361,6 +374,8 @@ latency dashboard.
 | `--ips`                | —                | File with one IP or CIDR per line                |
 | `--cidr`               | —                | CIDR block to sample (repeatable)                |
 | `--sample-per-cidr`    | `100`            | Random IPs sampled from each CIDR                |
+| `--interface`          | auto             | Network interface for probes, discovery sweeps, and speed tests (e.g. `en0`, `utun6`); binds connections to its address (`auto` restores OS routing). Also selects the capture device for `--discover syn` |
+| `--list-interfaces`    | —                | List network interfaces with their IP addresses, then exit |
 | `--probes`             | `8`              | Repeated probes per IP                           |
 | `--concurrency`        | `120`            | Max concurrent HTTP probes                       |
 | `--adaptive-concurrency` | off             | Adapt worker concurrency from recent probe health |

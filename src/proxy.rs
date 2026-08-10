@@ -142,6 +142,7 @@ pub async fn check_candidate(
     transport: &ProxyTransport,
     ip: &str,
     timeout_ms: u64,
+    interface: Option<crate::iface::InterfaceAddrs>,
 ) -> SurvivabilityResult {
     let started = Instant::now();
     let timeout_duration = Duration::from_millis(timeout_ms.max(500));
@@ -149,7 +150,12 @@ pub async fn check_candidate(
         Ok(ip) => SocketAddr::new(ip, transport.port),
         Err(e) => return failed(ip, transport, started, format!("invalid candidate IP: {e}")),
     };
-    let stream = match timeout(timeout_duration, TcpStream::connect(addr)).await {
+    let stream = match timeout(
+        timeout_duration,
+        crate::iface::bind_connect(addr, interface),
+    )
+    .await
+    {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => return failed(ip, transport, started, format!("TCP connect: {e}")),
         Err(_) => return failed(ip, transport, started, "TCP connect timed out".into()),

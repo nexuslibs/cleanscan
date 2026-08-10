@@ -66,6 +66,9 @@ pub enum ScanEventKind {
     TargetFinalized,
     WorkerChanged,
     ScanFinalizing,
+    /// Non-fatal problem noticed during the scan (e.g. the pinned interface
+    /// cannot serve a target family); the scan continues on auto routing.
+    Warning,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -806,24 +809,32 @@ pub(crate) fn https_authority(host: &str, port: u16) -> String {
     }
 }
 
-fn client_for_ip(host: &str, ip: &str, args: &AppConfig, port: u16) -> Result<Client> {
+fn client_for_ip(
+    host: &str,
+    ip: &str,
+    args: &AppConfig,
+    port: u16,
+    interface: Option<crate::iface::InterfaceAddrs>,
+) -> Result<Client> {
     let ip_addr = IpAddr::from_str(ip)?;
     let socket = SocketAddr::new(ip_addr, port);
-
-    let client = crate::proxy::apply_rustls_backend(
-        reqwest::Client::builder()
-            .http2_adaptive_window(true)
-            .no_proxy()
-            .resolve_to_addrs(resolve_host_for_ip(host), &[socket])
-            .redirect(if args.follow_redirects {
-                reqwest::redirect::Policy::limited(10)
-            } else {
-                reqwest::redirect::Policy::none()
-            })
-            .connect_timeout(Duration::from_millis(args.connect_timeout_ms))
-            .timeout(Duration::from_millis(args.timeout_ms)),
-    )
-    .build()?;
+    let mut builder = reqwest::Client::builder()
+        .http2_adaptive_window(true)
+        .no_proxy()
+        .resolve_to_addrs(resolve_host_for_ip(host), &[socket])
+        .redirect(if args.follow_redirects {
+            reqwest::redirect::Policy::limited(10)
+        } else {
+            reqwest::redirect::Policy::none()
+        })
+        .connect_timeout(Duration::from_millis(args.connect_timeout_ms))
+        .timeout(Duration::from_millis(args.timeout_ms));
+    if let Some(addrs) = interface {
+        if let Some(local) = addrs.pick(ip_addr.is_ipv4()) {
+            builder = builder.local_address(local);
+        }
+    }
+    let client = crate::proxy::apply_rustls_backend(builder).build()?;
 
     Ok(client)
 }
@@ -1598,6 +1609,7 @@ async fn probe_with_lazy_client(
     port: u16,
     url: String,
     args: Arc<AppConfig>,
+    interface: Option<crate::iface::InterfaceAddrs>,
     sem: Arc<Semaphore>,
     cancel: Arc<AtomicBool>,
 ) -> (
@@ -1631,8 +1643,10 @@ async fn probe_with_lazy_client(
         Some(client) => client,
         None => {
             let build_args = args.clone();
-            match tokio::task::spawn_blocking(move || client_for_ip(&host, &ip, &build_args, port))
-                .await
+            match tokio::task::spawn_blocking(move || {
+                client_for_ip(&host, &ip, &build_args, port, interface)
+            })
+            .await
             {
                 Ok(Ok(client)) => client,
                 Ok(Err(error)) => return (None, Err(client_construction_diagnostic(error))),
@@ -1642,6 +1656,45 @@ async fn probe_with_lazy_client(
     };
     let sample = probe_once(&client, &url, &args).await;
     (Some(client), sample)
+}
+
+/// Resolve the pinned interface once per scan and check it can serve the
+/// target families. On any problem the scan falls back to auto routing with a
+/// single warning event instead of failing per probe.
+fn resolve_scan_interface(
+    args: &AppConfig,
+    targets: &[String],
+) -> (Option<crate::iface::InterfaceAddrs>, Option<ScanEvent>) {
+    let name = match args.interface.as_deref() {
+        Some(name) => name,
+        None => return (None, None),
+    };
+    let addrs = match crate::iface::interface_addrs(name) {
+        Ok(addrs) => addrs,
+        Err(error) => {
+            return (
+                None,
+                Some(ScanEvent::new(
+                    ScanEventKind::Warning,
+                    None,
+                    format!("{error}; reverting to auto routing"),
+                )),
+            );
+        }
+    };
+    if let Err(error) =
+        crate::iface::validate_target_families(name, &addrs, targets.iter().map(String::as_str))
+    {
+        return (
+            None,
+            Some(ScanEvent::new(
+                ScanEventKind::Warning,
+                None,
+                format!("{error}; reverting to auto routing"),
+            )),
+        );
+    }
+    (Some(addrs), None)
 }
 
 fn client_construction_diagnostic(error: impl Display) -> ProbeDiagnostic {
@@ -1785,6 +1838,7 @@ async fn run_scan_port(
         )
     });
     let mut adaptive_reason: Option<String> = None;
+    let (interface, interface_warning) = resolve_scan_interface(&args, &targets);
     let mut states: Vec<TargetState> = targets
         .into_iter()
         .map(|ip| TargetState::new(ip, &args, probe_count, port))
@@ -1828,6 +1882,21 @@ async fn run_scan_port(
             format!("scheduler using {workers} workers"),
         )),
     );
+    if let Some(warning) = interface_warning {
+        send_progress_with_workers(
+            progress.as_ref(),
+            warming_phase,
+            probes_started,
+            probes_completed,
+            futs.len(),
+            targets_completed,
+            None,
+            workers,
+            adaptive_reason.as_deref(),
+            failure_counts,
+            Some(warning),
+        );
+    }
     if let Some(state) = states.first() {
         send_progress_with_workers(
             progress.as_ref(),
@@ -1958,7 +2027,7 @@ async fn run_scan_port(
                 let cancel = cancel.clone();
                 futs.push(tokio::spawn(async move {
                     let (client, sample) = probe_with_lazy_client(
-                        client, host, ip, port, url, probe_args, sem, cancel,
+                        client, host, ip, port, url, probe_args, interface, sem, cancel,
                     )
                     .await;
                     ProbeOutcome::Warmup {
@@ -2000,9 +2069,10 @@ async fn run_scan_port(
             let cancel = cancel.clone();
 
             futs.push(tokio::spawn(async move {
-                let (client, sample) =
-                    probe_with_lazy_client(client, host, ip, port, url, probe_args, sem, cancel)
-                        .await;
+                let (client, sample) = probe_with_lazy_client(
+                    client, host, ip, port, url, probe_args, interface, sem, cancel,
+                )
+                .await;
                 ProbeOutcome::Measured {
                     index,
                     client,
@@ -2993,11 +3063,17 @@ pub async fn run_connect_discovery(
     } else {
         args.ports.clone()
     };
+    let interface = args
+        .interface
+        .as_deref()
+        .map(crate::iface::interface_addrs)
+        .transpose()?;
     let discovered = crate::discovery::connect_sweep(
         &sources,
         &ports,
         args.connect_timeout_ms,
         args.concurrency,
+        interface,
         cancel,
         progress,
     )

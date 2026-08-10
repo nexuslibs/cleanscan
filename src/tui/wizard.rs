@@ -27,6 +27,7 @@ pub enum SettingField {
     FollowRedirects,
     HealthChecks,
     Warmup,
+    Interface,
     DownloadPath,
     UploadPath,
     SpeedPayloadMb,
@@ -78,7 +79,7 @@ impl SettingField {
 
     /// All settings fields in display order, grouped by concern. Group
     /// boundaries are described by [`SettingField::GROUPS`].
-    pub const ALL: [SettingField; 37] = [
+    pub const ALL: [SettingField; 38] = [
         // Target
         SettingField::Host,
         SettingField::Path,
@@ -89,6 +90,8 @@ impl SettingField {
         SettingField::FollowRedirects,
         SettingField::HealthChecks,
         SettingField::Warmup,
+        // Network
+        SettingField::Interface,
         // Latency scan
         SettingField::SamplePerCidr,
         SettingField::Probes,
@@ -125,9 +128,10 @@ impl SettingField {
 
     /// Section headers and the number of consecutive fields in each, in the
     /// same order as [`SettingField::ALL`].
-    pub const GROUPS: [(&'static str, usize); 6] = [
+    pub const GROUPS: [(&'static str, usize); 7] = [
         ("Target", 3),
         ("Validation", 6),
+        ("Network", 1),
         ("Latency scan", 6),
         ("Ranking quality", 2),
         ("Adaptive scan", 15),
@@ -145,6 +149,7 @@ impl SettingField {
             SettingField::FollowRedirects => "Follow redirects",
             SettingField::HealthChecks => "Health checks",
             SettingField::Warmup => "Warmup probe",
+            SettingField::Interface => "Network interface",
             SettingField::DownloadPath => "Download path",
             SettingField::UploadPath => "Upload path",
             SettingField::SpeedPayloadMb => "Speed payload (MB)",
@@ -187,6 +192,7 @@ impl SettingField {
             SettingField::FollowRedirects => "Follow redirects during validation. Off preserves the default strict behavior.",
             SettingField::HealthChecks => "Optional checks encoded as name|path|required|weight;... . Leave empty to use the primary path.",
             SettingField::Warmup => "Send a discarded connection-establishment request before measured latency probes.",
+            SettingField::Interface => "Network interface used for probes, discovery sweeps, and speed tests. Auto (default) lets the OS route every connection; picking an interface (e.g. en0, wlan0, tun0) binds outbound connections to that interface's address so all test traffic leaves through the chosen link (on Linux the interface must have its own route to the targets, as VPN tunnels do). Useful on hosts with multiple uplinks or VPNs. The CLI equivalent is --interface <name>; `--list-interfaces` prints the available ones.",
             SettingField::DownloadPath => "Static file endpoint used for download speed tests.",
             SettingField::UploadPath => "POST endpoint used for upload speed tests; it should consume and discard the request body.",
             SettingField::SpeedPayloadMb => "Payload size used for each upload/download repetition. Larger payloads reduce short-test noise but use more bandwidth.",
@@ -265,6 +271,7 @@ impl SettingField {
                     "Off".to_string()
                 }
             }
+            SettingField::Interface => args.interface.clone().unwrap_or_else(|| "Auto".to_string()),
             SettingField::DownloadPath => args.download_path.clone(),
             SettingField::UploadPath => args.upload_path.clone(),
             SettingField::SpeedPayloadMb => (args.speed_payload_bytes / (1024 * 1024)).to_string(),
@@ -456,6 +463,7 @@ impl SettingField {
             | SettingField::TwoPhase
             | SettingField::DiscoveryDriver
             | SettingField::Warmup
+            | SettingField::Interface
             | SettingField::AdaptiveProbing
             | SettingField::AdaptiveConcurrency
             | SettingField::StabilityWeight
@@ -602,6 +610,16 @@ impl SettingField {
                     "off" | "false" | "0" | "no" => false,
                     _ => return Err("enter on or off".to_string()),
                 };
+            }
+            SettingField::Interface => {
+                match crate::iface::normalize_interface(Some(raw.to_string())) {
+                    Some(name) => {
+                        crate::iface::validate_interface(&name)
+                            .map_err(|error| error.to_string())?;
+                        args.interface = Some(name);
+                    }
+                    None => args.interface = None,
+                }
             }
             SettingField::DownloadPath => {
                 if raw.is_empty() || !raw.starts_with('/') {
@@ -1286,14 +1304,36 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     let mut row_map: Vec<Option<usize>> = Vec::new();
     let mut ports_row_map: Vec<Option<usize>> = Vec::new();
+    let mut interface_row_map: Vec<Option<usize>> = Vec::new();
     let ports_field_index = SettingField::ALL
         .iter()
         .position(|field| *field == SettingField::Ports)
         .expect("ports setting field must exist");
+    let interface_field_index = SettingField::ALL
+        .iter()
+        .position(|field| *field == SettingField::Interface)
+        .expect("interface setting field must exist");
     let editing_ports = matches!(
         app.edit_field,
         Some(i) if i == ports_field_index
     );
+    let editing_interface = matches!(
+        app.edit_field,
+        Some(i) if i == interface_field_index
+    );
+    let interface_rows: Vec<(String, bool)> =
+        std::iter::once(("Auto (default)".to_string(), app.config.interface.is_none()))
+            .chain(app.interface_list.iter().map(|entry| {
+                let addresses = entry
+                    .addresses
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let selected = matches!(&app.config.interface, Some(name) if *name == entry.name);
+                (format!("{}  {}", entry.name, addresses), selected)
+            }))
+            .collect();
     let mut field_idx = 0usize;
     for (header, count) in SettingField::GROUPS {
         let group_start = field_idx;
@@ -1305,6 +1345,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
             )));
             row_map.push(None);
             ports_row_map.push(None);
+            interface_row_map.push(None);
             field_idx += count;
             continue;
         }
@@ -1314,6 +1355,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         )));
         row_map.push(None);
         ports_row_map.push(None);
+        interface_row_map.push(None);
         for _ in 0..count {
             let i = field_idx;
             let f = SettingField::ALL[i];
@@ -1354,6 +1396,38 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
                 field_idx += 1;
                 continue;
             }
+            if editing_interface && i == interface_field_index {
+                // One row per selectable interface (Auto first), with the
+                // interface's addresses alongside the name.
+                for (index, (label, selected)) in interface_rows.iter().enumerate() {
+                    let cursor_here = index == app.interface_cursor;
+                    let style = if cursor_here {
+                        theme::row_selected_style()
+                    } else {
+                        Style::default().fg(theme::palette().subtitle)
+                    };
+                    let row = format!(
+                        "{}{}{}",
+                        if cursor_here {
+                            widgets::focus_marker()
+                        } else {
+                            " "
+                        },
+                        if *selected {
+                            widgets::checked_marker()
+                        } else {
+                            widgets::unchecked_marker()
+                        },
+                        label
+                    );
+                    lines.push(Line::from(format!("  {row}")).style(style));
+                    row_map.push(Some(i));
+                    ports_row_map.push(None);
+                    interface_row_map.push(Some(index));
+                }
+                field_idx += 1;
+                continue;
+            }
             let style = if i == app.cursor {
                 theme::row_selected_style()
             } else {
@@ -1385,19 +1459,27 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
             lines.push(Line::from(format!("{} = {}", label, value)).style(style));
             row_map.push(Some(i));
             ports_row_map.push(None);
+            interface_row_map.push(None);
             field_idx += 1;
         }
     }
 
     let items = lines.into_iter().map(ListItem::new).collect::<Vec<_>>();
-    let selected_row = if editing_ports {
-        // While editing, the list highlight follows the focused port row so
-        // the List widget keeps it inside the viewport as the port cursor
-        // moves and the row map slices stay aligned with the scroll.
+    let selected_row = if editing_ports || editing_interface {
+        // While editing one of the list fields, the list highlight follows
+        // the focused row so the List widget keeps it inside the viewport as
+        // the cursor moves and the row map slices stay aligned with the
+        // scroll.
         row_map
             .iter()
             .position(|field| *field == Some(app.cursor))
-            .map(|row| row + app.port_cursor)
+            .map(|row| {
+                row + if editing_ports {
+                    app.port_cursor
+                } else {
+                    app.interface_cursor
+                }
+            })
     } else {
         row_map.iter().position(|field| *field == Some(app.cursor))
     };
@@ -1409,7 +1491,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         List::new(items)
             .block(block)
             .highlight_style(theme::row_selected_style())
-            .highlight_symbol(if editing_ports {
+            .highlight_symbol(if editing_ports || editing_interface {
                 ""
             } else {
                 widgets::focus_marker()
@@ -1422,6 +1504,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     let end = (start + inner.height as usize).min(row_map.len());
     app.settings_row_map = row_map[start..end].to_vec();
     app.ports_row_map = ports_row_map[start..end].to_vec();
+    app.interface_row_map = interface_row_map[start..end].to_vec();
 
     // Right Side Description Panel
     let current_field = SettingField::ALL[app.cursor.min(SettingField::ALL.len() - 1)];
@@ -1634,6 +1717,22 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
                 DiscoveryDriver::Sampling => "sampling (random per-CIDR)".to_string(),
                 DiscoveryDriver::Connect => "connect sweep (full range)".to_string(),
                 DiscoveryDriver::Syn => "syn (not implemented)".to_string(),
+            }),
+        ]),
+        Line::from(vec![
+            Span::styled("Interface   : ", theme::title_style()),
+            Span::raw(match &app.config.interface {
+                None => "auto".to_string(),
+                Some(name) => {
+                    let suffix = app.review_interface_suffix.get_or_insert_with(|| {
+                        crate::iface::interface_addrs(name)
+                            .ok()
+                            .and_then(|addrs| addrs.pick(true))
+                            .map(|ip| format!(" ({ip})"))
+                            .unwrap_or_default()
+                    });
+                    format!("{name}{suffix}")
+                }
             }),
         ]),
         Line::from(vec![
@@ -1996,6 +2095,26 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             }
             return;
         }
+        if field == SettingField::Interface {
+            match code {
+                KeyCode::Enter => {
+                    app.commit_edit();
+                }
+                KeyCode::Esc => {
+                    app.edit_field = None;
+                    app.edit_buffer.clear();
+                    app.edit_caret = 0;
+                }
+                KeyCode::Up if app.interface_cursor > 0 => {
+                    app.interface_cursor -= 1;
+                }
+                KeyCode::Down if app.interface_cursor + 1 < app.interface_list.len() + 1 => {
+                    app.interface_cursor += 1;
+                }
+                _ => {}
+            }
+            return;
+        }
         match code {
             KeyCode::Enter => {
                 app.commit_edit();
@@ -2199,6 +2318,10 @@ impl App {
             return true;
         };
         let field = SettingField::ALL[i];
+        if field == SettingField::Interface {
+            self.commit_interface_selection();
+            return true;
+        }
         let mut updated_config = self.config.clone();
         match field.apply(&self.edit_buffer, &mut updated_config) {
             Ok(()) => {
@@ -2258,7 +2381,38 @@ impl App {
             if field == SettingField::Ports {
                 self.port_cursor = 0;
             }
+            if field == SettingField::Interface {
+                self.interface_list = crate::iface::list_interfaces().unwrap_or_default();
+                self.interface_cursor = match &self.config.interface {
+                    None => 0,
+                    Some(name) => self
+                        .interface_list
+                        .iter()
+                        .position(|entry| entry.name == *name)
+                        .map(|index| index + 1)
+                        .unwrap_or(0),
+                };
+            }
         }
+    }
+
+    /// Commit the currently highlighted interface row: row 0 clears the
+    /// pin (auto), any other row pins that interface.
+    pub fn commit_interface_selection(&mut self) {
+        let selection = if self.interface_cursor == 0 {
+            None
+        } else {
+            self.interface_list
+                .get(self.interface_cursor - 1)
+                .map(|entry| entry.name.clone())
+        };
+        self.config.interface = selection;
+        self.review_interface_suffix = None;
+        self.edit_field = None;
+        self.edit_buffer.clear();
+        self.edit_caret = 0;
+        self.invalidate_preview();
+        self.save_config();
     }
 }
 
@@ -2323,20 +2477,99 @@ mod tests {
         )
     }
 
+    fn field_position(field: SettingField) -> usize {
+        SettingField::ALL
+            .iter()
+            .position(|candidate| *candidate == field)
+            .unwrap()
+    }
+
     #[test]
     fn advanced_settings_are_collapsed_but_navigation_stays_on_visible_fields() {
         let mut app = settings_app();
-        app.cursor = 14; // last regular latency field
+        app.cursor = field_position(SettingField::Top); // last regular latency field
         handle_settings_key(&mut app, crossterm::event::KeyCode::Down);
-        assert_eq!(app.cursor, 17); // adaptive controls remain visible
+        assert_eq!(app.cursor, field_position(SettingField::EarlyStop)); // adaptive controls remain visible
 
         handle_settings_key(&mut app, crossterm::event::KeyCode::Char('x'));
-        app.cursor = 15;
+        app.cursor = field_position(SettingField::StabilityWeight);
         handle_settings_key(&mut app, crossterm::event::KeyCode::Down);
-        assert_eq!(app.cursor, 16);
+        assert_eq!(app.cursor, field_position(SettingField::LossWeight));
 
         handle_settings_key(&mut app, crossterm::event::KeyCode::Char('x'));
         assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn interface_field_applies_auto_default_and_validates_names() {
+        let mut config = AppConfig::default();
+        assert_eq!(config.interface, None);
+        for raw in ["auto", "Auto", "default", ""] {
+            SettingField::Interface.apply(raw, &mut config).unwrap();
+            assert_eq!(
+                config.interface, None,
+                "raw input {raw:?} should clear the pin"
+            );
+        }
+        let name = crate::iface::list_interfaces()
+            .unwrap()
+            .first()
+            .map(|entry| entry.name.clone())
+            .expect("every platform has at least one interface");
+        SettingField::Interface.apply(&name, &mut config).unwrap();
+        assert_eq!(config.interface.as_deref(), Some(name.as_str()));
+        assert!(SettingField::Interface
+            .apply("definitely-not-an-interface", &mut config)
+            .is_err());
+        assert_eq!(config.interface.as_deref(), Some(name.as_str()));
+    }
+
+    #[test]
+    fn interface_picker_navigates_and_commits() {
+        let mut app = settings_app();
+        app.wizard_step = crate::tui::WizardStep::Settings;
+        let index = field_position(SettingField::Interface);
+        app.start_edit(index);
+        assert_eq!(app.edit_field, Some(index));
+        assert_eq!(app.interface_cursor, 0);
+        assert!(
+            !app.interface_list.is_empty(),
+            "expected at least a loopback interface"
+        );
+
+        // Down clamps to the last row (interfaces after the Auto row).
+        for _ in 0..app.interface_list.len() + 5 {
+            handle_settings_key(&mut app, crossterm::event::KeyCode::Down);
+        }
+        assert_eq!(app.interface_cursor, app.interface_list.len());
+
+        handle_settings_key(&mut app, crossterm::event::KeyCode::Enter);
+        assert_eq!(app.edit_field, None);
+        assert_eq!(
+            app.config.interface.as_deref(),
+            app.interface_list.last().map(|entry| entry.name.as_str())
+        );
+
+        // Reopening the picker highlights the pinned interface; walking back
+        // to Auto and committing clears the pin.
+        app.start_edit(index);
+        assert_eq!(app.interface_cursor, app.interface_list.len());
+        while app.interface_cursor > 0 {
+            handle_settings_key(&mut app, crossterm::event::KeyCode::Up);
+        }
+        handle_settings_key(&mut app, crossterm::event::KeyCode::Enter);
+        assert_eq!(app.config.interface, None);
+    }
+
+    #[test]
+    fn interface_edit_cancels_without_changes() {
+        let mut app = settings_app();
+        app.wizard_step = crate::tui::WizardStep::Settings;
+        app.start_edit(field_position(SettingField::Interface));
+        handle_settings_key(&mut app, crossterm::event::KeyCode::Down);
+        handle_settings_key(&mut app, crossterm::event::KeyCode::Esc);
+        assert_eq!(app.edit_field, None);
+        assert_eq!(app.config.interface, None);
     }
 
     #[test]

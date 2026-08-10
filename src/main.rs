@@ -2,6 +2,7 @@ mod adaptive;
 mod colo;
 mod config;
 mod discovery;
+mod iface;
 mod proxy;
 mod scanner;
 mod speed;
@@ -88,9 +89,15 @@ pub struct Args {
     #[arg(long, value_parser = ["sampling", "connect", "syn"])]
     pub discover: Option<String>,
 
-    /// Interface for the raw SYN sweep (`--discover syn`); defaults to the default device.
+    /// Network interface for probes, discovery, and speed tests (e.g. en0);
+    /// defaults to auto (OS route selection). For `--discover syn` this also
+    /// selects the capture device.
     #[arg(long)]
     pub interface: Option<String>,
+
+    /// List network interfaces with their IP addresses, then exit.
+    #[arg(long)]
+    pub list_interfaces: bool,
 
     /// Pacing for the raw SYN sweep (`--discover syn`) in packets per second.
     #[arg(long)]
@@ -307,6 +314,18 @@ fn main() -> Result<()> {
     if let Some(Command::Update { check }) = args.command.clone() {
         return updater::run_explicit(check);
     }
+    if args.list_interfaces {
+        for entry in iface::list_interfaces()? {
+            let addresses = entry
+                .addresses
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            println!("{}\t{addresses}", entry.name);
+        }
+        return Ok(());
+    }
     let mut update_receiver =
         if args.no_update_check || std::env::var_os("CLEANSCAN_NO_UPDATE_CHECK").is_some() {
             None
@@ -357,9 +376,7 @@ fn main() -> Result<()> {
     if let Some(driver) = args.discover.as_deref() {
         config.discovery_driver = driver.parse().map_err(anyhow::Error::msg)?;
     }
-    if let Some(interface) = args.interface.clone() {
-        config.interface = Some(interface);
-    }
+    config.interface = crate::iface::normalize_interface(args.interface.clone());
     if let Some(rate) = args.rate {
         if rate == 0 || rate > 1_000_000 {
             anyhow::bail!("--rate must be between 1 and 1000000");
@@ -507,9 +524,20 @@ fn main() -> Result<()> {
         }
     }
     if config.discovery_driver != DiscoveryDriver::Syn
-        && (args.interface.is_some() || args.rate.is_some() || args.syn_retrans.is_some())
+        && (args.rate.is_some() || args.syn_retrans.is_some())
     {
-        anyhow::bail!("--interface, --rate and --syn-retrans require --discover syn");
+        anyhow::bail!("--rate and --syn-retrans require --discover syn");
+    }
+    if let Some(name) = config.interface.as_deref() {
+        if let Err(error) = iface::validate_interface(name) {
+            if args.interface.is_some() {
+                return Err(error);
+            }
+            eprintln!(
+                "warning: {error}; reverting to auto routing (remove `interface` from config.json to silence this)"
+            );
+            config.interface = None;
+        }
     }
     if config.discovery_driver != DiscoveryDriver::Sampling && config.two_phase {
         anyhow::bail!("--discover cannot be combined with --two-phase");
@@ -1088,11 +1116,24 @@ fn cli_mode(
 
     if let Some(raw_proxy_url) = proxy_url {
         let transport = proxy::parse_share_url(raw_proxy_url)?;
+        let interface =
+            config
+                .interface
+                .as_deref()
+                .and_then(|name| match iface::interface_addrs(name) {
+                    Ok(addrs) => Some(addrs),
+                    Err(error) => {
+                        eprintln!("warning: {error}; proxy checks will use auto routing");
+                        None
+                    }
+                });
         let checks = results
             .iter()
             .filter(|result| result.ok > 0)
             .take(protocol_check_top)
-            .map(|result| proxy::check_candidate(&transport, &result.ip, config.timeout_ms))
+            .map(|result| {
+                proxy::check_candidate(&transport, &result.ip, config.timeout_ms, interface)
+            })
             .collect::<Vec<_>>();
         let checks = rt.block_on(
             futures::stream::iter(checks)

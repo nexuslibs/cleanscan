@@ -104,6 +104,13 @@ pub struct App {
     pub cidr_candidates: Vec<CidrEntry>,
     pub cursor: usize,
     pub port_cursor: usize,
+    /// Row cursor while the network-interface picker is being edited.
+    pub interface_cursor: usize,
+    /// Live interface list shown by the network-interface picker.
+    pub interface_list: Vec<crate::iface::InterfaceInfo>,
+    /// Cached `(ip)` suffix for the review screen's interface row; computed
+    /// once per interface change instead of on every rendered frame.
+    pub review_interface_suffix: Option<String>,
     /// When true, the user is typing a custom CIDR in the ranges step.
     pub custom_input_mode: bool,
     pub input_buffer: String,
@@ -211,6 +218,9 @@ pub struct App {
     /// Maps each rendered settings row to a Cloudflare HTTPS port index while
     /// the ports field is being edited (`None` otherwise), for mouse hit-testing.
     pub ports_row_map: Vec<Option<usize>>,
+    /// Maps each rendered settings row to a network-interface row index while
+    /// the interface field is being edited (`None` otherwise), for mouse hit-testing.
+    pub interface_row_map: Vec<Option<usize>>,
     pub table_inner: Option<Rect>,
     pub table_header: Option<Rect>,
     pub table_col_bounds: Vec<(u16, u16)>,
@@ -510,6 +520,9 @@ impl App {
             cidr_candidates,
             cursor: 0,
             port_cursor: 0,
+            interface_cursor: 0,
+            interface_list: Vec::new(),
+            review_interface_suffix: None,
             custom_input_mode: false,
             input_buffer: String::new(),
             edit_field: None,
@@ -593,6 +606,7 @@ impl App {
             settings_inner: None,
             settings_row_map: Vec::new(),
             ports_row_map: Vec::new(),
+            interface_row_map: Vec::new(),
             table_inner: None,
             table_header: None,
             table_col_bounds: Vec::new(),
@@ -3045,6 +3059,19 @@ impl App {
                                 // individual ports instead of committing the
                                 // whole edit. Other rows keep the normal
                                 // commit-and-activate behavior.
+                                if self
+                                    .edit_field
+                                    .map(|i| SettingField::ALL[i] == SettingField::Interface)
+                                    .unwrap_or(false)
+                                {
+                                    if let Some(Some(row_idx)) =
+                                        self.interface_row_map.get(row).copied()
+                                    {
+                                        self.interface_cursor = row_idx;
+                                        self.commit_interface_selection();
+                                        return;
+                                    }
+                                }
                                 if self
                                     .edit_field
                                     .map(|i| SettingField::ALL[i] == SettingField::Ports)

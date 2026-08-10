@@ -54,19 +54,28 @@ pub struct SpeedResult {
     pub error: Option<String>,
 }
 
-fn client_for_ip(host: &str, ip: &str, args: &AppConfig, port: u16) -> Result<Client> {
+fn client_for_ip(
+    host: &str,
+    ip: &str,
+    args: &AppConfig,
+    port: u16,
+    interface: Option<crate::iface::InterfaceAddrs>,
+) -> Result<Client> {
     let ip_addr = IpAddr::from_str(ip)?;
     let socket = SocketAddr::new(ip_addr, port);
-    Ok(crate::proxy::apply_rustls_backend(
-        reqwest::Client::builder()
-            .http2_adaptive_window(true)
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve_to_addrs(resolve_host_for_ip(host), &[socket])
-            .connect_timeout(Duration::from_millis(args.connect_timeout_ms))
-            .timeout(Duration::from_millis(args.speed_timeout_ms)),
-    )
-    .build()?)
+    let mut builder = reqwest::Client::builder()
+        .http2_adaptive_window(true)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(resolve_host_for_ip(host), &[socket])
+        .connect_timeout(Duration::from_millis(args.connect_timeout_ms))
+        .timeout(Duration::from_millis(args.speed_timeout_ms));
+    if let Some(addrs) = interface {
+        if let Some(local) = addrs.pick(ip_addr.is_ipv4()) {
+            builder = builder.local_address(local);
+        }
+    }
+    Ok(crate::proxy::apply_rustls_backend(builder).build()?)
 }
 
 async fn download_once(
@@ -179,8 +188,9 @@ async fn test_target(
     port: u16,
     args: Arc<AppConfig>,
     direction: SpeedDirection,
+    interface: Option<crate::iface::InterfaceAddrs>,
 ) -> SpeedResult {
-    let client = match client_for_ip(&args.host, &ip, &args, port) {
+    let client = match client_for_ip(&args.host, &ip, &args, port, interface) {
         Ok(client) => client,
         Err(error) => {
             return SpeedResult {
@@ -235,6 +245,32 @@ async fn test_target(
     }
 }
 
+/// Resolve the pinned interface once for the whole speed run and check it
+/// can serve the target families; problems degrade to auto routing with a
+/// warning instead of per-target failures.
+fn resolve_speed_interface(
+    args: &AppConfig,
+    targets: &[(String, u16)],
+) -> Option<crate::iface::InterfaceAddrs> {
+    let name = args.interface.as_deref()?;
+    let addrs = match crate::iface::interface_addrs(name) {
+        Ok(addrs) => addrs,
+        Err(error) => {
+            eprintln!("warning: {error}; speed tests will use auto routing");
+            return None;
+        }
+    };
+    if let Err(error) = crate::iface::validate_target_families(
+        name,
+        &addrs,
+        targets.iter().map(|(ip, _)| ip.as_str()),
+    ) {
+        eprintln!("warning: {error}; speed tests will use auto routing");
+        return None;
+    }
+    Some(addrs)
+}
+
 pub async fn run_speed_scan(
     targets: Vec<(String, u16)>,
     args: Arc<AppConfig>,
@@ -244,6 +280,7 @@ pub async fn run_speed_scan(
 ) {
     let concurrency = args.concurrency.clamp(1, 4);
     let semaphore = Arc::new(Semaphore::new(concurrency));
+    let interface = resolve_speed_interface(&args, &targets);
     let mut tasks = JoinSet::new();
     let mut cancellation = Box::pin(async {
         while !cancel.load(Ordering::Relaxed) {
@@ -275,7 +312,7 @@ pub async fn run_speed_scan(
         let args = args.clone();
         tasks.spawn(async move {
             let _permit = permit;
-            test_target(ip, port, args, direction).await
+            test_target(ip, port, args, direction, interface).await
         });
     }
 

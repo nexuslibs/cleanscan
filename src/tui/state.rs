@@ -174,7 +174,7 @@ pub(super) fn apply_event_to_activity(
             activity.stage = TargetStage::Finalized;
             return true;
         }
-        ScanEventKind::WorkerChanged | ScanEventKind::ScanFinalizing => {}
+        ScanEventKind::WorkerChanged | ScanEventKind::ScanFinalizing | ScanEventKind::Warning => {}
     }
     false
 }

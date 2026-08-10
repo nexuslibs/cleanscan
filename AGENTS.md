@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Single Rust **binary** crate (`cargo test --lib` fails — there is no library target). Entrypoint is `src/main.rs`; the real work lives in `scanner.rs` (probe engine + warmup), `colo.rs` (embedded colo→country data), `config.rs`, `speed.rs`, and `src/tui/` (ratatui interface).
+Single Rust **binary** crate (`cargo test --lib` fails — there is no library target). Entrypoint is `src/main.rs`; the real work lives in `scanner.rs` (probe engine + warmup), `iface.rs` (network interface enumeration + source-address binding), `colo.rs` (embedded colo→country data), `config.rs`, `speed.rs`, and `src/tui/` (ratatui interface).
 
 ## Developer commands
 

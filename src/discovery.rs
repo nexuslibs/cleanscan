@@ -15,7 +15,6 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use futures::stream::StreamExt;
 use ipnet::{IpAddrRange, IpNet};
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::scanner::{ProbeFailureCounts, ScanEvent, ScanEventKind, ScanPhase, ScanProgress};
@@ -236,6 +235,7 @@ pub async fn connect_sweep(
     ports: &[u16],
     connect_timeout_ms: u64,
     concurrency: usize,
+    interface: Option<crate::iface::InterfaceAddrs>,
     cancel: Arc<AtomicBool>,
     progress: Option<ProgressSender>,
 ) -> Vec<String> {
@@ -264,13 +264,16 @@ pub async fn connect_sweep(
                 let mut reachable = false;
                 if !cancel.load(Ordering::Relaxed) {
                     for port in ports {
-                        if timeout(
+                        let result = timeout(
                             connect_timeout,
-                            TcpStream::connect(SocketAddr::new(addr, *port)),
+                            crate::iface::bind_connect(SocketAddr::new(addr, *port), interface),
                         )
-                        .await
-                        .is_ok()
-                        {
+                        .await;
+                        // Only a completed TCP handshake counts as reachable:
+                        // a fast connect error (e.g. an immediate RST from a
+                        // closed port) means the host is up but the port is
+                        // not open, so it must not enter the sweep results.
+                        if matches!(result, Ok(Ok(_))) {
                             reachable = true;
                             break;
                         }
@@ -371,8 +374,28 @@ mod tests {
         assert_eq!(unique.len(), candidates.len());
     }
 
+    /// TEST-NET (RFC 5737) addresses are expected to be unroutable, but a
+    /// full-tunnel VPN can route them somewhere that answers. Probe first so
+    /// the test skips itself on such hosts instead of failing.
+    fn test_net_is_routable() -> bool {
+        match std::net::TcpStream::connect_timeout(
+            &"192.0.2.1:9".parse().unwrap(),
+            std::time::Duration::from_millis(150),
+        ) {
+            Ok(_) => true,
+            Err(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn connect_sweep_finds_reachable_addresses() {
+        if test_net_is_routable() {
+            eprintln!("skipping: TEST-NET is routable on this host (full-tunnel VPN?)");
+            return;
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         // Linux treats all of 127.0.0.0/8 as loopback, so a socket bound to
@@ -385,6 +408,7 @@ mod tests {
             &[port],
             300,
             4,
+            None,
             Arc::new(AtomicBool::new(false)),
             None,
         )
@@ -396,7 +420,7 @@ mod tests {
     async fn connect_sweep_respects_cancellation() {
         let sources = vec![entry("192.0.2.0/24")];
         let cancel = Arc::new(AtomicBool::new(true));
-        let open = connect_sweep(&sources, &[443], 100, 4, cancel, None).await;
+        let open = connect_sweep(&sources, &[443], 100, 4, None, cancel, None).await;
         assert!(open.is_empty());
     }
 }
