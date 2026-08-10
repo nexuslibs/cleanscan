@@ -375,10 +375,11 @@ mod tests {
     async fn connect_sweep_finds_reachable_addresses() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let sources = vec![
-            entry("127.0.0.1"),
-            entry("127.0.0.2"), // loopback neighbor: connection refused
-        ];
+        // Linux treats all of 127.0.0.0/8 as loopback, so a socket bound to
+        // 127.0.0.1 also accepts connections addressed to 127.0.0.2 there.
+        // A TEST-NET address (RFC 5737) is never local, so the unreachable
+        // probe is deterministic on every platform.
+        let sources = vec![entry("127.0.0.1"), entry("192.0.2.1")];
         let open = connect_sweep(
             &sources,
             &[port],
