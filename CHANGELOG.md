@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.34.0](https://github.com/nexuslibs/cleanscan/compare/v0.33.0...v0.34.0) (2026-08-11)
+
+
+### Features
+
+* **tui:** enhance review functionality for sweep mode and sampling estimates ([1e76166](https://github.com/nexuslibs/cleanscan/commit/1e76166d111b5137b5bcad4612bb01a2f8936ed8))
+* **tui:** offer syn discovery driver in the wizard ([47f50b3](https://github.com/nexuslibs/cleanscan/commit/47f50b3c37abe6d54322635c614ab9d867f4d7e3))
+* **tui:** offer syn discovery driver in the wizard ([de84575](https://github.com/nexuslibs/cleanscan/commit/de845755ff1421c02c55e0b49be0b656f3f04a55))
+
+
+### Bug Fixes
+
+* **syn:** satisfy clippy 1.97 needless_as_bytes lint ([7cae3f4](https://github.com/nexuslibs/cleanscan/commit/7cae3f420f36b12c973052c950e78ae3846d12ca))
+
 ## [0.33.0](https://github.com/nexuslibs/cleanscan/compare/v0.32.0...v0.33.0) (2026-08-10)
 
 
