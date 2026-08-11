@@ -52,6 +52,9 @@ sudo cargo build --release --features syn
 sudo cleanscan --cli --discover syn --host example.com --rate 10000
 ```
 
+In syn-enabled builds the TUI wizard also offers `syn` as a discovery-driver
+choice; the same root, IPv4, and Ethernet requirements apply at scan start.
+
 `--interface <name>` also selects the capture device for the SYN sweep
 (defaults to the default device). Outbound connections are bound to the
 interface's address; on Linux the kernel still picks the egress path from the

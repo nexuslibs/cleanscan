@@ -33,8 +33,10 @@ cargo test --locked
   the engine needs root (`euid 0`); its loopback end-to-end test skips itself
   when not root.
 - SYN sweeps are IPv4-only and Ethernet-only and need a reachable IPv4 default
-  gateway; the TUI wizard deliberately keeps the `syn` driver unreachable
-  (CLI-only).
+  gateway. In syn-featured builds the TUI wizard offers `syn` as a discovery
+  driver (toggle cycles sampling → connect → syn); without the feature it stays
+  hidden and the runtime reports the missing feature. Root is checked at scan
+  start, not at wizard time.
 
 ## Branch and commit enforcement
 

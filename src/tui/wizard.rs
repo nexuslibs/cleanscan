@@ -211,8 +211,8 @@ impl SettingField {
             SettingField::EarlyStopMinSamples => "Minimum number of measured probes before any early-stop rule may fire, so a single first-timeout does not abort an otherwise-good target.",
             SettingField::EarlyStopPrune => "Once at least 'Top results' READY candidates exist, stop probing targets whose current score remains worse than the current top-N boundary after applying the margin tolerance.",
             SettingField::EarlyStopPruneMargin => "How much worse (as a fraction) a target may be than the worst current top-N candidate before the prune rule stops probing it.",
-            SettingField::TwoPhase => "Run a sparse discovery pass first, then spend the rest of the probe budget focusing on the CIDRs that produced the best Cloudflare colos. Finds good edges faster and densifies there. Not available with the connect discovery driver.",
-            SettingField::DiscoveryDriver => "How the target set is produced before probing: `sampling` picks random IPs from each selected CIDR; `connect` sweeps every address in the selected ranges with plain TCP connects and only addresses with a reachable probe port become targets (masscan-style discovery without raw sockets). A raw SYN sweep (`syn`) is a CLI-only option for root builds with the `syn` feature. Selecting connect disables two-phase scanning.",
+            SettingField::TwoPhase => "Run a sparse discovery pass first, then spend the rest of the probe budget focusing on the CIDRs that produced the best Cloudflare colos. Finds good edges faster and densifies there. Not available with the connect or syn discovery driver.",
+            SettingField::DiscoveryDriver => "How the target set is produced before probing: `sampling` picks random IPs from each selected CIDR; `connect` sweeps every address in the selected ranges with plain TCP connects and only addresses with a reachable probe port become targets (masscan-style discovery without raw sockets); `syn` does the same with a raw SYN sweep (root, IPv4/Ethernet, and a build with the `syn` feature). Selecting connect or syn disables two-phase scanning.",
             SettingField::DiscoverFraction => "Fraction of sample_per_cidr used for the discovery pass when two-phase scanning is enabled; the remainder is spent on the focused CIDRs.",
             SettingField::AdaptiveProbing => "Allocate probes adaptively using confidence intervals instead of probing every target equally.",
             SettingField::MinProbes => "Minimum measured probes before adaptive stopping can occur.",
@@ -801,10 +801,18 @@ impl SettingField {
                         args.two_phase = false;
                     }
                     "syn" => {
-                        return Err(
-                            "syn requires root and a CLI build with the `syn` feature; use sampling or connect"
-                                .to_string(),
-                        )
+                        #[cfg(feature = "syn")]
+                        {
+                            args.discovery_driver = DiscoveryDriver::Syn;
+                            args.two_phase = false;
+                        }
+                        #[cfg(not(feature = "syn"))]
+                        {
+                            return Err(
+                                "syn requires a build with the `syn` cargo feature; use sampling or connect"
+                                    .to_string(),
+                            );
+                        }
                     }
                     _ => return Err("enter sampling, connect, or syn".to_string()),
                 }
@@ -921,9 +929,13 @@ impl SettingField {
             SettingField::DiscoveryDriver => {
                 args.discovery_driver = match args.discovery_driver {
                     DiscoveryDriver::Sampling => DiscoveryDriver::Connect,
+                    #[cfg(feature = "syn")]
+                    DiscoveryDriver::Connect => DiscoveryDriver::Syn,
                     _ => DiscoveryDriver::Sampling,
                 };
-                if args.discovery_driver == DiscoveryDriver::Connect {
+                // Connect and SYN discovery replace the two-phase sampling
+                // pass as target-selection strategies.
+                if args.discovery_driver != DiscoveryDriver::Sampling {
                     args.two_phase = false;
                 }
             }
@@ -1716,7 +1728,7 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
             Span::raw(match app.config.discovery_driver {
                 DiscoveryDriver::Sampling => "sampling (random per-CIDR)".to_string(),
                 DiscoveryDriver::Connect => "connect sweep (full range)".to_string(),
-                DiscoveryDriver::Syn => "syn (not implemented)".to_string(),
+                DiscoveryDriver::Syn => "syn (raw SYN sweep)".to_string(),
             }),
         ]),
         Line::from(vec![
@@ -2715,6 +2727,22 @@ mod tests {
         assert_eq!(config.discovery_driver, DiscoveryDriver::Sampling);
         SettingField::DiscoveryDriver.toggle(&mut config);
         assert_eq!(config.discovery_driver, DiscoveryDriver::Connect);
+        #[cfg(not(feature = "syn"))]
+        {
+            SettingField::DiscoveryDriver.toggle(&mut config);
+            assert_eq!(config.discovery_driver, DiscoveryDriver::Sampling);
+        }
+    }
+
+    #[cfg(feature = "syn")]
+    #[test]
+    fn discovery_driver_cycles_through_syn_when_built_with_feature() {
+        let mut config = AppConfig::default();
+        SettingField::DiscoveryDriver.toggle(&mut config);
+        assert_eq!(config.discovery_driver, DiscoveryDriver::Connect);
+        SettingField::DiscoveryDriver.toggle(&mut config);
+        assert_eq!(config.discovery_driver, DiscoveryDriver::Syn);
+        assert!(!config.two_phase);
         SettingField::DiscoveryDriver.toggle(&mut config);
         assert_eq!(config.discovery_driver, DiscoveryDriver::Sampling);
     }
@@ -2752,13 +2780,25 @@ mod tests {
             .is_ok());
         assert_eq!(config.discovery_driver, DiscoveryDriver::Sampling);
 
-        assert!(SettingField::DiscoveryDriver
-            .apply("syn", &mut config)
-            .is_err());
+        #[cfg(feature = "syn")]
+        {
+            assert!(SettingField::DiscoveryDriver
+                .apply("syn", &mut config)
+                .is_ok());
+            assert_eq!(config.discovery_driver, DiscoveryDriver::Syn);
+            assert!(!config.two_phase);
+        }
+        #[cfg(not(feature = "syn"))]
+        {
+            assert!(SettingField::DiscoveryDriver
+                .apply("syn", &mut config)
+                .is_err());
+            assert_eq!(config.discovery_driver, DiscoveryDriver::Sampling);
+        }
+
         assert!(SettingField::DiscoveryDriver
             .apply("bogus", &mut config)
             .is_err());
-        assert_eq!(config.discovery_driver, DiscoveryDriver::Sampling);
     }
 
     #[test]
