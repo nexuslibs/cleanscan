@@ -211,8 +211,8 @@ impl SettingField {
             SettingField::EarlyStopMinSamples => "Minimum number of measured probes before any early-stop rule may fire, so a single first-timeout does not abort an otherwise-good target.",
             SettingField::EarlyStopPrune => "Once at least 'Top results' READY candidates exist, stop probing targets whose current score remains worse than the current top-N boundary after applying the margin tolerance.",
             SettingField::EarlyStopPruneMargin => "How much worse (as a fraction) a target may be than the worst current top-N candidate before the prune rule stops probing it.",
-            SettingField::TwoPhase => "Run a sparse discovery pass first, then spend the rest of the probe budget focusing on the CIDRs that produced the best Cloudflare colos. Finds good edges faster and densifies there. Not available with the connect discovery driver.",
-            SettingField::DiscoveryDriver => "How the target set is produced before probing: `sampling` picks random IPs from each selected CIDR; `connect` sweeps every address in the selected ranges with plain TCP connects and only addresses with a reachable probe port become targets (masscan-style discovery without raw sockets). A raw SYN sweep (`syn`) is a CLI-only option for root builds with the `syn` feature. Selecting connect disables two-phase scanning.",
+            SettingField::TwoPhase => "Run a sparse discovery pass first, then spend the rest of the probe budget focusing on the CIDRs that produced the best Cloudflare colos. Finds good edges faster and densifies there. Not available with the connect or syn discovery driver.",
+            SettingField::DiscoveryDriver => "How the target set is produced before probing: `sampling` picks random IPs from each selected CIDR; `connect` sweeps every address in the selected ranges with plain TCP connects and only addresses with a reachable probe port become targets (masscan-style discovery without raw sockets); `syn` does the same with a raw SYN sweep (root, IPv4/Ethernet, and a build with the `syn` feature). Selecting connect or syn disables two-phase scanning.",
             SettingField::DiscoverFraction => "Fraction of sample_per_cidr used for the discovery pass when two-phase scanning is enabled; the remainder is spent on the focused CIDRs.",
             SettingField::AdaptiveProbing => "Allocate probes adaptively using confidence intervals instead of probing every target equally.",
             SettingField::MinProbes => "Minimum measured probes before adaptive stopping can occur.",
@@ -801,10 +801,18 @@ impl SettingField {
                         args.two_phase = false;
                     }
                     "syn" => {
-                        return Err(
-                            "syn requires root and a CLI build with the `syn` feature; use sampling or connect"
-                                .to_string(),
-                        )
+                        #[cfg(feature = "syn")]
+                        {
+                            args.discovery_driver = DiscoveryDriver::Syn;
+                            args.two_phase = false;
+                        }
+                        #[cfg(not(feature = "syn"))]
+                        {
+                            return Err(
+                                "syn requires a build with the `syn` cargo feature; use sampling or connect"
+                                    .to_string(),
+                            );
+                        }
                     }
                     _ => return Err("enter sampling, connect, or syn".to_string()),
                 }
@@ -921,9 +929,13 @@ impl SettingField {
             SettingField::DiscoveryDriver => {
                 args.discovery_driver = match args.discovery_driver {
                     DiscoveryDriver::Sampling => DiscoveryDriver::Connect,
+                    #[cfg(feature = "syn")]
+                    DiscoveryDriver::Connect => DiscoveryDriver::Syn,
                     _ => DiscoveryDriver::Sampling,
                 };
-                if args.discovery_driver == DiscoveryDriver::Connect {
+                // Connect and SYN discovery replace the two-phase sampling
+                // pass as target-selection strategies.
+                if args.discovery_driver != DiscoveryDriver::Sampling {
                     args.two_phase = false;
                 }
             }
@@ -1615,30 +1627,24 @@ fn numeric_slider_bounds(field: SettingField) -> (f64, f64) {
 
 fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
     let (selected, workload) = selected_cidrs_and_workload(app);
-    let connect_mode = app.config.discovery_driver == DiscoveryDriver::Connect;
+    let sweep_mode = review_sweep_mode(app.config.discovery_driver);
 
     let selected_count = selected.len();
     let preview_ready = !app.preview_targets.is_empty();
     // A generated preview is deduplicated by the scanner and is therefore
     // authoritative for the actual target workload. Before generation, the
     // deterministic per-CIDR cap is the stable upper-bound estimate. In
-    // connect mode the sweep enumerates every address in the selected ranges.
-    let total_ips = if connect_mode {
-        crate::discovery::enumerated_address_count(
-            &crate::discovery::parse_target_sources(None, &selected).unwrap_or_default(),
-        )
-    } else if preview_ready {
-        app.preview_targets.len() as u128
-    } else {
-        workload.total_ips
-    };
-    let total_probes = if connect_mode {
-        total_ips.saturating_mul(app.config.ports.len().max(1) as u128)
-    } else {
-        total_ips
-            .saturating_mul(app.config.probes as u128)
-            .saturating_mul(app.config.ports.len().max(1) as u128)
-    };
+    // sweep mode (connect or syn) the sweep enumerates every address in the
+    // selected ranges instead of sampling.
+    let (total_ips, total_probes) = review_totals(
+        &selected,
+        preview_ready,
+        app.preview_targets.len(),
+        &app.config,
+        workload.total_ips,
+    );
+    let (readiness_text, readiness_warn) =
+        review_readiness(sweep_mode, preview_ready, app.config.concurrency, total_ips);
 
     // Ideal scan duration estimate
     let ideal_seconds =
@@ -1716,7 +1722,7 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
             Span::raw(match app.config.discovery_driver {
                 DiscoveryDriver::Sampling => "sampling (random per-CIDR)".to_string(),
                 DiscoveryDriver::Connect => "connect sweep (full range)".to_string(),
-                DiscoveryDriver::Syn => "syn (not implemented)".to_string(),
+                DiscoveryDriver::Syn => "syn (raw SYN sweep)".to_string(),
             }),
         ]),
         Line::from(vec![
@@ -1789,21 +1795,8 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            if connect_mode {
-                "Ready: sweep will find reachable ports, then probe them"
-            } else if !preview_ready {
-                "Unavailable: target preview could not be generated"
-            } else if app.config.concurrency > 500 {
-                "Warning: very high concurrency may trigger rate limits"
-            } else if total_ips > 10_000 {
-                "Warning: large target set; this scan may take significant time"
-            } else {
-                "Ready: sampled targets are stable for this review"
-            },
-            if (!connect_mode && !preview_ready)
-                || app.config.concurrency > 500
-                || total_ips > 10_000
-            {
+            readiness_text,
+            if readiness_warn {
                 theme::warn_style()
             } else {
                 theme::good_style()
@@ -1818,6 +1811,72 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
     let block_right = widgets::panel_block("Scope & Workload", false);
     let para_right = Paragraph::new(summary_right).block(block_right);
     frame.render_widget(para_right, main_layout[1]);
+}
+
+/// Whether the driver sweeps every candidate address in the selected ranges
+/// (connect or syn) instead of sampling a per-CIDR subset.
+fn review_sweep_mode(driver: DiscoveryDriver) -> bool {
+    matches!(driver, DiscoveryDriver::Connect | DiscoveryDriver::Syn)
+}
+
+/// Candidate and probe totals shown on the review screen. Sweep drivers
+/// enumerate the full selected ranges; sampled drivers use the generated
+/// preview when available and the deterministic per-CIDR cap otherwise.
+fn review_totals(
+    selected: &[String],
+    preview_ready: bool,
+    preview_len: usize,
+    config: &AppConfig,
+    sampled_total: u128,
+) -> (u128, u128) {
+    let total_ips = if review_sweep_mode(config.discovery_driver) {
+        crate::discovery::enumerated_address_count(
+            &crate::discovery::parse_target_sources(None, selected).unwrap_or_default(),
+        )
+    } else if preview_ready {
+        preview_len as u128
+    } else {
+        sampled_total
+    };
+    let total_probes = if review_sweep_mode(config.discovery_driver) {
+        total_ips.saturating_mul(config.ports.len().max(1) as u128)
+    } else {
+        total_ips
+            .saturating_mul(config.probes as u128)
+            .saturating_mul(config.ports.len().max(1) as u128)
+    };
+    (total_ips, total_probes)
+}
+
+/// Readiness line for the review screen and whether it warns. Sweep drivers
+/// report the sweep-ready status even when the target set is large, but still
+/// warn on very high concurrency or huge ranges.
+fn review_readiness(
+    sweep_mode: bool,
+    preview_ready: bool,
+    concurrency: usize,
+    total_ips: u128,
+) -> (&'static str, bool) {
+    if sweep_mode {
+        (
+            "Ready: sweep will find reachable ports, then probe them",
+            concurrency > 500 || total_ips > 10_000,
+        )
+    } else if !preview_ready {
+        ("Unavailable: target preview could not be generated", true)
+    } else if concurrency > 500 {
+        (
+            "Warning: very high concurrency may trigger rate limits",
+            true,
+        )
+    } else if total_ips > 10_000 {
+        (
+            "Warning: large target set; this scan may take significant time",
+            true,
+        )
+    } else {
+        ("Ready: sampled targets are stable for this review", false)
+    }
 }
 
 fn ideal_scan_seconds(total_probes: u128, concurrency: usize, timeout_ms: u64) -> f64 {
@@ -2463,10 +2522,11 @@ fn next_char_boundary(s: &str, index: usize) -> usize {
 mod tests {
     use super::{
         handle_settings_key, ideal_scan_seconds, next_char_boundary, numeric_slider_bounds,
-        previous_char_boundary, SettingField,
+        previous_char_boundary, review_readiness, review_totals, selected_cidrs_and_workload,
+        SettingField,
     };
     use crate::config::{AppConfig, DiscoveryDriver};
-    use crate::tui::App;
+    use crate::tui::{App, CidrEntry};
     use std::sync::{atomic::AtomicBool, Arc};
 
     fn settings_app() -> App {
@@ -2715,6 +2775,22 @@ mod tests {
         assert_eq!(config.discovery_driver, DiscoveryDriver::Sampling);
         SettingField::DiscoveryDriver.toggle(&mut config);
         assert_eq!(config.discovery_driver, DiscoveryDriver::Connect);
+        #[cfg(not(feature = "syn"))]
+        {
+            SettingField::DiscoveryDriver.toggle(&mut config);
+            assert_eq!(config.discovery_driver, DiscoveryDriver::Sampling);
+        }
+    }
+
+    #[cfg(feature = "syn")]
+    #[test]
+    fn discovery_driver_cycles_through_syn_when_built_with_feature() {
+        let mut config = AppConfig::default();
+        SettingField::DiscoveryDriver.toggle(&mut config);
+        assert_eq!(config.discovery_driver, DiscoveryDriver::Connect);
+        SettingField::DiscoveryDriver.toggle(&mut config);
+        assert_eq!(config.discovery_driver, DiscoveryDriver::Syn);
+        assert!(!config.two_phase);
         SettingField::DiscoveryDriver.toggle(&mut config);
         assert_eq!(config.discovery_driver, DiscoveryDriver::Sampling);
     }
@@ -2752,13 +2828,75 @@ mod tests {
             .is_ok());
         assert_eq!(config.discovery_driver, DiscoveryDriver::Sampling);
 
-        assert!(SettingField::DiscoveryDriver
-            .apply("syn", &mut config)
-            .is_err());
+        #[cfg(feature = "syn")]
+        {
+            assert!(SettingField::DiscoveryDriver
+                .apply("syn", &mut config)
+                .is_ok());
+            assert_eq!(config.discovery_driver, DiscoveryDriver::Syn);
+            assert!(!config.two_phase);
+        }
+        #[cfg(not(feature = "syn"))]
+        {
+            assert!(SettingField::DiscoveryDriver
+                .apply("syn", &mut config)
+                .is_err());
+            assert_eq!(config.discovery_driver, DiscoveryDriver::Sampling);
+        }
+
         assert!(SettingField::DiscoveryDriver
             .apply("bogus", &mut config)
             .is_err());
-        assert_eq!(config.discovery_driver, DiscoveryDriver::Sampling);
+    }
+
+    #[test]
+    fn syn_review_counts_full_range_and_reports_sweep_ready() {
+        let mut app = settings_app();
+        app.config.discovery_driver = DiscoveryDriver::Syn;
+        app.cidr_candidates = vec![CidrEntry {
+            cidr: "10.0.0.0/24".to_string(),
+            selected: true,
+        }];
+        let (selected, workload) = selected_cidrs_and_workload(&app);
+        let (ips, probes) = review_totals(&selected, false, 0, &app.config, workload.total_ips);
+        assert_eq!(
+            ips, 254,
+            "syn enumerates the full range, not the sample cap"
+        );
+        assert_eq!(probes, ips * app.config.ports.len().max(1) as u128);
+        let (text, warn) = review_readiness(true, false, app.config.concurrency, ips);
+        assert_eq!(
+            text,
+            "Ready: sweep will find reachable ports, then probe them"
+        );
+        assert!(!warn);
+
+        let (text, warn) = review_readiness(true, false, app.config.concurrency, 65_534);
+        assert_eq!(
+            text,
+            "Ready: sweep will find reachable ports, then probe them"
+        );
+        assert!(warn, "huge sweep ranges still warn");
+    }
+
+    #[test]
+    fn sampled_review_keeps_capped_estimates_and_sampling_readiness() {
+        let mut app = settings_app();
+        app.cidr_candidates = vec![CidrEntry {
+            cidr: "10.0.0.0/16".to_string(),
+            selected: true,
+        }];
+        let (selected, workload) = selected_cidrs_and_workload(&app);
+        assert_eq!(workload.total_ips, 100, "sampling caps at sample_per_cidr");
+        let (ips, probes) = review_totals(&selected, false, 0, &app.config, workload.total_ips);
+        assert_eq!(ips, 100, "sampled drivers must not count the full range");
+        assert_eq!(
+            probes,
+            ips * app.config.probes as u128 * app.config.ports.len().max(1) as u128
+        );
+        let (text, warn) = review_readiness(false, true, app.config.concurrency, ips);
+        assert_eq!(text, "Ready: sampled targets are stable for this review");
+        assert!(!warn);
     }
 
     #[test]

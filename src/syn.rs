@@ -159,7 +159,7 @@ fn interface_mac(name: &str) -> Result<[u8; 6]> {
         );
     }
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-    if name.as_bytes().len() >= ifr.ifr_name.len() {
+    if name.len() >= ifr.ifr_name.len() {
         unsafe { libc::close(fd) };
         bail!("interface name {name:?} is too long");
     }

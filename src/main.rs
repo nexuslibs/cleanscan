@@ -511,7 +511,7 @@ fn main() -> Result<()> {
     if args.watch.is_some() && config.two_phase {
         anyhow::bail!("--watch cannot be combined with --two-phase");
     }
-    if config.discovery_driver == DiscoveryDriver::Syn {
+    if config.discovery_driver == DiscoveryDriver::Syn && args.discover.is_some() {
         #[cfg(not(feature = "syn"))]
         anyhow::bail!(
             "--discover syn requires a build with the `syn` cargo feature: `cargo build --features syn`"
