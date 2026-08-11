@@ -75,6 +75,7 @@ fn wizard_lines(step: WizardStep) -> Vec<Line<'static>> {
             v.push(key("a", "Add a custom CIDR range"));
             v.push(key("A", "Select all ranges"));
             v.push(key("N / n / d", "Deselect all ranges"));
+            v.push(key("s", "Toggle full-range sweep (every address)"));
             v.push(key("c", "Jump to scan parameters"));
             v.push(key("Enter", "Edit or activate the focused control"));
             v.push(key("↑ / ↓", "Move through ranges"));
