@@ -1453,6 +1453,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
                     lines.push(Line::from(format!("  {row}")).style(style));
                     row_map.push(Some(i));
                     ports_row_map.push(Some(index));
+                    interface_row_map.push(None);
                 }
                 field_idx += 1;
                 continue;

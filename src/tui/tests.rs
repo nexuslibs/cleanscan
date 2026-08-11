@@ -1761,3 +1761,33 @@ fn mouse_tap_commits_the_clicked_interface_while_editing() {
     assert_eq!(app.edit_field, None, "tap should commit the selection");
     assert_eq!(app.config.interface, expected);
 }
+
+#[test]
+fn ports_editor_keeps_row_maps_aligned() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.wizard_step = WizardStep::Settings;
+    let ports_idx = SettingField::ALL
+        .iter()
+        .position(|field| *field == SettingField::Ports)
+        .unwrap();
+    app.start_edit(ports_idx);
+
+    // Tall terminal: the visible slice covers every row, so the row maps
+    // must all stay as long as the rendered list.
+    draw(&mut app, 120, 80);
+
+    assert_eq!(
+        app.settings_row_map.len(),
+        app.interface_row_map.len(),
+        "interface row map must track the rendered rows while ports are edited"
+    );
+    assert_eq!(
+        app.settings_row_map.len(),
+        app.ports_row_map.len(),
+        "ports row map must track the rendered rows while ports are edited"
+    );
+}
