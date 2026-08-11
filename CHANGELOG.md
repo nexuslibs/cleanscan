@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.35.0](https://github.com/nexuslibs/cleanscan/compare/v0.34.0...v0.35.0) (2026-08-11)
+
+
+### Features
+
+* **tui:** add full-range sweep toggle on ranges step ([19ae90f](https://github.com/nexuslibs/cleanscan/commit/19ae90febec6173db1001f8efb03c33b5bc79278))
+* **tui:** add full-range sweep toggle on ranges step ([1b4d28a](https://github.com/nexuslibs/cleanscan/commit/1b4d28a5803b61cd8656703d73160bf328abbafc))
+* **tui:** implement two-phase preference handling for full-range sweep ([da003d2](https://github.com/nexuslibs/cleanscan/commit/da003d2be35997c74d7b2d61ece7a14f516288c0))
+
 ## [0.34.0](https://github.com/nexuslibs/cleanscan/compare/v0.33.0...v0.34.0) (2026-08-11)
 
 
