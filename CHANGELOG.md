@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.36.0](https://github.com/nexuslibs/cleanscan/compare/v0.35.0...v0.36.0) (2026-08-11)
+
+
+### Features
+
+* **tui:** add test for ports editor row map alignment ([78737c9](https://github.com/nexuslibs/cleanscan/commit/78737c9a59c20210f3a595b6de78b10903de74a9))
+
 ## [0.35.0](https://github.com/nexuslibs/cleanscan/compare/v0.34.0...v0.35.0) (2026-08-11)
 
 
