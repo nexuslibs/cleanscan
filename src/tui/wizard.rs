@@ -1012,6 +1012,18 @@ fn worker_summary(app: &App) -> String {
     }
 }
 
+/// How the selected ranges become targets, as shown on the ranges step.
+fn scan_mode_label(app: &App) -> String {
+    match app.config.discovery_driver {
+        DiscoveryDriver::Sampling => format!(
+            "sample {} IPs per CIDR",
+            format_ip_count(app.config.sample_per_cidr as u128)
+        ),
+        DiscoveryDriver::Connect => "full-range sweep (TCP connect)".to_string(),
+        DiscoveryDriver::Syn => "full-range sweep (raw SYN)".to_string(),
+    }
+}
+
 fn selected_cidrs_and_workload(app: &App) -> (Vec<String>, crate::scanner::CidrWorkloadSummary) {
     let selected_cidrs: Vec<String> = app
         .cidr_candidates
@@ -1062,8 +1074,10 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(chunks[0]);
 
-    let list_block =
-        widgets::panel_block("Cloudflare CIDR ranges (space toggle, A all, N none)", true);
+    let list_block = widgets::panel_block(
+        "Cloudflare CIDR ranges (space toggle, A all, N none, s sweep)",
+        true,
+    );
     let inner = list_block.inner(main_layout[0]);
     frame.render_widget(list_block, main_layout[0]);
     app.ranges_inner = Some(inner);
@@ -1183,8 +1197,8 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
             )),
         ]),
         Line::from(vec![
-            Span::styled("Sample per CIDR: ", theme::title_style()),
-            Span::raw(app.config.sample_per_cidr.to_string()),
+            Span::styled("Scan mode  : ", theme::title_style()),
+            Span::raw(scan_mode_label(app)),
         ]),
         Line::from(vec![
             Span::styled("Total target IPs: ", theme::title_style()),
@@ -1207,6 +1221,10 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
         Line::from(vec![
             Span::styled("  a  ", theme::highlight_style()),
             Span::raw("Add a custom CIDR range"),
+        ]),
+        Line::from(vec![
+            Span::styled("  s  ", theme::highlight_style()),
+            Span::raw("Toggle full-range sweep"),
         ]),
     ];
 
@@ -1948,6 +1966,7 @@ fn render_hint(app: &App, frame: &mut Frame, area: Rect) {
                 &[
                     ("Tab", "focus"),
                     ("Space", "toggle"),
+                    ("s", "sweep"),
                     (widgets::enter_key(), "next"),
                     ("/", "commands"),
                     ("?", "help"),
@@ -2092,6 +2111,42 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
         KeyCode::Char('A') => {
             for e in app.cidr_candidates.iter_mut() {
                 e.selected = true;
+            }
+            app.invalidate_preview();
+            app.save_config();
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            let selected: Vec<String> = app
+                .cidr_candidates
+                .iter()
+                .filter(|e| e.selected)
+                .map(|e| e.cidr.clone())
+                .collect();
+            if app.config.discovery_driver == DiscoveryDriver::Sampling {
+                app.config.discovery_driver = DiscoveryDriver::Connect;
+                // Sweep and the two-phase sampling pass are alternative
+                // target-selection strategies.
+                app.config.two_phase = false;
+                let total = crate::discovery::parse_target_sources(None, &selected)
+                    .map(|sources| crate::discovery::enumerated_address_count(&sources))
+                    .unwrap_or(0);
+                if total > 10_000 {
+                    app.toast_warn(format!(
+                        "Full-range sweep: {} addresses will be scanned; large ranges take significant time",
+                        format_ip_count(total)
+                    ));
+                } else {
+                    app.toast_info(format!(
+                        "Full-range sweep enabled: {} addresses will be scanned; reachable ports become targets",
+                        format_ip_count(total)
+                    ));
+                }
+            } else {
+                app.config.discovery_driver = DiscoveryDriver::Sampling;
+                app.toast_info(format!(
+                    "Sampling mode restored: {} random IPs per CIDR",
+                    app.config.sample_per_cidr
+                ));
             }
             app.invalidate_preview();
             app.save_config();
@@ -2521,9 +2576,9 @@ fn next_char_boundary(s: &str, index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_settings_key, ideal_scan_seconds, next_char_boundary, numeric_slider_bounds,
-        previous_char_boundary, review_readiness, review_totals, selected_cidrs_and_workload,
-        SettingField,
+        handle_ranges_key, handle_settings_key, ideal_scan_seconds, next_char_boundary,
+        numeric_slider_bounds, previous_char_boundary, review_readiness, review_totals,
+        selected_cidrs_and_workload, SettingField,
     };
     use crate::config::{AppConfig, DiscoveryDriver};
     use crate::tui::{App, CidrEntry};
@@ -2812,6 +2867,35 @@ mod tests {
         SettingField::TwoPhase.toggle(&mut config);
         assert!(config.two_phase);
         assert_eq!(config.discovery_driver, DiscoveryDriver::Sampling);
+    }
+
+    #[test]
+    fn ranges_sweep_key_toggles_between_sampling_and_connect() {
+        let mut app = settings_app();
+        app.cidr_candidates = vec![CidrEntry {
+            cidr: "10.0.0.0/24".to_string(),
+            selected: true,
+        }];
+        assert_eq!(app.config.discovery_driver, DiscoveryDriver::Sampling);
+
+        app.config.two_phase = true;
+        handle_ranges_key(&mut app, crossterm::event::KeyCode::Char('s'));
+        assert_eq!(
+            app.config.discovery_driver,
+            DiscoveryDriver::Connect,
+            "s enables the full-range connect sweep"
+        );
+        assert!(
+            !app.config.two_phase,
+            "sweep and the two-phase sampling pass are exclusive"
+        );
+
+        handle_ranges_key(&mut app, crossterm::event::KeyCode::Char('S'));
+        assert_eq!(
+            app.config.discovery_driver,
+            DiscoveryDriver::Sampling,
+            "s restores sampling mode"
+        );
     }
 
     #[test]
