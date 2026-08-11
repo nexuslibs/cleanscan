@@ -1183,7 +1183,24 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
 
     // Right Side Info Panel
     let selected_count = app.cidr_candidates.iter().filter(|e| e.selected).count();
-    let (_, workload) = selected_cidrs_and_workload(app);
+    let (selected_cidrs, workload) = selected_cidrs_and_workload(app);
+    let sweep = matches!(
+        app.config.discovery_driver,
+        DiscoveryDriver::Connect | DiscoveryDriver::Syn
+    );
+    let (total_ips, total_probes) = if sweep {
+        // The full-range sweep probes every candidate address against every
+        // selected port, so the sampling-based workload is not applicable.
+        let candidates = crate::discovery::parse_target_sources(None, &selected_cidrs)
+            .map(|sources| crate::discovery::enumerated_address_count(&sources))
+            .unwrap_or(0);
+        (
+            candidates,
+            candidates.saturating_mul(app.config.ports.len().max(1) as u128),
+        )
+    } else {
+        (workload.total_ips, workload.total_probes)
+    };
 
     let info_text = vec![
         Line::from(vec![Span::styled(" RANGE SUMMARY ", theme::header_style())]),
@@ -1201,12 +1218,26 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
             Span::raw(scan_mode_label(app)),
         ]),
         Line::from(vec![
-            Span::styled("Total target IPs: ", theme::title_style()),
-            Span::raw(format_ip_count(workload.total_ips)),
+            Span::styled(
+                if sweep {
+                    "Sweep candidates : "
+                } else {
+                    "Total target IPs: "
+                },
+                theme::title_style(),
+            ),
+            Span::raw(format_ip_count(total_ips)),
         ]),
         Line::from(vec![
-            Span::styled("Total HTTP Probes: ", theme::title_style()),
-            Span::raw(format_ip_count(workload.total_probes)),
+            Span::styled(
+                if sweep {
+                    "Max sweep probes: "
+                } else {
+                    "Total HTTP Probes: "
+                },
+                theme::title_style(),
+            ),
+            Span::raw(format_ip_count(total_probes)),
         ]),
         Line::from(""),
         Line::from(Span::styled(" Quick Actions: ", theme::subtitle_style())),
@@ -2123,9 +2154,11 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
                 .map(|e| e.cidr.clone())
                 .collect();
             if app.config.discovery_driver == DiscoveryDriver::Sampling {
-                app.config.discovery_driver = DiscoveryDriver::Connect;
                 // Sweep and the two-phase sampling pass are alternative
-                // target-selection strategies.
+                // target-selection strategies; remember the two-phase
+                // preference so switching back to sampling restores it.
+                app.two_phase_before_sweep = app.config.two_phase;
+                app.config.discovery_driver = DiscoveryDriver::Connect;
                 app.config.two_phase = false;
                 let total = crate::discovery::parse_target_sources(None, &selected)
                     .map(|sources| crate::discovery::enumerated_address_count(&sources))
@@ -2143,6 +2176,7 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
                 }
             } else {
                 app.config.discovery_driver = DiscoveryDriver::Sampling;
+                app.config.two_phase = app.two_phase_before_sweep;
                 app.toast_info(format!(
                     "Sampling mode restored: {} random IPs per CIDR",
                     app.config.sample_per_cidr
@@ -2895,6 +2929,10 @@ mod tests {
             app.config.discovery_driver,
             DiscoveryDriver::Sampling,
             "s restores sampling mode"
+        );
+        assert!(
+            app.config.two_phase,
+            "s restores the two-phase setting saved before the sweep"
         );
     }
 

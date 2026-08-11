@@ -98,6 +98,9 @@ pub(crate) fn modal_overlay(
 pub struct App {
     /// Editable scan parameters; drive the scan when launched from the wizard.
     pub config: AppConfig,
+    /// Two-phase preference saved when the ranges step enables the full-range
+    /// sweep; restored when the sweep is toggled back to sampling.
+    pub two_phase_before_sweep: bool,
     pub system_network: crate::system_info::SystemNetworkInfo,
     pub screen: Screen,
     pub wizard_step: WizardStep,
@@ -479,6 +482,7 @@ impl App {
 
     pub fn new(config: AppConfig, has_cli_targets: bool, paused: Arc<AtomicBool>) -> Self {
         let scan_seed = config.seed;
+        let two_phase_before_sweep = config.two_phase;
         let mut cidr_candidates = Vec::new();
 
         let default_set: std::collections::HashSet<String> =
@@ -510,6 +514,7 @@ impl App {
 
         Self {
             config,
+            two_phase_before_sweep,
             system_network: crate::system_info::SystemNetworkInfo::default(),
             screen: if has_cli_targets {
                 Screen::Scanning
