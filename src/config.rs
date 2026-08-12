@@ -6,6 +6,8 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::{fs, io::Write};
 
+use crate::proxy::FragmentSpec;
+
 pub const CLOUDFLARE_HTTPS_PORTS: &[u16] = &[443, 2053, 2083, 2087, 2096, 8443];
 
 pub fn default_ports() -> Vec<u16> {
@@ -136,6 +138,11 @@ pub struct AppConfig {
     /// Interface for the raw SYN sweep; `None` picks the default device.
     #[serde(default)]
     pub interface: Option<String>,
+    /// Xray-style TLS fragmentation (xray `freedom` fragment settings) applied
+    /// to protocol checks (`--proxy-url`) and the TUI fragment tester.
+    /// `None` disables fragmentation.
+    #[serde(default)]
+    pub tls_fragment: Option<FragmentSpec>,
     pub probes: usize,
     pub concurrency: usize,
     pub timeout_ms: u64,
@@ -343,6 +350,7 @@ impl Default for AppConfig {
             syn_rate: default_syn_rate(),
             syn_retransmits: default_syn_retransmits(),
             interface: None,
+            tls_fragment: None,
             probes: 8,
             concurrency: 120,
             timeout_ms: 2500,

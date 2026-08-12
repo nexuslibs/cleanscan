@@ -1,5 +1,6 @@
 mod clipboard;
 pub mod dashboard;
+pub mod fragment;
 pub mod help;
 mod run;
 pub mod speed;
@@ -254,6 +255,20 @@ pub struct App {
     pub speed_start_time: Instant,
     pub pending_speed_start: bool,
     pub confirm_speed_start: bool,
+    /// TLS fragment tester state: target IP, per-profile toggles, results.
+    pub fragment_ip: String,
+    /// Port probed by the fragment tester, prefilled from the result the
+    /// target IP came from (defaults to 443).
+    pub fragment_port: u16,
+    pub fragment_ip_editing: bool,
+    pub fragment_enabled: Vec<bool>,
+    pub fragment_cursor: usize,
+    pub fragment_results: Vec<crate::tui::state::FragmentTestResult>,
+    pub fragment_result_cursor: usize,
+    pub fragment_complete: bool,
+    pub fragment_cancel: Arc<AtomicBool>,
+    pub fragment_start_time: Instant,
+    pub pending_fragment_start: bool,
     confirm_scan_action: Option<PendingScanAction>,
     /// Active semantic focus target and its position in the current screen's
     /// focus map. Focus is intentionally independent from list cursors.
@@ -333,7 +348,7 @@ impl App {
             },
             Screen::Scanning => {
                 if self.scan_complete && self.scan_lifecycle != ScanLifecycle::Cancelling {
-                    5
+                    6
                 } else {
                     4
                 }
@@ -341,6 +356,9 @@ impl App {
             Screen::SpeedSelect => 8,
             Screen::SpeedTesting => 1,
             Screen::SpeedResults => 3,
+            Screen::FragmentSelect => 3,
+            Screen::FragmentTesting => 1,
+            Screen::FragmentResults => 3,
         }
     }
 
@@ -373,6 +391,9 @@ impl App {
             Screen::SpeedSelect if index == 0 => FocusTarget::List,
             Screen::SpeedResults if index == 0 => FocusTarget::Table,
             Screen::SpeedTesting => FocusTarget::Panel,
+            Screen::FragmentSelect if index == 0 => FocusTarget::List,
+            Screen::FragmentResults if index == 0 => FocusTarget::Table,
+            Screen::FragmentTesting => FocusTarget::Panel,
             _ => FocusTarget::Button,
         }
     }
@@ -409,6 +430,7 @@ impl App {
                     Action::Quit
                         | Action::Export
                         | Action::SpeedTest
+                        | Action::FragmentTest
                         | Action::CopyIp
                         | Action::OpenDetails
                         | Action::OpenHelp
@@ -460,6 +482,19 @@ impl App {
                     | Action::Back
                     | Action::OpenHelp
                     | Action::OpenCommandPalette
+            ),
+            Screen::FragmentSelect => matches!(
+                action,
+                Action::Quit
+                    | Action::Back
+                    | Action::Start
+                    | Action::OpenHelp
+                    | Action::OpenCommandPalette
+            ),
+            Screen::FragmentTesting => matches!(action, Action::Quit | Action::OpenHelp),
+            Screen::FragmentResults => matches!(
+                action,
+                Action::Quit | Action::Back | Action::OpenHelp | Action::OpenCommandPalette
             ),
         }
     }
@@ -638,6 +673,17 @@ impl App {
             speed_start_time: Instant::now(),
             pending_speed_start: false,
             confirm_speed_start: false,
+            fragment_ip: String::new(),
+            fragment_port: 443,
+            fragment_ip_editing: false,
+            fragment_enabled: vec![true; crate::proxy::TLS_FRAGMENT_PRESETS.len()],
+            fragment_cursor: 0,
+            fragment_results: Vec::new(),
+            fragment_result_cursor: 0,
+            fragment_complete: false,
+            fragment_cancel: Arc::new(AtomicBool::new(false)),
+            fragment_start_time: Instant::now(),
+            pending_fragment_start: false,
             confirm_scan_action: None,
             focus_target: FocusTarget::List,
             focus_index: 0,
@@ -1784,6 +1830,10 @@ impl App {
                 self.request_cancel();
                 return;
             }
+            KeyCode::Esc if self.screen == Screen::FragmentTesting => {
+                self.fragment_cancel.store(true, Ordering::Relaxed);
+                return;
+            }
             KeyCode::Esc if self.screen == Screen::Scanning => {
                 if self.scan_complete
                     && self.investigation.is_none()
@@ -1818,6 +1868,9 @@ impl App {
                     self.confirm_quit = true;
                 } else if self.screen == Screen::SpeedTesting {
                     self.request_cancel();
+                } else if self.screen == Screen::FragmentTesting {
+                    self.fragment_cancel.store(true, Ordering::Relaxed);
+                    self.quit_after_cancel = true;
                 } else if self.screen == Screen::Wizard && self.return_to_results {
                     self.return_to_results();
                 } else {
@@ -1859,9 +1912,10 @@ impl App {
                     }
                     2 if self.scan_complete => self.activate_action(Action::SpeedTest),
                     2 => self.activate_action(Action::StopKeepResults),
-                    3 if self.scan_complete => self.activate_action(Action::CustomizeScan),
+                    3 if self.scan_complete => self.activate_action(Action::FragmentTest),
                     3 => self.activate_action(Action::Quit),
-                    4 if self.scan_complete => self.activate_action(Action::Quit),
+                    4 if self.scan_complete => self.activate_action(Action::CustomizeScan),
+                    5 if self.scan_complete => self.activate_action(Action::Quit),
                     _ => {}
                 }
                 return;
@@ -1875,6 +1929,9 @@ impl App {
             Screen::SpeedSelect => self.handle_speed_select_key(code),
             Screen::SpeedTesting => {}
             Screen::SpeedResults => self.handle_speed_results_key(code),
+            Screen::FragmentSelect => self.handle_fragment_select_key(code),
+            Screen::FragmentTesting => {}
+            Screen::FragmentResults => self.handle_fragment_results_key(code),
         }
     }
 
@@ -1899,6 +1956,7 @@ impl App {
             Action::Export => self.save(),
             Action::PauseResume => self.activate_button(ButtonAction::PauseResume),
             Action::SpeedTest => self.activate_button(ButtonAction::SpeedTest),
+            Action::FragmentTest => self.activate_button(ButtonAction::FragmentTest),
             Action::CopyIp => self.copy_selected_ip(),
             Action::OpenDetails => {
                 if self.scan_lifecycle != ScanLifecycle::Cancelling {
@@ -2001,6 +2059,9 @@ impl App {
             Screen::Scanning => dashboard::render(self, frame, frame.area(), elapsed),
             Screen::SpeedSelect | Screen::SpeedTesting | Screen::SpeedResults => {
                 speed::render(self, frame, frame.area())
+            }
+            Screen::FragmentSelect | Screen::FragmentTesting | Screen::FragmentResults => {
+                fragment::render(self, frame, frame.area())
             }
         }
 
@@ -2322,6 +2383,7 @@ impl App {
             KeyCode::Char('p') => self.activate_action(Action::PauseResume),
             KeyCode::Char('e') => self.activate_action(Action::Export),
             KeyCode::Char('t') if self.scan_complete => self.activate_action(Action::SpeedTest),
+            KeyCode::Char('g') if self.scan_complete => self.activate_action(Action::FragmentTest),
             KeyCode::Char('c') => self.activate_action(Action::CopyIp),
             KeyCode::Up => self.move_scan_cursor(-1),
             KeyCode::Down => {
@@ -2941,6 +3003,158 @@ impl App {
         }
     }
 
+    /// Open the TLS fragment tester, prefilling the target IP from the best
+    /// selected result (or the first successful one), carrying its port.
+    fn open_fragment_selection(&mut self) {
+        let (ip, port) = {
+            let results = self.sorted_results();
+            results
+                .iter()
+                .find(|result| self.selected_targets.contains(&result.ip))
+                .or_else(|| results.iter().find(|result| result.ok > 0))
+                .map(|result| (result.ip.clone(), result.port))
+                .unwrap_or_else(|| (String::new(), 443))
+        };
+        self.fragment_ip = ip;
+        self.fragment_port = port;
+        self.fragment_ip_editing = false;
+        self.fragment_cursor = 0;
+        self.fragment_results.clear();
+        self.fragment_result_cursor = 0;
+        self.fragment_complete = false;
+        self.fragment_cancel.store(false, Ordering::Relaxed);
+        self.quit_after_cancel = false;
+        self.scroll = 0;
+        self.focus_index = 0;
+        self.focus_target = FocusTarget::List;
+        self.screen = Screen::FragmentSelect;
+    }
+
+    fn handle_fragment_select_key(&mut self, code: KeyCode) {
+        if self.fragment_ip_editing {
+            match code {
+                KeyCode::Enter => {
+                    let ip = self.edit_buffer.trim().to_string();
+                    if ip.parse::<std::net::IpAddr>().is_err() {
+                        self.toast_error("Target IP must be a valid IPv4 or IPv6 address");
+                        return;
+                    }
+                    self.fragment_ip = ip;
+                    self.fragment_ip_editing = false;
+                    self.edit_buffer.clear();
+                    self.edit_caret = 0;
+                }
+                KeyCode::Esc => {
+                    self.fragment_ip_editing = false;
+                    self.edit_buffer.clear();
+                    self.edit_caret = 0;
+                }
+                KeyCode::Backspace if self.edit_caret > 0 => {
+                    let previous = self.edit_buffer[..self.edit_caret]
+                        .char_indices()
+                        .next_back()
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                    self.edit_buffer.drain(previous..self.edit_caret);
+                    self.edit_caret = previous;
+                }
+                KeyCode::Left if self.edit_caret > 0 => {
+                    self.edit_caret = self.edit_buffer[..self.edit_caret]
+                        .char_indices()
+                        .next_back()
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                }
+                KeyCode::Right if self.edit_caret < self.edit_buffer.len() => {
+                    self.edit_caret = self.edit_buffer[self.edit_caret..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(index, _)| self.edit_caret + index)
+                        .unwrap_or(self.edit_buffer.len());
+                }
+                KeyCode::Home => self.edit_caret = 0,
+                KeyCode::End => self.edit_caret = self.edit_buffer.len(),
+                KeyCode::Char(c) => {
+                    self.edit_buffer.insert(self.edit_caret, c);
+                    self.edit_caret += c.len_utf8();
+                }
+                _ => {}
+            }
+            return;
+        }
+        let total = crate::proxy::TLS_FRAGMENT_PRESETS.len() + 1;
+        match code {
+            KeyCode::Up | KeyCode::Char('k') if self.fragment_cursor > 0 => {
+                self.fragment_cursor -= 1;
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.fragment_cursor + 1 < total => {
+                self.fragment_cursor += 1;
+            }
+            KeyCode::Char(' ') if self.fragment_cursor > 0 => {
+                let index = self.fragment_cursor - 1;
+                if let Some(enabled) = self.fragment_enabled.get_mut(index) {
+                    *enabled = !*enabled;
+                }
+            }
+            KeyCode::Enter => match self.focus_index {
+                0 if self.fragment_cursor == 0 => {
+                    self.fragment_ip_editing = true;
+                    self.edit_buffer = self.fragment_ip.clone();
+                    self.edit_caret = self.edit_buffer.len();
+                }
+                0 => {
+                    let index = self.fragment_cursor - 1;
+                    if let Some(enabled) = self.fragment_enabled.get_mut(index) {
+                        *enabled = !*enabled;
+                    }
+                }
+                1 => self.activate_button(ButtonAction::FragmentStart),
+                2 => self.activate_button(ButtonAction::FragmentBack),
+                _ => {}
+            },
+            KeyCode::Esc => self.activate_button(ButtonAction::FragmentBack),
+            _ => {}
+        }
+    }
+
+    fn handle_fragment_results_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('B') => {
+                self.activate_button(ButtonAction::FragmentBack);
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                self.activate_button(ButtonAction::FragmentCopy);
+            }
+            KeyCode::Up => {
+                self.fragment_result_cursor = self.fragment_result_cursor.saturating_sub(1);
+                self.scroll = self.scroll.min(self.fragment_result_cursor);
+            }
+            KeyCode::Down => {
+                let max = self.fragment_results.len().saturating_sub(1);
+                self.fragment_result_cursor = (self.fragment_result_cursor + 1).min(max);
+                self.scroll = self.scroll.max(self.fragment_result_cursor);
+            }
+            KeyCode::PageUp => {
+                self.fragment_result_cursor = self.fragment_result_cursor.saturating_sub(10);
+                self.scroll = self.scroll.min(self.fragment_result_cursor);
+            }
+            KeyCode::PageDown => {
+                let max = self.fragment_results.len().saturating_sub(1);
+                self.fragment_result_cursor = (self.fragment_result_cursor + 10).min(max);
+                self.scroll = self.scroll.max(self.fragment_result_cursor);
+            }
+            KeyCode::Home => {
+                self.fragment_result_cursor = 0;
+                self.scroll = 0;
+            }
+            KeyCode::End => {
+                self.fragment_result_cursor = self.fragment_results.len().saturating_sub(1);
+                self.scroll = self.fragment_result_cursor;
+            }
+            _ => {}
+        }
+    }
+
     fn handle_mouse(&mut self, m: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
         if self.scan_lifecycle == ScanLifecycle::Cancelling {
@@ -3265,6 +3479,42 @@ impl App {
                 self.send_scan_control(ScanControl::StopAndKeepResults)
             }
             ButtonAction::SpeedTest => self.open_speed_selection(),
+            ButtonAction::FragmentTest => self.open_fragment_selection(),
+            ButtonAction::FragmentStart => {
+                if self.fragment_ip.is_empty() {
+                    self.toast_warn("Enter a target IP first (Enter on the IP row)");
+                } else if self.config.host.is_empty() {
+                    self.toast_warn("Set a Host before testing fragments");
+                } else if !self.fragment_enabled.iter().any(|enabled| *enabled) {
+                    self.toast_warn("Enable at least one profile (Space)");
+                } else {
+                    self.pending_fragment_start = true;
+                }
+            }
+            ButtonAction::FragmentBack => self.screen = Screen::Scanning,
+            ButtonAction::FragmentCopy => {
+                let Some(result) = self
+                    .fragment_results
+                    .get(self.fragment_result_cursor)
+                    .cloned()
+                else {
+                    self.toast_warn("No fragment result to copy");
+                    return;
+                };
+                let has_spec = result.spec.is_some();
+                let text = result.spec.unwrap_or_else(|| "off".to_string());
+                match crate::tui::clipboard::copy(&text) {
+                    Ok(target) => self.toast_success(format!(
+                        "Copied {} to {target}",
+                        if has_spec {
+                            "fragment JSON"
+                        } else {
+                            "control profile"
+                        }
+                    )),
+                    Err(error) => self.toast_error(format!("Clipboard failed: {error}")),
+                }
+            }
             ButtonAction::CustomizeScan => {
                 if self.screen == Screen::Scanning && self.scan_complete {
                     self.enter_customization();

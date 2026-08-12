@@ -361,6 +361,29 @@ the download / upload / both direction. Results report throughput in Mbps for
 each direction. Press `c` to copy the selected IP and `Esc` to return to the
 latency dashboard.
 
+**TLS fragment tester**
+
+When your ISP's DPI blocks the TLS handshake for the probe host (the scan
+"works" for clean edges only), press `g` on the completed results dashboard to
+find the xray-style TLS fragment setting that defeats it. The tester runs each
+profile — an xray `freedom` `fragment` config — against the selected target IP
+(editable; prefilled from your selection or best result, on that result's
+port): a full TCP connect, a
+TLS handshake with the scan host as SNI, and a plain HTTP request. A profile
+*works* only when all three succeed.
+
+Every profile is byte-faithful to xray's `FragmentWriter`: `tlshello` splits
+the first ClientHello record into random-length fragments re-wrapped as
+complete TLS records, `interval: 0` concatenates them into a single packet
+(xray PR #3660 "single TLS hello fragmenting"), and `maxSplit` caps the number
+of fragments. The default sweep covers `1-1` through `256-256` (interval 0),
+the classic `1-3`, and the xray docs default `10-20 / 10-20ms`. Press `c` on a
+working row to copy its fragment JSON — paste it straight into your xray
+freedom outbound, and optionally into the wizard's *TLS fragment (xray)*
+setting (or `--tls-fragment`) so `--proxy-url` protocol checks reuse it. Note
+that the latency-scan probes themselves run unfragmented; the tester tells you
+which value to configure in your proxy client.
+
 ### CLI options
 
 | Flag                   | Default          | Description                                      |
@@ -379,6 +402,7 @@ latency dashboard.
 | `--sample-per-cidr`    | `100`            | Random IPs sampled from each CIDR                |
 | `--interface`          | auto             | Network interface for probes, discovery sweeps, and speed tests (e.g. `en0`, `utun6`); binds connections to its address (`auto` restores OS routing). Also selects the capture device for `--discover syn` |
 | `--list-interfaces`    | —                | List network interfaces with their IP addresses, then exit |
+| `--tls-fragment`       | off              | Xray-style TLS fragment JSON applied to `--proxy-url` protocol checks, e.g. `'{"packets":"tlshello","length":"100-200","interval":"10-20"}'` |
 | `--probes`             | `8`              | Repeated probes per IP                           |
 | `--concurrency`        | `120`            | Max concurrent HTTP probes                       |
 | `--adaptive-concurrency` | off             | Adapt worker concurrency from recent probe health |

@@ -136,8 +136,8 @@ fn scanning_focus_map_keeps_stop_and_quit_reachable() {
     assert!(app.confirm_quit);
     app.confirm_quit = false;
     app.scan_complete = true;
-    assert_eq!(app.focus_count(), 5);
-    app.focus_index = 4;
+    assert_eq!(app.focus_count(), 6);
+    app.focus_index = 5;
     app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
     assert!(app.should_quit);
 }
@@ -594,6 +594,9 @@ fn all_screens_render_without_panicking() {
         Screen::SpeedSelect,
         Screen::SpeedTesting,
         Screen::SpeedResults,
+        Screen::FragmentSelect,
+        Screen::FragmentTesting,
+        Screen::FragmentResults,
     ] {
         app.screen = screen;
         draw(&mut app, 120, 36);
@@ -1790,4 +1793,165 @@ fn ports_editor_keeps_row_maps_aligned() {
         app.ports_row_map.len(),
         "ports row map must track the rendered rows while ports are edited"
     );
+}
+
+#[test]
+fn fragment_tester_prefills_ip_and_validates_manual_entry() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(1);
+    app.scan_complete = true;
+    app.results = vec![result("192.0.2.1", 0, 0.02)];
+    app.activate_action(super::Action::FragmentTest);
+    assert_eq!(app.screen, Screen::FragmentSelect);
+    assert_eq!(app.fragment_ip, "192.0.2.1");
+    assert_eq!(
+        app.fragment_enabled.len(),
+        crate::proxy::TLS_FRAGMENT_PRESETS.len()
+    );
+
+    // Enter on the IP row starts editing; an invalid IP is rejected.
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(app.fragment_ip_editing);
+    app.edit_buffer = "not-an-ip".to_string();
+    app.edit_caret = app.edit_buffer.len();
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        app.fragment_ip_editing,
+        "invalid IP must keep the editor open"
+    );
+
+    app.edit_buffer = "104.16.124.96".to_string();
+    app.edit_caret = app.edit_buffer.len();
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(!app.fragment_ip_editing);
+    assert_eq!(app.fragment_ip, "104.16.124.96");
+}
+
+#[test]
+fn fragment_tester_prefills_port_and_prefers_best_selected_result() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(1);
+    app.scan_complete = true;
+    // Lower p95 wins the ranking; give each result a distinct port.
+    let mut best = result("104.16.124.96", 0, 0.01);
+    best.port = 2053;
+    let mut worse = result("198.41.192.1", 0, 0.02);
+    worse.port = 8443;
+    app.results = vec![worse, best];
+
+    // No selection: the best-ranked result is prefilled, port included.
+    app.activate_action(super::Action::FragmentTest);
+    assert_eq!(app.fragment_ip, "104.16.124.96");
+    assert_eq!(app.fragment_port, 2053);
+
+    // A selected result wins over ranking, and its port is carried.
+    app.selected_targets.insert("198.41.192.1".to_string());
+    app.activate_action(super::Action::FragmentTest);
+    assert_eq!(app.fragment_ip, "198.41.192.1");
+    assert_eq!(app.fragment_port, 8443);
+}
+
+#[test]
+fn fragment_testing_q_cancels_then_quits_but_esc_only_cancels() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.screen = Screen::FragmentTesting;
+
+    // q cancels the run and schedules a quit once the runner finishes.
+    app.handle_key(KeyCode::Char('q'), KeyModifiers::NONE);
+    assert!(app.fragment_cancel.load(Ordering::Relaxed));
+    assert!(app.quit_after_cancel);
+    assert!(!app.should_quit);
+
+    // Esc cancels without scheduling a quit.
+    app.fragment_cancel = Arc::new(AtomicBool::new(false));
+    app.quit_after_cancel = false;
+    app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(app.fragment_cancel.load(Ordering::Relaxed));
+    assert!(!app.quit_after_cancel);
+}
+
+#[test]
+fn fragment_start_requires_ip_host_and_profile() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.screen = Screen::FragmentSelect;
+    app.fragment_ip.clear();
+    app.activate_action(super::Action::FragmentTest);
+    app.activate_button(super::ButtonAction::FragmentStart);
+    assert!(!app.pending_fragment_start);
+
+    app.fragment_ip = "104.16.124.96".to_string();
+    app.config.host.clear();
+    app.activate_button(super::ButtonAction::FragmentStart);
+    assert!(!app.pending_fragment_start);
+
+    app.config.host = "www.cloudflare.com".to_string();
+    app.fragment_enabled = vec![false; crate::proxy::TLS_FRAGMENT_PRESETS.len()];
+    app.activate_button(super::ButtonAction::FragmentStart);
+    assert!(!app.pending_fragment_start);
+
+    app.fragment_enabled[2] = true;
+    app.activate_button(super::ButtonAction::FragmentStart);
+    assert!(app.pending_fragment_start);
+}
+
+#[test]
+fn fragment_select_toggles_profiles_and_cycles_focus() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.screen = Screen::FragmentSelect;
+    app.fragment_enabled = vec![true; crate::proxy::TLS_FRAGMENT_PRESETS.len()];
+    app.fragment_cursor = 3;
+    app.handle_key(KeyCode::Char(' '), KeyModifiers::NONE);
+    assert!(!app.fragment_enabled[2]);
+    app.handle_key(KeyCode::Char(' '), KeyModifiers::NONE);
+    assert!(app.fragment_enabled[2]);
+    assert_eq!(app.focus_count(), 3);
+    app.focus_next(false);
+    assert_eq!(app.focus_target, FocusTarget::Button);
+}
+
+#[test]
+fn wizard_tls_fragment_field_accepts_xray_json_and_empty() {
+    let mut config = AppConfig::default();
+    SettingField::TlsFragment
+        .apply(
+            r#"{"packets":"tlshello","length":"100-200","interval":"10-20"}"#,
+            &mut config,
+        )
+        .unwrap();
+    let spec = config.tls_fragment.as_ref().unwrap();
+    assert_eq!(
+        spec.xray_json(),
+        r#"{"packets":"tlshello","length":"100-200","interval":"10-20"}"#
+    );
+    SettingField::TlsFragment.apply("", &mut config).unwrap();
+    assert!(config.tls_fragment.is_none());
+    assert!(SettingField::TlsFragment
+        .apply("not json", &mut config)
+        .is_err());
+    assert!(SettingField::TlsFragment
+        .apply(
+            r#"{"packets":"tlshello","length":"0-10","interval":"0"}"#,
+            &mut config
+        )
+        .is_err());
 }

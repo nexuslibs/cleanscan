@@ -28,6 +28,7 @@ pub enum SettingField {
     HealthChecks,
     Warmup,
     Interface,
+    TlsFragment,
     DownloadPath,
     UploadPath,
     SpeedPayloadMb,
@@ -79,7 +80,7 @@ impl SettingField {
 
     /// All settings fields in display order, grouped by concern. Group
     /// boundaries are described by [`SettingField::GROUPS`].
-    pub const ALL: [SettingField; 38] = [
+    pub const ALL: [SettingField; 39] = [
         // Target
         SettingField::Host,
         SettingField::Path,
@@ -92,6 +93,7 @@ impl SettingField {
         SettingField::Warmup,
         // Network
         SettingField::Interface,
+        SettingField::TlsFragment,
         // Latency scan
         SettingField::SamplePerCidr,
         SettingField::Probes,
@@ -131,7 +133,7 @@ impl SettingField {
     pub const GROUPS: [(&'static str, usize); 7] = [
         ("Target", 3),
         ("Validation", 6),
-        ("Network", 1),
+        ("Network", 2),
         ("Latency scan", 6),
         ("Ranking quality", 2),
         ("Adaptive scan", 15),
@@ -150,6 +152,7 @@ impl SettingField {
             SettingField::HealthChecks => "Health checks",
             SettingField::Warmup => "Warmup probe",
             SettingField::Interface => "Network interface",
+            SettingField::TlsFragment => "TLS fragment (xray)",
             SettingField::DownloadPath => "Download path",
             SettingField::UploadPath => "Upload path",
             SettingField::SpeedPayloadMb => "Speed payload (MB)",
@@ -193,6 +196,7 @@ impl SettingField {
             SettingField::HealthChecks => "Optional checks encoded as name|path|required|weight;... . Leave empty to use the primary path.",
             SettingField::Warmup => "Send a discarded connection-establishment request before measured latency probes.",
             SettingField::Interface => "Network interface used for probes, discovery sweeps, and speed tests. Auto (default) lets the OS route every connection; picking an interface (e.g. en0, wlan0, tun0) binds outbound connections to that interface's address so all test traffic leaves through the chosen link (on Linux the interface must have its own route to the targets, as VPN tunnels do). Useful on hosts with multiple uplinks or VPNs. The CLI equivalent is --interface <name>; `--list-interfaces` prints the available ones.",
+            SettingField::TlsFragment => "Xray-style TLS ClientHello fragmentation (xray `freedom` fragment settings) applied to protocol checks (`--proxy-url`) and the TLS fragment tester. Paste a full xray fragment object, e.g. {\"packets\":\"tlshello\",\"length\":\"100-200\",\"interval\":\"10-20\"}; empty disables fragmentation. tlshello splits only the ClientHello into random-length fragments re-wrapped as TLS records; with interval 0 they are combined into a single packet. Find the value that defeats your ISP's DPI with the tester (g on the results screen), then paste it here and in your xray config.",
             SettingField::DownloadPath => "Static file endpoint used for download speed tests.",
             SettingField::UploadPath => "POST endpoint used for upload speed tests; it should consume and discard the request body.",
             SettingField::SpeedPayloadMb => "Payload size used for each upload/download repetition. Larger payloads reduce short-test noise but use more bandwidth.",
@@ -272,6 +276,10 @@ impl SettingField {
                 }
             }
             SettingField::Interface => args.interface.clone().unwrap_or_else(|| "Auto".to_string()),
+            SettingField::TlsFragment => match &args.tls_fragment {
+                Some(spec) => spec.xray_json(),
+                None => "Off".to_string(),
+            },
             SettingField::DownloadPath => args.download_path.clone(),
             SettingField::UploadPath => args.upload_path.clone(),
             SettingField::SpeedPayloadMb => (args.speed_payload_bytes / (1024 * 1024)).to_string(),
@@ -357,6 +365,8 @@ impl SettingField {
                 | SettingField::Warmup
                 | SettingField::AdaptiveProbing
                 | SettingField::AdaptiveConcurrency
+                | SettingField::Interface
+                | SettingField::TlsFragment
         )
     }
 
@@ -464,6 +474,7 @@ impl SettingField {
             | SettingField::DiscoveryDriver
             | SettingField::Warmup
             | SettingField::Interface
+            | SettingField::TlsFragment
             | SettingField::AdaptiveProbing
             | SettingField::AdaptiveConcurrency
             | SettingField::StabilityWeight
@@ -619,6 +630,13 @@ impl SettingField {
                         args.interface = Some(name);
                     }
                     None => args.interface = None,
+                }
+            }
+            SettingField::TlsFragment => {
+                if raw.is_empty() {
+                    args.tls_fragment = None;
+                } else {
+                    args.tls_fragment = Some(crate::proxy::FragmentSpec::parse_json(raw)?);
                 }
             }
             SettingField::DownloadPath => {
@@ -1789,6 +1807,13 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
                     });
                     format!("{name}{suffix}")
                 }
+            }),
+        ]),
+        Line::from(vec![
+            Span::styled("Fragment    : ", theme::title_style()),
+            Span::raw(match &app.config.tls_fragment {
+                Some(spec) => spec.xray_json(),
+                None => "off".to_string(),
             }),
         ]),
         Line::from(vec![

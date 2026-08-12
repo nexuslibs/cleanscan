@@ -95,6 +95,11 @@ pub struct Args {
     #[arg(long)]
     pub interface: Option<String>,
 
+    /// Xray-style TLS fragment JSON applied to --proxy-url protocol checks and
+    /// the TUI fragment tester (e.g. '{"packets":"tlshello","length":"100-200","interval":"10-20"}')
+    #[arg(long = "tls-fragment")]
+    pub tls_fragment: Option<String>,
+
     /// List network interfaces with their IP addresses, then exit.
     #[arg(long)]
     pub list_interfaces: bool,
@@ -377,6 +382,18 @@ fn main() -> Result<()> {
         config.discovery_driver = driver.parse().map_err(anyhow::Error::msg)?;
     }
     config.interface = crate::iface::normalize_interface(args.interface.clone());
+    if let Some(raw) = args.tls_fragment.as_deref() {
+        config.tls_fragment = if raw.trim().is_empty() {
+            None
+        } else {
+            Some(crate::proxy::FragmentSpec::parse_json(raw).map_err(|e| {
+                anyhow::anyhow!(
+                    "--tls-fragment: {e}; expected an xray fragment object like \
+                     {{\"packets\":\"tlshello\",\"length\":\"100-200\",\"interval\":\"10-20\"}}"
+                )
+            })?)
+        };
+    }
     if let Some(rate) = args.rate {
         if rate == 0 || rate > 1_000_000 {
             anyhow::bail!("--rate must be between 1 and 1000000");
@@ -1116,6 +1133,11 @@ fn cli_mode(
 
     if let Some(raw_proxy_url) = proxy_url {
         let transport = proxy::parse_share_url(raw_proxy_url)?;
+        if config.tls_fragment.is_some() && !transport.tls {
+            eprintln!(
+                "warning: --tls-fragment requires a TLS transport; fragmentation is disabled for this proxy URL"
+            );
+        }
         let interface =
             config
                 .interface
@@ -1132,7 +1154,13 @@ fn cli_mode(
             .filter(|result| result.ok > 0)
             .take(protocol_check_top)
             .map(|result| {
-                proxy::check_candidate(&transport, &result.ip, config.timeout_ms, interface)
+                proxy::check_candidate_fragmented(
+                    &transport,
+                    &result.ip,
+                    config.timeout_ms,
+                    interface,
+                    config.tls_fragment.as_ref(),
+                )
             })
             .collect::<Vec<_>>();
         let checks = rt.block_on(
@@ -1141,16 +1169,24 @@ fn cli_mode(
                 .collect::<Vec<_>>(),
         );
         eprintln!(
-            "protocol transport: {} {}:{} via {} (top {})",
+            "protocol transport: {} {}:{} via {} (top {}){}",
             transport.protocol,
             transport.address,
             transport.port,
             transport.network,
-            protocol_check_top
+            protocol_check_top,
+            if transport.tls {
+                match &config.tls_fragment {
+                    Some(spec) => format!(", fragment {}", spec.xray_json()),
+                    None => String::new(),
+                }
+            } else {
+                String::new()
+            }
         );
         for check in checks {
             eprintln!(
-                "protocol_check\tip={}\ttcp={}\ttls={}\tlong_tls={}\tws_reached={}\tws_accepted={}\telapsed_ms={:.1}\terror={}",
+                "protocol_check\tip={}\ttcp={}\ttls={}\tlong_tls={}\tws_reached={}\tws_accepted={}\thttp={}\tcolo={}\telapsed_ms={:.1}\terror={}",
                 check.ip,
                 check.tcp_ok,
                 check.tls_ok,
@@ -1159,6 +1195,9 @@ fn cli_mode(
                     .map_or_else(|| "-".into(), |v| v.to_string()),
                 check.websocket_accepted
                     .map_or_else(|| "-".into(), |v| v.to_string()),
+                check.http_ok
+                    .map_or_else(|| "-".into(), |v| v.to_string()),
+                check.colo.as_deref().unwrap_or("-"),
                 check.elapsed_ms,
                 check.error.unwrap_or_default()
             );

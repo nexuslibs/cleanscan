@@ -616,10 +616,18 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         app.button_ex(
             frame,
             buttons[2],
+            "Fragments (g)",
+            ButtonAction::FragmentTest,
+            ButtonKind::Secondary,
+            app.focus_index == 3,
+        );
+        app.button_ex(
+            frame,
+            buttons[3],
             "Customize (w)",
             ButtonAction::CustomizeScan,
             ButtonKind::Primary,
-            app.focus_index == 3,
+            app.focus_index == 4,
         );
         app.button_ex(
             frame,
@@ -627,7 +635,7 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
             "Quit (q)",
             ButtonAction::Quit,
             ButtonKind::Secondary,
-            app.focus_index == 4,
+            app.focus_index == 5,
         );
     } else {
         app.button_ex(
@@ -697,6 +705,7 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
             (widgets::enter_key(), "details"),
             ("e", "export"),
             ("t", "speed"),
+            ("g", "fragments"),
             ("f", "failures"),
             ("/", "commands"),
             ("?", "help"),
