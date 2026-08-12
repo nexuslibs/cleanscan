@@ -393,6 +393,12 @@ fn main() -> Result<()> {
                 )
             })?)
         };
+        if config.tls_fragment.is_some() && args.proxy_url.is_none() {
+            eprintln!(
+                "warning: --tls-fragment is only applied to --proxy-url protocol checks; \
+                 without a proxy URL, fragmentation will not be applied"
+            );
+        }
     }
     if let Some(rate) = args.rate {
         if rate == 0 || rate > 1_000_000 {

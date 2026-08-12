@@ -633,7 +633,7 @@ impl SettingField {
                 }
             }
             SettingField::TlsFragment => {
-                if raw.is_empty() {
+                if raw.trim().is_empty() || raw.trim().eq_ignore_ascii_case("off") {
                     args.tls_fragment = None;
                 } else {
                     args.tls_fragment = Some(crate::proxy::FragmentSpec::parse_json(raw)?);

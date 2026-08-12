@@ -1930,6 +1930,21 @@ fn fragment_select_toggles_profiles_and_cycles_focus() {
 }
 
 #[test]
+fn fragment_select_start_action_routes_to_fragment_start() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.screen = Screen::FragmentSelect;
+    app.fragment_ip = "192.0.2.1".to_string();
+    app.config.host = "www.cloudflare.com".to_string();
+    app.fragment_enabled = vec![true; crate::proxy::TLS_FRAGMENT_PRESETS.len()];
+    app.activate_action(Action::Start);
+    assert!(app.pending_fragment_start);
+}
+
+#[test]
 fn wizard_tls_fragment_field_accepts_xray_json_and_empty() {
     let mut config = AppConfig::default();
     SettingField::TlsFragment
@@ -1944,6 +1959,10 @@ fn wizard_tls_fragment_field_accepts_xray_json_and_empty() {
         r#"{"packets":"tlshello","length":"100-200","interval":"10-20"}"#
     );
     SettingField::TlsFragment.apply("", &mut config).unwrap();
+    assert!(config.tls_fragment.is_none());
+    SettingField::TlsFragment.apply("off", &mut config).unwrap();
+    assert!(config.tls_fragment.is_none());
+    SettingField::TlsFragment.apply("Off", &mut config).unwrap();
     assert!(config.tls_fragment.is_none());
     assert!(SettingField::TlsFragment
         .apply("not json", &mut config)

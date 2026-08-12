@@ -426,6 +426,9 @@ pub struct FragmentWriter<S, R> {
     /// so the next call can be recognized as a new write rather than a poll
     /// retry of the same buffer.
     flushed: bool,
+    /// Length of the logical write whose fragments are currently enqueued;
+    /// poll retries must pass the same buffer.
+    write_len: usize,
     /// Trailing inter-fragment delay carried from a fragmented write into the
     /// first fragment of the next write (xray sleeps after the final chunk).
     carry_delay: u64,
@@ -443,6 +446,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin, R: Rng + Unpin> FragmentWriter<S, R> {
             current: None,
             sleep: None,
             flushed: true,
+            write_len: 0,
             carry_delay: 0,
         }
     }
@@ -456,6 +460,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin, R: Rng + Unpin> FragmentWriter<S, R> {
     /// Split `buf` into queue items for one logical write, mirroring xray's
     /// `FragmentWriter.Write`.
     fn push_items(&mut self, buf: &[u8]) {
+        // Save any delay carried from the previous write's final fragment and
+        // clear the slot before enqueuing: push_tcp stores the current write's
+        // own trailing delay there for the next write.
+        let carried = std::mem::take(&mut self.carry_delay);
+        self.write_len = buf.len();
         self.count += 1;
         if self.spec.packets == FragmentPackets::TlsHello
             && self.count == 1
@@ -465,7 +474,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin, R: Rng + Unpin> FragmentWriter<S, R> {
             let record_len = 5 + (((buf[3] as usize) << 8) | buf[4] as usize);
             if buf.len() >= record_len {
                 self.push_tlshello(buf, record_len);
-                self.apply_carry();
+                self.apply_carry(carried);
                 return;
             }
         }
@@ -483,15 +492,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin, R: Rng + Unpin> FragmentWriter<S, R> {
                 delay_ms: 0,
             });
         }
-        self.apply_carry();
+        self.apply_carry(carried);
     }
 
-    fn apply_carry(&mut self) {
-        if self.carry_delay > 0 {
+    /// Apply a delay carried from the previous write's final fragment to the
+    /// first item of the write just enqueued, so the trailing sleep of a
+    /// fragmented write lands between writes instead of inside the write that
+    /// produced it.
+    fn apply_carry(&mut self, carry_delay: u64) {
+        if carry_delay > 0 {
             if let Some(first) = self.queue.front_mut() {
-                first.delay_ms = first.delay_ms.saturating_add(self.carry_delay);
+                first.delay_ms = first.delay_ms.saturating_add(carry_delay);
             }
-            self.carry_delay = 0;
         }
     }
 
@@ -692,6 +704,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin, R: Rng + Unpin> AsyncWrite for FragmentW
         }
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
+        }
+        if !this.flushed && buf.len() != this.write_len {
+            // A poll retry must carry the same logical write: the previous
+            // buffer's bytes are already enqueued, so accepting a different
+            // buffer here would silently drop it.
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fragment writer: poll retry passed a buffer of a different \
+                 length than the write being drained",
+            )));
         }
         if this.flushed {
             // The previous logical write was fully flushed, so this is a new
@@ -1056,6 +1078,7 @@ mod tests {
     };
     use rand::{rngs::StdRng, SeedableRng};
     use std::io;
+    use std::time::{Duration, Instant};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
@@ -1216,12 +1239,6 @@ mod tests {
         record
     }
 
-    fn frag_record(payload: &[u8]) -> Vec<u8> {
-        let mut record = vec![0x16, 0x03, 0x01, 0x00, payload.len() as u8];
-        record.extend_from_slice(payload);
-        record
-    }
-
     #[tokio::test]
     async fn tlshello_combine_mode_rewraps_each_fragment_as_a_tls_record() {
         // length 1-1, interval 0: every ClientHello byte becomes its own TLS
@@ -1232,7 +1249,7 @@ mod tests {
         let received = write_through(spec, &tls_record(b"hello")).await;
         let mut expected = Vec::new();
         for byte in b"hello" {
-            expected.extend_from_slice(&frag_record(&[*byte]));
+            expected.extend_from_slice(&tls_record(&[*byte]));
         }
         assert_eq!(received, expected);
     }
@@ -1245,8 +1262,8 @@ mod tests {
         let mut record = tls_record(b"hello");
         record.extend_from_slice(b"tail");
         let received = write_through(spec, &record).await;
-        let mut expected = frag_record(b"hel");
-        expected.extend_from_slice(&frag_record(b"lo"));
+        let mut expected = tls_record(b"hel");
+        expected.extend_from_slice(&tls_record(b"lo"));
         expected.extend_from_slice(b"tail");
         assert_eq!(received, expected);
     }
@@ -1258,8 +1275,8 @@ mod tests {
         )
         .unwrap();
         let received = write_through(spec, &tls_record(b"hello")).await;
-        let mut expected = frag_record(b"h");
-        expected.extend_from_slice(&frag_record(b"ello"));
+        let mut expected = tls_record(b"h");
+        expected.extend_from_slice(&tls_record(b"ello"));
         assert_eq!(received, expected);
     }
 
@@ -1269,9 +1286,9 @@ mod tests {
             FragmentSpec::parse_json(r#"{"packets":"tlshello","length":"2-2","interval":"1-1"}"#)
                 .unwrap();
         let received = write_through(spec, &tls_record(b"hello")).await;
-        let mut expected = frag_record(b"he");
-        expected.extend_from_slice(&frag_record(b"ll"));
-        expected.extend_from_slice(&frag_record(b"o"));
+        let mut expected = tls_record(b"he");
+        expected.extend_from_slice(&tls_record(b"ll"));
+        expected.extend_from_slice(&tls_record(b"o"));
         assert_eq!(received, expected);
     }
 
@@ -1300,7 +1317,7 @@ mod tests {
         server.read_to_end(&mut received).await.unwrap();
         let mut expected = Vec::new();
         for byte in b"hello" {
-            expected.extend_from_slice(&frag_record(&[*byte]));
+            expected.extend_from_slice(&tls_record(&[*byte]));
         }
         expected.extend_from_slice(b"plain");
         assert_eq!(received, expected);
@@ -1370,9 +1387,9 @@ mod tests {
         let recorder = writer.into_inner();
         // Interval 0: all fragment records concatenated into one write.
         assert_eq!(recorder.slices.len(), 1);
-        let mut expected = frag_record(b"he");
-        expected.extend_from_slice(&frag_record(b"ll"));
-        expected.extend_from_slice(&frag_record(b"o"));
+        let mut expected = tls_record(b"he");
+        expected.extend_from_slice(&tls_record(b"ll"));
+        expected.extend_from_slice(&tls_record(b"o"));
         assert_eq!(recorder.slices[0], expected);
     }
 
@@ -1387,7 +1404,51 @@ mod tests {
         let recorder = writer.into_inner();
         assert_eq!(
             recorder.slices,
-            vec![frag_record(b"he"), frag_record(b"ll"), frag_record(b"o"),]
+            vec![tls_record(b"he"), tls_record(b"ll"), tls_record(b"o"),]
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_mode_carries_trailing_delay_between_writes() {
+        let spec =
+            FragmentSpec::parse_json(r#"{"packets":"","length":"2-2","interval":"5-5"}"#).unwrap();
+        let (client, mut server) = tokio::io::duplex(4096);
+        let mut writer = FragmentWriter::new(client, spec, StdRng::seed_from_u64(42));
+        let reader = tokio::spawn(async move {
+            let mut chunks = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                match server.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => chunks.push((Instant::now(), buf[..n].to_vec())),
+                }
+            }
+            chunks
+        });
+        writer.write_all(b"abcdef").await.unwrap();
+        writer.write_all(b"ghij").await.unwrap();
+        drop(writer);
+        let chunks = reader.await.unwrap();
+        let bytes = chunks
+            .iter()
+            .map(|(_, chunk)| chunk.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bytes,
+            vec![
+                b"ab".to_vec(),
+                b"cd".to_vec(),
+                b"ef".to_vec(),
+                b"gh".to_vec(),
+                b"ij".to_vec(),
+            ]
+        );
+        // The first write's trailing 5ms delay must land between the writes
+        // (ef -> gh), not on the first write's own first fragment.
+        let gap = chunks[3].0.duration_since(chunks[2].0);
+        assert!(
+            gap >= Duration::from_millis(4),
+            "delay between writes was {gap:?}"
         );
     }
 }

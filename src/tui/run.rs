@@ -936,15 +936,19 @@ pub fn run_tui(
                             .iter()
                             .filter(|r| r.spec.is_some())
                             .count();
-                        let working = app.fragment_results.iter().filter(|r| r.works()).count();
-                        if fragment_total == 0 {
+                        let working = app
+                            .fragment_results
+                            .iter()
+                            .filter(|r| r.spec.is_some() && r.works())
+                            .count();
+                        if app.fragment_results.is_empty() {
                             app.toast_warn("No fragment profiles were enabled");
                         } else if working > 0 {
                             app.toast_success(format!(
                                 "{working}/{fragment_total} fragment profiles work; \
                                  copy the winning JSON with c"
                             ));
-                        } else {
+                        } else if fragment_total > 0 {
                             app.toast_warn("No fragment profile produced a working connection");
                         }
                     }

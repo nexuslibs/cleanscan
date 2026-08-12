@@ -407,15 +407,15 @@ fn render_results(app: &mut App, frame: &mut Frame, area: Rect) {
                 Cell::from(format!("{:.0}", result.elapsed_ms)),
                 Cell::from(result.error.as_deref().unwrap_or("")),
             ]);
-            if result.works() {
-                row = row.style(theme::good_style());
-            } else if result.error.is_some() {
-                row = row.style(theme::bad_style());
-            }
             if selected {
                 row = row.style(theme::row_selected_style());
             } else if (app.scroll + index) % 2 == 1 {
                 row = row.style(theme::row_alt_style());
+            }
+            if result.works() {
+                row = row.style(theme::good_style());
+            } else if result.error.is_some() {
+                row = row.style(theme::bad_style());
             }
             row
         });

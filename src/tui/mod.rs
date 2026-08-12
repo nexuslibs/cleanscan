@@ -1945,6 +1945,8 @@ impl App {
             Action::Start => {
                 if self.screen == Screen::SpeedSelect {
                     self.activate_button(ButtonAction::SpeedStart);
+                } else if self.screen == Screen::FragmentSelect {
+                    self.activate_button(ButtonAction::FragmentStart);
                 } else if self.screen == Screen::Wizard
                     && self.wizard_step == WizardStep::Review
                     && !self.pending_start

@@ -623,7 +623,7 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         );
         app.button_ex(
             frame,
-            buttons[3],
+            buttons[4],
             "Customize (w)",
             ButtonAction::CustomizeScan,
             ButtonKind::Primary,
