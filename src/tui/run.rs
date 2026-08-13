@@ -295,7 +295,20 @@ pub fn run_tui(
                 match crate::iface::interface_addrs(name) {
                     Ok(addrs) => Some(addrs),
                     Err(error) => {
-                        eprintln!("warning: {error}; fragment tests will use auto routing");
+                        // Terminal is in raw mode; surface the error as a
+                        // result row instead of writing to stderr.
+                        let _ = fragment_sender.send(crate::tui::state::FragmentTestResult {
+                            name: "error",
+                            spec: None,
+                            tcp_ok: false,
+                            tls_ok: false,
+                            http_ok: None,
+                            colo: None,
+                            elapsed_ms: 0.0,
+                            error: Some(format!(
+                                "warning: {error}; fragment tests will use auto routing"
+                            )),
+                        });
                         None
                     }
                 }
@@ -950,6 +963,8 @@ pub fn run_tui(
                             ));
                         } else if fragment_total > 0 {
                             app.toast_warn("No fragment profile produced a working connection");
+                        } else {
+                            app.toast_warn("Fragment test produced no fragment profile result");
                         }
                     }
                 }
@@ -1085,6 +1100,7 @@ pub fn run_tui(
     if let Some(s) = speed_runner {
         let _ = s.join();
     }
+    fragment_cancel.store(true, Ordering::Relaxed);
     if let Some(worker) = fragment_runner {
         let _ = worker.join();
     }

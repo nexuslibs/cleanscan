@@ -986,14 +986,33 @@ async fn http_probe<S: AsyncRead + AsyncWrite + Unpin>(
     if stream.write_all(request.as_bytes()).await.is_err() {
         return (false, None);
     }
-    let mut response = vec![0u8; 16_384];
-    let Ok(Ok(size)) = timeout(duration, stream.read(&mut response)).await else {
-        return (false, None);
-    };
-    if size == 0 {
+    // Read incrementally: the colo line can arrive in a later segment than
+    // the status line (slow or fragmented links), so keep reading until the
+    // peer closes, the deadline expires, or the colo is found.
+    let mut response = Vec::new();
+    let mut buffer = [0u8; 16_384];
+    let deadline = Instant::now() + duration;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match timeout(remaining, stream.read(&mut buffer)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(size)) => {
+                response.extend_from_slice(&buffer[..size]);
+                if crate::scanner::parse_colo(&String::from_utf8_lossy(&response)).is_some() {
+                    break;
+                }
+            }
+            Ok(Err(_)) => return (false, None),
+            Err(_) => break,
+        }
+    }
+    if response.is_empty() {
         return (false, None);
     }
-    let text = String::from_utf8_lossy(&response[..size]);
+    let text = String::from_utf8_lossy(&response);
     let status_ok = text.starts_with("HTTP/1.1 2")
         || text.starts_with("HTTP/1.0 2")
         || text.starts_with("HTTP/2 2");

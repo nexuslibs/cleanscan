@@ -393,7 +393,7 @@ fn main() -> Result<()> {
                 )
             })?)
         };
-        if config.tls_fragment.is_some() && args.proxy_url.is_none() {
+        if args.cli && config.tls_fragment.is_some() && args.proxy_url.is_none() {
             eprintln!(
                 "warning: --tls-fragment is only applied to --proxy-url protocol checks; \
                  without a proxy URL, fragmentation will not be applied"

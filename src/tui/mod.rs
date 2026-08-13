@@ -1638,6 +1638,10 @@ impl App {
         if self.scan_lifecycle == ScanLifecycle::Cancelling {
             return;
         }
+        if self.fragment_ip_editing {
+            self.handle_fragment_select_key(code);
+            return;
+        }
         if self.screen == Screen::Wizard && (self.edit_field.is_some() || self.custom_input_mode) {
             wizard::handle_wizard_key(self, code);
             return;
@@ -3153,6 +3157,11 @@ impl App {
                 self.fragment_result_cursor = self.fragment_results.len().saturating_sub(1);
                 self.scroll = self.fragment_result_cursor;
             }
+            KeyCode::Enter => match self.focus_index {
+                1 => self.activate_button(ButtonAction::FragmentCopy),
+                2 => self.activate_button(ButtonAction::FragmentBack),
+                _ => {}
+            },
             _ => {}
         }
     }

@@ -393,7 +393,7 @@ fn render_results(app: &mut App, frame: &mut Frame, area: Rect) {
         .enumerate()
         .map(|(index, result)| {
             let selected = app.scroll + index == app.fragment_result_cursor;
-            let mut row = Row::new(vec![
+            let row = Row::new(vec![
                 Cell::from(result.name),
                 Cell::from(result.spec.as_deref().unwrap_or("off")),
                 Cell::from(if result.tcp_ok { "yes" } else { "no" }),
@@ -407,17 +407,18 @@ fn render_results(app: &mut App, frame: &mut Frame, area: Rect) {
                 Cell::from(format!("{:.0}", result.elapsed_ms)),
                 Cell::from(result.error.as_deref().unwrap_or("")),
             ]);
+            let mut style = Style::default();
             if selected {
-                row = row.style(theme::row_selected_style());
+                style = style.patch(theme::row_selected_style());
             } else if (app.scroll + index) % 2 == 1 {
-                row = row.style(theme::row_alt_style());
+                style = style.patch(theme::row_alt_style());
             }
             if result.works() {
-                row = row.style(theme::good_style());
+                style = style.patch(theme::good_style());
             } else if result.error.is_some() {
-                row = row.style(theme::bad_style());
+                style = style.patch(theme::bad_style());
             }
-            row
+            row.style(style)
         });
 
     let table = Table::new(
