@@ -20,6 +20,12 @@ pub enum Screen {
     SpeedSelect,
     SpeedTesting,
     SpeedResults,
+    /// TLS fragment tester: profile selection.
+    FragmentSelect,
+    /// TLS fragment tester: probing in progress.
+    FragmentTesting,
+    /// TLS fragment tester: per-profile results.
+    FragmentResults,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,10 +346,11 @@ pub enum Action {
     IsolateTarget,
     RerunSelected,
     StopKeepResults,
+    FragmentTest,
 }
 
 impl Action {
-    pub const ALL: [Action; 29] = [
+    pub const ALL: [Action; 30] = [
         Action::Back,
         Action::Next,
         Action::Start,
@@ -373,6 +380,7 @@ impl Action {
         Action::IsolateTarget,
         Action::RerunSelected,
         Action::StopKeepResults,
+        Action::FragmentTest,
     ];
 
     pub fn label(self) -> &'static str {
@@ -406,6 +414,7 @@ impl Action {
             Action::IsolateTarget => "Isolate selected target",
             Action::RerunSelected => "Rerun selected targets",
             Action::StopKeepResults => "Stop and keep results",
+            Action::FragmentTest => "Test TLS fragments",
         }
     }
 
@@ -430,6 +439,7 @@ impl Action {
             Action::IsolateTarget => "i",
             Action::RerunSelected => "R",
             Action::StopKeepResults => "x",
+            Action::FragmentTest => "g",
             _ => "",
         }
     }
@@ -451,6 +461,7 @@ impl Action {
             Action::IsolateTarget => "Pause main scheduling and investigate one target alone",
             Action::RerunSelected => "Start a focused scan using the selected targets",
             Action::StopKeepResults => "Stop active work and preserve completed results",
+            Action::FragmentTest => "Probe a target IP with xray-style TLS fragmentation profiles to find which fragment setting passes the DPI",
             _ => self.label(),
         }
     }
@@ -480,6 +491,34 @@ pub enum ButtonAction {
     WorkerUp,
     WorkerAuto,
     StopKeepResults,
+    FragmentTest,
+    FragmentStart,
+    FragmentBack,
+    FragmentCopy,
+}
+
+/// One probe result in the TLS fragment tester: a profile (or the unfragmented
+/// control) checked against the target IP.
+#[derive(Debug, Clone)]
+pub struct FragmentTestResult {
+    /// Preset label, e.g. "1-3 classic".
+    pub name: &'static str,
+    /// Xray fragment JSON (`None` for the unfragmented control).
+    pub spec: Option<String>,
+    pub tcp_ok: bool,
+    pub tls_ok: bool,
+    pub http_ok: Option<bool>,
+    pub colo: Option<String>,
+    pub elapsed_ms: f64,
+    pub error: Option<String>,
+}
+
+impl FragmentTestResult {
+    /// Whether this profile established a fully working connection
+    /// (TCP + TLS + a 2xx HTTP response).
+    pub fn works(&self) -> bool {
+        self.tcp_ok && self.tls_ok && self.http_ok == Some(true)
+    }
 }
 
 /// A selectable CIDR candidate in the wizard's ranges step.

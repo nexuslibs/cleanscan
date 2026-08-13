@@ -998,7 +998,7 @@ fn validate_response(
 
 /// Extract the Cloudflare `colo=` code from a `/cdn-cgi/trace` response body.
 /// The body is `key=value` lines; the field is absent for other paths.
-fn parse_colo(body: &str) -> Option<String> {
+pub(crate) fn parse_colo(body: &str) -> Option<String> {
     for line in body.lines() {
         let line = line.trim();
         if let Some(value) = line.strip_prefix("colo=") {

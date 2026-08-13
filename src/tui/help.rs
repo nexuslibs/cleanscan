@@ -30,6 +30,9 @@ pub fn overlay(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) 
         Screen::SpeedSelect => speed_selection_lines(),
         Screen::SpeedTesting => speed_testing_lines(),
         Screen::SpeedResults => speed_results_lines(),
+        Screen::FragmentSelect => fragment_selection_lines(),
+        Screen::FragmentTesting => fragment_testing_lines(),
+        Screen::FragmentResults => fragment_results_lines(),
     };
 
     let para = Paragraph::new(lines)
@@ -138,6 +141,7 @@ fn scanning_lines(app: &App) -> Vec<Line<'static>> {
     if app.scan_complete {
         lines.push(key("e", "Export results to a .tsv file"));
         lines.push(key("t", "Run speed tests on successful IPs"));
+        lines.push(key("g", "Test TLS fragment profiles on a target IP"));
         lines.push(key("f", "Show failed targets for diagnosis"));
         lines.push(key("v", "Show or hide result columns"));
         lines.push(key("r", "Repeat the identical sampled target set"));
@@ -212,5 +216,55 @@ fn speed_results_lines() -> Vec<Line<'static>> {
         key("c", "Copy the selected IP"),
         key("Esc / b", "Return to latency results"),
         key("q", "Quit cleanscan"),
+    ]
+}
+
+fn fragment_selection_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            " TLS fragment tester — profiles",
+            theme::header_style(),
+        )),
+        key("↑ / ↓", "Move between the IP field and profiles"),
+        key("Enter on IP", "Edit the target IP address"),
+        key("Space / Enter on profile", "Enable or disable a profile"),
+        key("Tab", "Focus the list, Start, or Back"),
+        key("Enter on Start", "Run the enabled profiles"),
+        key("Esc", "Return to scan results"),
+        key("q", "Quit cleanscan"),
+        Line::from(""),
+        Line::from(Span::styled(
+            " Each profile is an xray `fragment` config: tlshello splits the TLS ClientHello into random-length fragments re-wrapped as TLS records. Interval 0 sends them combined in a single packet. A profile works when TCP + TLS + an HTTP 2xx response all succeed.",
+            theme::hint_style(),
+        )),
+    ]
+}
+
+fn fragment_testing_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            " TLS fragment tests running",
+            theme::header_style(),
+        )),
+        key("Esc", "Cancel the remaining profiles"),
+        key("q", "Quit cleanscan"),
+    ]
+}
+
+fn fragment_results_lines() -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            " TLS fragment results",
+            theme::header_style(),
+        )),
+        key("↑ / ↓", "Select a profile result"),
+        key("c", "Copy the profile's xray JSON to the clipboard"),
+        key("Esc / b", "Return to the profile list"),
+        key("q", "Quit cleanscan"),
+        Line::from(""),
+        Line::from(Span::styled(
+            " Paste the copied fragment object into your xray freedom outbound (and into Settings → TLS fragment to reuse it in protocol checks).",
+            theme::hint_style(),
+        )),
     ]
 }

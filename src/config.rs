@@ -1,10 +1,12 @@
 use anyhow::Result;
 use reqwest::header::HeaderName;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::{fs, io::Write};
+
+use crate::proxy::FragmentSpec;
 
 pub const CLOUDFLARE_HTTPS_PORTS: &[u16] = &[443, 2053, 2083, 2087, 2096, 8443];
 
@@ -136,6 +138,12 @@ pub struct AppConfig {
     /// Interface for the raw SYN sweep; `None` picks the default device.
     #[serde(default)]
     pub interface: Option<String>,
+    /// Xray-style TLS fragmentation (xray `freedom` fragment settings) applied
+    /// to protocol checks (`--proxy-url`) and the TUI fragment tester.
+    /// `None` disables fragmentation. An invalid persisted fragment falls back
+    /// to `None` so it cannot discard the rest of the configuration.
+    #[serde(default, deserialize_with = "deserialize_optional_fragment")]
+    pub tls_fragment: Option<FragmentSpec>,
     pub probes: usize,
     pub concurrency: usize,
     pub timeout_ms: u64,
@@ -327,6 +335,20 @@ fn default_syn_retransmits() -> u32 {
     1
 }
 
+/// Tolerant deserializer for the persisted TLS fragment: a missing, invalid,
+/// or unparseable `tls_fragment` resolves to `None` (fragmentation off) so a
+/// stale entry cannot discard the rest of the configuration. Valid fragments
+/// pass through unchanged.
+fn deserialize_optional_fragment<'de, D>(deserializer: D) -> Result<Option<FragmentSpec>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<FragmentSpec>::deserialize(deserializer) {
+        Ok(spec) => Ok(spec),
+        Err(_) => Ok(None),
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -343,6 +365,7 @@ impl Default for AppConfig {
             syn_rate: default_syn_rate(),
             syn_retransmits: default_syn_retransmits(),
             interface: None,
+            tls_fragment: None,
             probes: 8,
             concurrency: 120,
             timeout_ms: 2500,
@@ -570,5 +593,21 @@ mod tests {
         .unwrap();
         assert!(explicit.selected_cidrs.is_empty());
         assert!(explicit.selected_cidrs_persisted);
+    }
+
+    #[test]
+    fn invalid_persisted_tls_fragment_falls_back_to_none() {
+        let invalid: AppConfig = parse_config(
+            r#"{"host":"example.test","path":"/","sample_per_cidr":1,"probes":1,"concurrency":1,"timeout_ms":1,"connect_timeout_ms":1,"top":1,"custom_cidrs":[],"tls_fragment":"not json"}"#,
+        )
+        .unwrap();
+        assert!(invalid.tls_fragment.is_none());
+        assert_eq!(invalid.host, "example.test");
+
+        let valid: AppConfig = parse_config(
+            r#"{"host":"example.test","path":"/","sample_per_cidr":1,"probes":1,"concurrency":1,"timeout_ms":1,"connect_timeout_ms":1,"top":1,"custom_cidrs":[],"tls_fragment":{"packets":"tlshello","length":"100-200","interval":"10-20"}}"#,
+        )
+        .unwrap();
+        assert!(valid.tls_fragment.is_some());
     }
 }

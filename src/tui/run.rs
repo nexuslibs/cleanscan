@@ -58,6 +58,18 @@ fn watch_profile_fingerprint(config: &AppConfig) -> u64 {
     ))
 }
 
+/// Polls the cancel flag every 50 ms, resolving as soon as it is set. Used to
+/// abort long-running fragment probes promptly instead of waiting out their
+/// full timeout stack.
+async fn cancel_watcher(flag: &std::sync::atomic::AtomicBool) {
+    loop {
+        if flag.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn prepare_watch_targets(
     app: &mut App,
     mut targets: Vec<String>,
@@ -137,6 +149,9 @@ pub fn run_tui(
     // cannot grow an unbounded queue or starve rendering/input handling.
     let (progress_tx, progress_rx) = std::sync::mpsc::sync_channel::<ScanProgress>(128);
     let (speed_tx, speed_rx) = std::sync::mpsc::channel::<SpeedResult>();
+    let (fragment_tx, fragment_rx) =
+        std::sync::mpsc::channel::<crate::tui::state::FragmentTestResult>();
+    let fragment_cancel = Arc::new(AtomicBool::new(false));
     let (manifest_tx, manifest_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let (control_tx, control_rx) = std::sync::mpsc::channel::<ScanControl>();
     let (investigation_tx, investigation_rx) = std::sync::mpsc::channel::<ProbeResult>();
@@ -154,6 +169,7 @@ pub fn run_tui(
     app.system_network = system_network;
     app.set_cancel_token(cancel.clone());
     app.set_scan_control(control_tx);
+    app.fragment_cancel = fragment_cancel.clone();
     app.watch_interval = watch_interval.map(|seconds| Duration::from_secs(seconds.max(1)));
     app.manifest_path = manifest_path;
     app.manifest_thresholds = crate::HealthThresholds {
@@ -250,9 +266,113 @@ pub fn run_tui(
         })
     };
 
+    let spawn_fragment = |ip: String,
+                          port: u16,
+                          scan_config: Arc<AppConfig>,
+                          enabled: Vec<bool>|
+     -> std::thread::JoinHandle<()> {
+        let fragment_config = scan_config;
+        let fragment_cancel = fragment_cancel.clone();
+        let fragment_sender = fragment_tx.clone();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = fragment_sender.send(crate::tui::state::FragmentTestResult {
+                        name: "error",
+                        spec: None,
+                        tcp_ok: false,
+                        tls_ok: false,
+                        http_ok: None,
+                        colo: None,
+                        elapsed_ms: 0.0,
+                        error: Some(format!("failed to create tokio runtime: {e}")),
+                    });
+                    return;
+                }
+            };
+            let interface = fragment_config.interface.as_deref().and_then(|name| {
+                match crate::iface::interface_addrs(name) {
+                    Ok(addrs) => Some(addrs),
+                    Err(error) => {
+                        // Terminal is in raw mode; surface the error as a
+                        // result row instead of writing to stderr.
+                        let _ = fragment_sender.send(crate::tui::state::FragmentTestResult {
+                            name: "error",
+                            spec: None,
+                            tcp_ok: false,
+                            tls_ok: false,
+                            http_ok: None,
+                            colo: None,
+                            elapsed_ms: 0.0,
+                            error: Some(format!(
+                                "warning: {error}; fragment tests will use auto routing"
+                            )),
+                        });
+                        None
+                    }
+                }
+            });
+            let host = fragment_config.host.clone();
+            let path = fragment_config.path.clone();
+            // Interval profiles sleep between fragments during the handshake,
+            // so the per-profile budget must cover those sleeps on top of the
+            // normal probe timeout.
+            let timeout_ms = fragment_config.timeout_ms.max(8_000);
+            rt.block_on(async move {
+                for (label, spec) in crate::proxy::TLS_FRAGMENT_PRESETS
+                    .iter()
+                    .zip(&enabled)
+                    .filter(|(_, enabled)| **enabled)
+                    .map(|((label, spec), _)| (*label, spec))
+                {
+                    if fragment_cancel.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let transport = crate::proxy::ProxyTransport {
+                        protocol: "vless".to_string(),
+                        network: "tcp".to_string(),
+                        address: ip.clone(),
+                        port,
+                        sni: host.clone(),
+                        host: Some(host.clone()),
+                        path: Some(path.clone()),
+                        tls: true,
+                    };
+                    // Race the profile against the cancel flag so Esc / q
+                    // abort the in-flight probe within ~50ms instead of after
+                    // its full TCP + TLS + HTTP timeout stack. Dropping the
+                    // check future closes its sockets immediately.
+                    let check = tokio::select! {
+                        _ = cancel_watcher(&fragment_cancel) => None,
+                        check = crate::proxy::check_candidate_fragmented(
+                            &transport,
+                            &ip,
+                            timeout_ms,
+                            interface,
+                            spec.as_ref(),
+                        ) => Some(check),
+                    };
+                    let Some(check) = check else { break };
+                    let _ = fragment_sender.send(crate::tui::state::FragmentTestResult {
+                        name: label,
+                        spec: check.fragment,
+                        tcp_ok: check.tcp_ok,
+                        tls_ok: check.tls_ok,
+                        http_ok: check.http_ok,
+                        colo: check.colo,
+                        elapsed_ms: check.elapsed_ms,
+                        error: check.error,
+                    });
+                }
+            });
+        })
+    };
+
     let mut scanner: Option<std::thread::JoinHandle<Result<Vec<String>, String>>> = None;
     let mut investigator: Option<std::thread::JoinHandle<Result<(), String>>> = None;
     let mut speed_runner: Option<std::thread::JoinHandle<Result<(), String>>> = None;
+    let mut fragment_runner: Option<std::thread::JoinHandle<()>> = None;
 
     // CLI-provided targets start scanning immediately (legacy behavior).
     if has_cli_targets {
@@ -432,6 +552,9 @@ pub fn run_tui(
             }
             while let Ok(r) = speed_rx.try_recv() {
                 app.speed_results.push(r);
+            }
+            while let Ok(r) = fragment_rx.try_recv() {
+                app.fragment_results.push(r);
             }
             while let Ok(result) = investigation_rx.try_recv() {
                 if let Some(investigation) = app.investigation.as_mut() {
@@ -801,6 +924,52 @@ pub fn run_tui(
                 }
             }
 
+            if app.screen == Screen::FragmentTesting
+                && fragment_runner.as_ref().is_some_and(|s| s.is_finished())
+            {
+                while let Ok(r) = fragment_rx.try_recv() {
+                    app.fragment_results.push(r);
+                }
+                if let Some(handle) = fragment_runner.take() {
+                    let _ = handle.join();
+                    app.fragment_complete = true;
+                    app.fragment_result_cursor = 0;
+                    app.scroll = 0;
+                    app.focus_index = 0;
+                    app.focus_target = FocusTarget::Table;
+                    app.screen = Screen::FragmentResults;
+                    if app.fragment_cancel.load(Ordering::Relaxed) {
+                        app.toast_warn("Fragment test cancelled; partial results kept");
+                        if app.quit_after_cancel {
+                            app.should_quit = true;
+                        }
+                    } else {
+                        let fragment_total = app
+                            .fragment_results
+                            .iter()
+                            .filter(|r| r.spec.is_some())
+                            .count();
+                        let working = app
+                            .fragment_results
+                            .iter()
+                            .filter(|r| r.spec.is_some() && r.works())
+                            .count();
+                        if app.fragment_results.is_empty() {
+                            app.toast_warn("No fragment profiles were enabled");
+                        } else if working > 0 {
+                            app.toast_success(format!(
+                                "{working}/{fragment_total} fragment profiles work; \
+                                 copy the winning JSON with c"
+                            ));
+                        } else if fragment_total > 0 {
+                            app.toast_warn("No fragment profile produced a working connection");
+                        } else {
+                            app.toast_warn("Fragment test produced no fragment profile result");
+                        }
+                    }
+                }
+            }
+
             if let Some(receiver) = update_receiver.as_ref() {
                 if let Ok(notice) = receiver.try_recv() {
                     // Keep update availability visible until acknowledged by
@@ -890,6 +1059,31 @@ pub fn run_tui(
                     app.speed_direction,
                 ));
             }
+
+            if app.pending_fragment_start
+                && app.screen == Screen::FragmentSelect
+                && fragment_runner.is_none()
+            {
+                app.pending_fragment_start = false;
+                if app.fragment_ip.is_empty() {
+                    app.toast_warn("Enter a target IP first (Enter on the IP row)");
+                } else if app.config.host.is_empty() {
+                    app.toast_warn("Set a Host before testing fragments");
+                } else {
+                    let enabled = app.fragment_enabled.clone();
+                    app.fragment_results.clear();
+                    app.fragment_complete = false;
+                    app.fragment_cancel.store(false, Ordering::Relaxed);
+                    app.fragment_start_time = Instant::now();
+                    app.screen = Screen::FragmentTesting;
+                    fragment_runner = Some(spawn_fragment(
+                        app.fragment_ip.clone(),
+                        app.fragment_port,
+                        Arc::new(app.config.clone()),
+                        enabled,
+                    ));
+                }
+            }
         }
         Ok(())
     };
@@ -905,6 +1099,10 @@ pub fn run_tui(
     }
     if let Some(s) = speed_runner {
         let _ = s.join();
+    }
+    fragment_cancel.store(true, Ordering::Relaxed);
+    if let Some(worker) = fragment_runner {
+        let _ = worker.join();
     }
     if let Some(worker) = investigator {
         let _ = worker.join();
