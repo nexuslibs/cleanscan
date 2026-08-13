@@ -327,7 +327,12 @@ fn main() -> Result<()> {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(",");
-            println!("{}\t{addresses}", entry.name);
+            let vpn = if iface::is_vpn_interface(&entry.name) {
+                "\tVPN"
+            } else {
+                ""
+            };
+            println!("{}\t{addresses}{vpn}", entry.name);
         }
         return Ok(());
     }

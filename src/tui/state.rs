@@ -290,6 +290,7 @@ impl Default for ScanProgressState {
 pub(super) enum PendingScanAction {
     RepeatTargets,
     NewSample,
+    RetestDegraded,
 }
 
 /// Step within the guided wizard.
@@ -329,6 +330,7 @@ pub enum Action {
     CloseDetails,
     OpenHelp,
     OpenCommandPalette,
+    CopyCommand,
     Confirm,
     Cancel,
     SelectAll,
@@ -347,10 +349,12 @@ pub enum Action {
     RerunSelected,
     StopKeepResults,
     FragmentTest,
+    FragmentProfiles,
+    RetestDegraded,
 }
 
 impl Action {
-    pub const ALL: [Action; 30] = [
+    pub const ALL: [Action; 33] = [
         Action::Back,
         Action::Next,
         Action::Start,
@@ -363,6 +367,7 @@ impl Action {
         Action::CloseDetails,
         Action::OpenHelp,
         Action::OpenCommandPalette,
+        Action::CopyCommand,
         Action::Confirm,
         Action::Cancel,
         Action::SelectAll,
@@ -381,6 +386,8 @@ impl Action {
         Action::RerunSelected,
         Action::StopKeepResults,
         Action::FragmentTest,
+        Action::FragmentProfiles,
+        Action::RetestDegraded,
     ];
 
     pub fn label(self) -> &'static str {
@@ -397,6 +404,7 @@ impl Action {
             Action::CloseDetails => "Close details",
             Action::OpenHelp => "Open help",
             Action::OpenCommandPalette => "Open command palette",
+            Action::CopyCommand => "Show CLI command",
             Action::Confirm => "Confirm",
             Action::Cancel => "Cancel",
             Action::SelectAll => "Select all",
@@ -414,7 +422,9 @@ impl Action {
             Action::IsolateTarget => "Isolate selected target",
             Action::RerunSelected => "Rerun selected targets",
             Action::StopKeepResults => "Stop and keep results",
-            Action::FragmentTest => "Test TLS fragments",
+            Action::FragmentTest => "Test all fragment profiles",
+            Action::FragmentProfiles => "Fragment profiles (manual)",
+            Action::RetestDegraded => "Retest degraded targets",
         }
     }
 
@@ -427,6 +437,7 @@ impl Action {
             Action::CopyIp => "c",
             Action::OpenHelp => "?",
             Action::OpenCommandPalette => "/",
+            Action::CopyCommand => "C",
             Action::Confirm => "Enter",
             Action::Cancel => "Esc",
             Action::ConfigureColumns => "v",
@@ -440,6 +451,8 @@ impl Action {
             Action::RerunSelected => "R",
             Action::StopKeepResults => "x",
             Action::FragmentTest => "g",
+            Action::FragmentProfiles => "G",
+            Action::RetestDegraded => "d",
             _ => "",
         }
     }
@@ -461,7 +474,12 @@ impl Action {
             Action::IsolateTarget => "Pause main scheduling and investigate one target alone",
             Action::RerunSelected => "Start a focused scan using the selected targets",
             Action::StopKeepResults => "Stop active work and preserve completed results",
-            Action::FragmentTest => "Probe a target IP with xray-style TLS fragmentation profiles to find which fragment setting passes the DPI",
+            Action::FragmentTest => "Automatically probe the selected IP with every xray-style TLS fragment profile to find which one passes the DPI",
+            Action::FragmentProfiles => "Open the manual fragment profile screen to pick profiles or type a custom target IP",
+            Action::RetestDegraded => "Re-run the scan over degraded and failed targets only",
+            Action::CopyCommand => {
+                "Show the equivalent CLI command for the current scan settings"
+            }
             _ => self.label(),
         }
     }
@@ -495,6 +513,7 @@ pub enum ButtonAction {
     FragmentStart,
     FragmentBack,
     FragmentCopy,
+    CopyCliCommand,
 }
 
 /// One probe result in the TLS fragment tester: a profile (or the unfragmented
@@ -525,6 +544,9 @@ impl FragmentTestResult {
 pub struct CidrEntry {
     pub cidr: String,
     pub selected: bool,
+    /// User-added range (editable and removable); `false` for the built-in
+    /// Cloudflare defaults.
+    pub custom: bool,
 }
 
 #[derive(Clone)]

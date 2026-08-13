@@ -77,7 +77,12 @@ fn wizard_lines(step: WizardStep) -> Vec<Line<'static>> {
             v.push(key("Space", "Toggle the highlighted range"));
             v.push(key("a", "Add a custom CIDR range"));
             v.push(key("A", "Select all ranges"));
-            v.push(key("N / n / d", "Deselect all ranges"));
+            v.push(key("N / n", "Deselect all ranges"));
+            v.push(key("e", "Edit the highlighted custom range"));
+            v.push(key(
+                "x",
+                "Remove the highlighted custom range (twice to confirm)",
+            ));
             v.push(key("s", "Toggle full-range sweep (every address)"));
             v.push(key("c", "Jump to scan parameters"));
             v.push(key("Enter", "Edit or activate the focused control"));
@@ -95,6 +100,7 @@ fn wizard_lines(step: WizardStep) -> Vec<Line<'static>> {
             v.push(key("↑ / ↓ while editing", "Step a numeric value up / down"));
             v.push(key("Backspace / Del", "Delete a character"));
             v.push(key("Enter", "Confirm edit   Esc: cancel edit"));
+            v.push(key("C", "Show the equivalent CLI command (c to copy)"));
         }
         WizardStep::Review => {
             v.push(Line::from(Span::styled(
@@ -102,6 +108,11 @@ fn wizard_lines(step: WizardStep) -> Vec<Line<'static>> {
                 theme::header_style(),
             )));
             v.push(key("Enter", "Start the scan with the chosen settings"));
+            v.push(key(
+                "Tab + Enter",
+                "Focus the CLI panel's Copy button, then copy the command",
+            ));
+            v.push(key("C", "Show the equivalent CLI command (c to copy)"));
         }
     }
     v.push(Line::from(""));
@@ -141,7 +152,15 @@ fn scanning_lines(app: &App) -> Vec<Line<'static>> {
     if app.scan_complete {
         lines.push(key("e", "Export results to a .tsv file"));
         lines.push(key("t", "Run speed tests on successful IPs"));
-        lines.push(key("g", "Test TLS fragment profiles on a target IP"));
+        lines.push(key(
+            "g",
+            "Auto-test every TLS fragment profile on the selected IP",
+        ));
+        lines.push(key(
+            "G",
+            "Open manual fragment profiles (custom IP / subset)",
+        ));
+        lines.push(key("d", "Retest degraded and failed targets"));
         lines.push(key("f", "Show failed targets for diagnosis"));
         lines.push(key("v", "Show or hide result columns"));
         lines.push(key("r", "Repeat the identical sampled target set"));

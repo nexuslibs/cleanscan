@@ -219,6 +219,10 @@ fn render_select_panel(app: &App, frame: &mut Frame, area: Rect) {
             " Profiles are xray freedom `fragment` settings; the winning profile is copied as ready-to-paste JSON.",
             theme::hint_style(),
         )),
+        Line::from(Span::styled(
+            " Tip: press g on the results page to auto-test every profile on the selected IP.",
+            theme::hint_style(),
+        )),
     ];
     frame.render_widget(
         Paragraph::new(info).block(widgets::subtle_panel_block("Context")),

@@ -7,8 +7,8 @@ use super::{
 };
 use crate::config::AppConfig;
 use crate::scanner::{
-    DiagnosticCategory, DiagnosticPhase, ProbeDiagnostic, ProbeFailureCounts, ProbeResult,
-    ScanControl, ScanEvent, ScanEventKind, ScanPhase, ScanProgress,
+    DiagnosticCategory, DiagnosticPhase, PortResult, ProbeDiagnostic, ProbeFailureCounts,
+    ProbeResult, ScanControl, ScanEvent, ScanEventKind, ScanPhase, ScanProgress,
 };
 use crate::watch::{WatchPolicy, WatchState};
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -55,6 +55,42 @@ fn result(ip: &str, fail: usize, p95: f64) -> ProbeResult {
     }
 }
 
+fn port_result(port: u16, ok: usize, score: f64) -> PortResult {
+    PortResult {
+        port,
+        protocol: "h2".to_string(),
+        ok,
+        fail: usize::from(ok == 0),
+        completed: ok.max(1),
+        avg: 0.02,
+        p50: 0.02,
+        p90: 0.02,
+        p95: 0.02,
+        max: 0.03,
+        jitter: 0.0,
+        stddev: 0.0,
+        loss: usize::from(ok == 0),
+        packet_loss: f64::from(ok == 0),
+        samples: Vec::new(),
+        failures: Vec::new(),
+        diagnostics: Vec::new(),
+        success_rate: 1.0,
+        score,
+        colo: None,
+        country: None,
+        cold_ms: None,
+        stopped_early: false,
+        min_score: score,
+        max_score: score,
+        success_rate_lower: 1.0,
+        success_rate_upper: 1.0,
+        score_confidence: 0.95,
+        decision: "competitive".to_string(),
+        checks: Vec::new(),
+        health_ok: true,
+    }
+}
+
 fn draw(app: &mut App, w: u16, h: u16) {
     let backend = TestBackend::new(w, h);
     let mut terminal = Terminal::new(backend).unwrap();
@@ -75,6 +111,17 @@ fn rendered(app: &mut App, w: u16, h: u16) -> String {
         .iter()
         .map(|cell| cell.symbol())
         .collect()
+}
+
+/// Count buffer lines (terminal rows) that contain `needle`. Each cell is one
+/// character, so chunking the flattened buffer by the terminal width splits it
+/// back into screen lines.
+fn lines_containing(buffer: &str, width: u16, needle: &str) -> usize {
+    let chars: Vec<char> = buffer.chars().collect();
+    chars
+        .chunks(width as usize)
+        .filter(|line| line.iter().collect::<String>().contains(needle))
+        .count()
 }
 
 #[test]
@@ -110,8 +157,23 @@ fn export_tsv_includes_location_columns() {
     edge.country = Some("Germany".to_string());
     assert_eq!(
             export_tsv_line(1, &edge),
-            "1\t192.0.2.1\t443\tFRA\tGermany\th2\t1\t0\t0.020\t0.020\t0.020\t0.020\t0.020\t0.000\t0.000%"
+            "1\t192.0.2.1\t443\tFRA\tGermany\th2\t1\t0\t0.020\t0.020\t0.020\t0.020\t0.020\t0.000\t0.000%\t443"
         );
+}
+
+#[test]
+fn export_tsv_lists_every_working_port() {
+    let mut edge = result("192.0.2.1", 0, 0.02);
+    edge.colo = Some("FRA".to_string());
+    edge.country = Some("Germany".to_string());
+    let port_443 = port_result(443, 1, 50.0);
+    let port_2027 = port_result(2027, 1, 45.0);
+    let port_8443 = port_result(8443, 0, 30.0);
+    edge.port_results = vec![port_2027, port_443, port_8443];
+    let line = export_tsv_line(1, &edge);
+    let fields = line.split('\t').collect::<Vec<_>>();
+    assert_eq!(fields.len(), 16);
+    assert_eq!(fields[15], "443,2027");
 }
 
 #[test]
@@ -426,6 +488,177 @@ fn dashboard_renders_without_panicking() {
 }
 
 #[test]
+fn results_table_keeps_at_least_one_row_at_every_terminal_height() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(500);
+    for i in 1..=30 {
+        app.add_result(result(&format!("10.0.0.{i:03}"), 0, 0.05 + i as f64 * 0.01));
+    }
+
+    // Compact (4-column) results table: one data row must stay visible at
+    // every height. Below the layout's h=17 cutoff the table used to be
+    // completely empty (fixed sections + table frame eat every row).
+    for h in 12..=35u16 {
+        let buffer = rendered(&mut app, 80, h);
+        let visible = lines_containing(&buffer, 80, "10.0.0.");
+        let expected = h.saturating_sub(16).max(1) as usize;
+        assert_eq!(
+            visible, expected,
+            "compact results table at h={h} must show {expected} data row(s)"
+        );
+    }
+
+    // Wide (14-column) results table: the h=15..=20 band used to render an
+    // empty table. The wide stats panel echoes the best IP in "Fastest Edge",
+    // so with the 8-row panel a running scan shows one extra line.
+    for h in 15..=35u16 {
+        let buffer = rendered(&mut app, 200, h);
+        let visible = lines_containing(&buffer, 200, "10.0.0.");
+        let expected = if h >= 30 {
+            h.saturating_sub(19) as usize
+        } else {
+            h.saturating_sub(16).max(1) as usize
+        };
+        assert_eq!(
+            visible, expected,
+            "wide results table at h={h} must show {expected} data row(s)"
+        );
+    }
+}
+
+#[test]
+fn widening_the_terminal_never_hides_result_rows() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(500);
+    for i in 1..=30 {
+        app.add_result(result(&format!("10.0.0.{i:03}"), 0, 0.05 + i as f64 * 0.01));
+    }
+
+    // Widening must never remove rows: mode switches (micro/compact/wide)
+    // used to swap in taller chrome that starved the results table.
+    let widths = [71u16, 72, 167, 168, 200];
+    for h in [12u16, 16, 20, 24] {
+        let mut prev = 0usize;
+        for w in widths {
+            let buffer = rendered(&mut app, w, h);
+            let visible = lines_containing(&buffer, w, "10.0.0.");
+            assert!(
+                visible >= prev,
+                "widening dropped visible rows: {prev} -> {visible} at h={h}, w={w}"
+            );
+            prev = visible;
+        }
+    }
+
+    // Tall terminals may trade a few table rows for the rich 8-row stats
+    // panel, but a comfortable number must remain visible.
+    for w in widths {
+        let buffer = rendered(&mut app, w, 30);
+        let visible = lines_containing(&buffer, w, "10.0.0.");
+        assert!(visible >= 10, "h=30 at w={w} must keep at least 10 rows");
+    }
+}
+
+#[test]
+fn failing_partial_port_row_does_not_hide_a_working_ip_mid_scan() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(10);
+    app.add_result(result("192.0.2.1", 0, 0.02));
+    assert_eq!(app.sorted_results().len(), 1);
+
+    // A per-port row for a port that failed (no port_results yet, merged row
+    // still pending) must not replace the working row while the scan runs;
+    // the merged aggregate is what decides the IP's fate.
+    let mut failing_port = result("192.0.2.1", 1, 0.5);
+    failing_port.ok = 0;
+    failing_port.health_ok = false;
+    app.add_result(failing_port);
+    assert_eq!(
+        app.sorted_results().len(),
+        1,
+        "working IP vanished from the results while the multi-port scan is still running"
+    );
+    assert_eq!(app.sorted_results()[0].ok, 1);
+}
+
+#[test]
+fn retest_reordering_keeps_the_cursor_on_the_selected_ip() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(10);
+    for i in 1..=10 {
+        app.add_result(result(&format!("192.0.2.{i}"), 0, 0.01 + i as f64 * 0.001));
+    }
+    app.scan_complete = true;
+    app.scan_lifecycle = ScanLifecycle::Completed;
+    app.result_cursor = 0;
+    assert_eq!(app.sorted_results()[0].ip, "192.0.2.1");
+
+    // A retest that reorders the table must not silently move the selection
+    // to a different IP.
+    app.add_result(result("192.0.2.1", 0, 0.5));
+    let index = app
+        .sorted_results()
+        .iter()
+        .position(|r| r.ip == "192.0.2.1")
+        .expect("retested IP still present");
+    assert_eq!(
+        app.result_cursor, index,
+        "cursor must follow the selected IP after reordering"
+    );
+}
+
+#[test]
+fn completed_results_show_retest_actions_in_every_layout() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(500);
+    app.scan_complete = true;
+    app.scan_lifecycle = ScanLifecycle::Completed;
+    app.results = vec![result("104.16.124.96", 1, 0.05)];
+
+    // Wide: the decision panel actions row is always visible.
+    let wide = rendered(&mut app, 200, 40);
+    assert!(
+        wide.contains("retest this IP"),
+        "wide panel must show retest actions"
+    );
+    assert!(wide.contains("retest degraded"));
+
+    // Compact: retest chips lead the status bar.
+    let compact = rendered(&mut app, 120, 30);
+    assert!(
+        compact.contains("retest IP"),
+        "compact status bar must show retest chips"
+    );
+
+    // Micro: retest chips are visible.
+    let micro = rendered(&mut app, 60, 20);
+    assert!(
+        micro.contains("retest"),
+        "micro status bar must show retest chips"
+    );
+}
+
+#[test]
 fn confirming_quit_requests_immediate_cancellation() {
     let cancel = Arc::new(AtomicBool::new(false));
     let mut app = App::new(
@@ -648,6 +881,71 @@ fn command_palette_does_not_offer_speed_test_while_testing() {
 }
 
 #[test]
+fn cli_command_opens_from_wizard_review_and_closes() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.config.host = "www.cloudflare.com".to_string();
+    app.wizard_step = WizardStep::Review;
+
+    app.handle_key(KeyCode::Char('C'), KeyModifiers::NONE);
+    assert!(app.show_cli_command);
+    assert!(app.cli_command.contains("--host www.cloudflare.com"));
+
+    for _ in 0..10 {
+        draw(&mut app, 160, 40);
+    }
+    let output = rendered(&mut app, 160, 40);
+    assert!(output.contains("--host"));
+    assert!(output.contains("c / Enter copy"));
+
+    app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(!app.show_cli_command);
+}
+
+#[test]
+fn cli_command_opens_from_wizard_settings_and_uses_scan_seed() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.scan_seed = 12345;
+    app.config.ports = vec![443, 2053];
+    app.wizard_step = WizardStep::Settings;
+
+    app.handle_key(KeyCode::Char('C'), KeyModifiers::NONE);
+    assert!(app.show_cli_command);
+    assert!(app.cli_command.contains("--port 443 --port 2053"));
+    assert!(app.cli_command.contains("--seed 12345"));
+
+    app.handle_key(KeyCode::Char('c'), KeyModifiers::NONE);
+    assert!(app.show_cli_command, "copying keeps the popup open");
+}
+
+#[test]
+fn cli_command_action_only_available_in_settings_and_review() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.wizard_step = WizardStep::Ranges;
+    assert!(!app.action_available(Action::CopyCommand));
+
+    app.wizard_step = WizardStep::Settings;
+    assert!(app.action_available(Action::CopyCommand));
+
+    app.wizard_step = WizardStep::Review;
+    assert!(app.action_available(Action::CopyCommand));
+
+    app.screen = Screen::Scanning;
+    assert!(!app.action_available(Action::CopyCommand));
+}
+
+#[test]
 fn wizard_review_enter_uses_the_focused_control() {
     let mut app = App::new(
         AppConfig::default(),
@@ -655,16 +953,49 @@ fn wizard_review_enter_uses_the_focused_control() {
         Arc::new(AtomicBool::new(false)),
     );
     app.wizard_step = WizardStep::Review;
-    assert_eq!(app.focus_count(), 3);
+    assert_eq!(app.focus_count(), 4);
 
     app.focus_index = 1;
     app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
     assert_eq!(app.wizard_step, WizardStep::Settings);
 
     app.wizard_step = WizardStep::Review;
-    app.focus_index = 2;
+    app.focus_index = 3;
     app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
     assert!(app.pending_start);
+
+    app.pending_start = false;
+    app.focus_index = 2;
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(!app.pending_start, "copy button must not start the scan");
+
+    app.focus_index = 3;
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(app.pending_start);
+}
+
+#[test]
+fn review_screen_shows_the_cli_command_inline() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.config.host = "www.cloudflare.com".to_string();
+    app.scan_seed = 777;
+    app.wizard_step = WizardStep::Review;
+    app.focus_index = 2;
+    app.focus_target = FocusTarget::Button;
+
+    for _ in 0..3 {
+        draw(&mut app, 160, 40);
+    }
+    assert!(app.current_cli_command().contains("--seed 777"));
+    let output = rendered(&mut app, 160, 40);
+    assert!(output.contains("CLI equivalent"));
+    assert!(output.contains("cleanscan --cli"));
+    assert!(output.contains("--host www.cloudflare.com"));
+    assert!(output.contains("Copy"));
 }
 
 #[test]
@@ -1698,6 +2029,12 @@ fn interface_editor_renders_auto_row_and_interface_addresses() {
         output.contains("Auto (default)"),
         "the Auto row must always be listed"
     );
+    if let Some(candidate) = &app.bypass_vpn {
+        assert!(
+            output.contains("Bypass VPN (auto)") && output.contains(candidate),
+            "the Bypass VPN row must be listed when a candidate exists"
+        );
+    }
     // The row map exposes one row per selectable entry (Auto first) for
     // mouse hit-testing, but only for rows in the viewport. On hosts with
     // many interfaces the map is a leading window of the picker list, not
@@ -1744,10 +2081,13 @@ fn mouse_tap_commits_the_clicked_interface_while_editing() {
 
     draw(&mut app, 120, 36);
     let inner = app.settings_inner.unwrap();
+    // The row right after Auto is the Bypass VPN row when a candidate
+    // exists; the first interface sits one row further down either way.
+    let first_interface_row = 1 + usize::from(app.bypass_vpn.is_some());
     let row = app
         .interface_row_map
         .iter()
-        .position(|entry| *entry == Some(1))
+        .position(|entry| *entry == Some(first_interface_row))
         .unwrap();
 
     let tap = |app: &mut App, row: usize| {
@@ -1805,7 +2145,7 @@ fn fragment_tester_prefills_ip_and_validates_manual_entry() {
     app.begin_scan(1);
     app.scan_complete = true;
     app.results = vec![result("192.0.2.1", 0, 0.02)];
-    app.activate_action(super::Action::FragmentTest);
+    app.activate_action(super::Action::FragmentProfiles);
     assert_eq!(app.screen, Screen::FragmentSelect);
     assert_eq!(app.fragment_ip, "192.0.2.1");
     assert_eq!(
@@ -1848,13 +2188,13 @@ fn fragment_tester_prefills_port_and_prefers_best_selected_result() {
     app.results = vec![worse, best];
 
     // No selection: the best-ranked result is prefilled, port included.
-    app.activate_action(super::Action::FragmentTest);
+    app.activate_action(super::Action::FragmentProfiles);
     assert_eq!(app.fragment_ip, "104.16.124.96");
     assert_eq!(app.fragment_port, 2053);
 
     // A selected result wins over ranking, and its port is carried.
     app.selected_targets.insert("198.41.192.1".to_string());
-    app.activate_action(super::Action::FragmentTest);
+    app.activate_action(super::Action::FragmentProfiles);
     assert_eq!(app.fragment_ip, "198.41.192.1");
     assert_eq!(app.fragment_port, 8443);
 }
@@ -1891,7 +2231,7 @@ fn fragment_start_requires_ip_host_and_profile() {
     );
     app.screen = Screen::FragmentSelect;
     app.fragment_ip.clear();
-    app.activate_action(super::Action::FragmentTest);
+    app.activate_action(super::Action::FragmentProfiles);
     app.activate_button(super::ButtonAction::FragmentStart);
     assert!(!app.pending_fragment_start);
 
@@ -1945,6 +2285,153 @@ fn fragment_select_start_action_routes_to_fragment_start() {
 }
 
 #[test]
+fn g_auto_tests_all_profiles_on_selected_row() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(1);
+    app.scan_complete = true;
+    app.config.host = "www.cloudflare.com".to_string();
+    app.results = vec![
+        result("104.16.124.96", 0, 0.01),
+        result("198.41.192.1", 1, 0.05),
+    ];
+    app.result_cursor = 1;
+    app.fragment_enabled = vec![false; crate::proxy::TLS_FRAGMENT_PRESETS.len()];
+
+    app.handle_key(KeyCode::Char('g'), KeyModifiers::NONE);
+    assert_eq!(
+        app.screen,
+        Screen::FragmentTesting,
+        "g must skip the select screen"
+    );
+    assert!(app.pending_fragment_start);
+    assert_eq!(app.fragment_ip, "198.41.192.1");
+    assert_eq!(app.fragment_port, 443);
+    assert!(
+        app.fragment_enabled.iter().all(|enabled| *enabled),
+        "auto test must enable every fragment profile"
+    );
+}
+
+#[test]
+fn g_requires_result_row_and_host() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(1);
+    app.scan_complete = true;
+
+    // No results under the cursor: no auto test.
+    app.handle_key(KeyCode::Char('g'), KeyModifiers::NONE);
+    assert_eq!(app.screen, Screen::Scanning);
+    assert!(!app.pending_fragment_start);
+
+    // A row but no Host configured: still no auto test.
+    app.results = vec![result("192.0.2.1", 0, 0.02)];
+    app.handle_key(KeyCode::Char('g'), KeyModifiers::NONE);
+    assert_eq!(app.screen, Screen::Scanning);
+    assert!(!app.pending_fragment_start);
+}
+
+#[test]
+fn capital_g_opens_manual_fragment_selection() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(1);
+    app.scan_complete = true;
+    app.results = vec![result("192.0.2.1", 0, 0.02)];
+
+    app.handle_key(KeyCode::Char('G'), KeyModifiers::NONE);
+    assert_eq!(app.screen, Screen::FragmentSelect);
+    assert!(!app.pending_fragment_start);
+    assert_eq!(app.fragment_ip, "192.0.2.1");
+}
+
+#[test]
+fn d_retest_collects_degraded_and_failed_targets() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(1);
+    app.scan_complete = true;
+    let degraded = result("198.41.192.1", 1, 0.05);
+    let mut failed = result("203.0.113.9", 1, 0.05);
+    failed.ok = 0;
+    app.results = vec![result("104.16.124.96", 0, 0.01), degraded, failed];
+
+    app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+    assert!(app.confirm_scan_action.is_some());
+    assert!(!app.pending_start, "must wait for confirmation");
+
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(app.confirm_scan_action.is_none());
+    assert!(app.pending_start);
+    assert_eq!(app.pending_run_kind, RunKind::Targeted);
+    assert_eq!(app.pending_source_run_id, Some(app.current_run_id));
+    assert_eq!(
+        app.rescan_targets.as_deref(),
+        Some(&["198.41.192.1".to_string(), "203.0.113.9".to_string()][..]),
+        "ready targets must not be retested"
+    );
+}
+
+#[test]
+fn d_without_problems_does_not_confirm() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(1);
+    app.scan_complete = true;
+    app.results = vec![result("104.16.124.96", 0, 0.01)];
+
+    app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+    assert!(app.confirm_scan_action.is_none());
+    assert!(!app.pending_start);
+}
+
+#[test]
+fn targeted_retests_preserve_existing_results() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(1);
+    app.scan_complete = true;
+    app.results = vec![result("192.0.2.1", 0, 0.02)];
+
+    // Targeted retest (R / d) keeps the rows so the table stays populated;
+    // add_result then replaces the retested IPs in place.
+    app.pending_run_kind = RunKind::Targeted;
+    app.begin_scan(1);
+    assert_eq!(
+        app.results.len(),
+        1,
+        "targeted reruns must keep existing rows"
+    );
+
+    // Full runs (new sample, repeat targets, wizard start) still clear.
+    app.pending_run_kind = RunKind::Full;
+    app.begin_scan(1);
+    assert!(
+        app.results.is_empty(),
+        "full runs must clear previous results"
+    );
+}
+
+#[test]
 fn wizard_tls_fragment_field_accepts_xray_json_and_empty() {
     let mut config = AppConfig::default();
     SettingField::TlsFragment
@@ -1973,4 +2460,171 @@ fn wizard_tls_fragment_field_accepts_xray_json_and_empty() {
             &mut config
         )
         .is_err());
+}
+
+#[test]
+fn tls_fragment_editor_renders_preset_checklist() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.wizard_step = WizardStep::Settings;
+    let fragment_idx = SettingField::ALL
+        .iter()
+        .position(|field| *field == SettingField::TlsFragment)
+        .unwrap();
+    app.start_edit(fragment_idx);
+    // Fragmentation is off by default, so the off row is checked.
+    assert_eq!(app.fragment_preset_draft, 0);
+    assert_eq!(app.fragment_preset_cursor, 0);
+
+    let output = rendered(&mut app, 160, 40);
+    assert!(
+        output.contains("Off (control)"),
+        "the off row must be listed"
+    );
+    assert!(
+        output.contains("10-20 / 10-20ms (xray default)"),
+        "the curated presets must be listed"
+    );
+    assert!(
+        output.contains("Custom (paste JSON)"),
+        "the custom-JSON entry must be listed"
+    );
+    let mapped: Vec<usize> = app.fragment_row_map.iter().flatten().copied().collect();
+    assert!(
+        mapped.iter().enumerate().all(|(index, row)| *row == index),
+        "mapped rows must be the leading window of the picker list"
+    );
+}
+
+#[test]
+fn tls_fragment_editor_space_toggles_and_enter_commits() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.wizard_step = WizardStep::Settings;
+    let fragment_idx = SettingField::ALL
+        .iter()
+        .position(|field| *field == SettingField::TlsFragment)
+        .unwrap();
+    app.start_edit(fragment_idx);
+    assert_eq!(app.fragment_preset_draft, 0);
+
+    // Highlight the second preset ("1-1") and check it, then confirm.
+    app.fragment_preset_cursor = 1;
+    app.handle_key(KeyCode::Char(' '), KeyModifiers::NONE);
+    assert_eq!(app.fragment_preset_draft, 1);
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.edit_field, None, "Enter should commit the picker");
+    let crate::proxy::FragmentProfile::Xray(expected) =
+        crate::proxy::TLS_FRAGMENT_PRESETS[1].1.as_ref().unwrap()
+    else {
+        panic!("preset 1 must be a single xray fragment");
+    };
+    assert_eq!(app.config.tls_fragment.as_ref(), Some(expected));
+
+    // Reopening checks the matching preset; Space on it unchecks back to off.
+    app.start_edit(fragment_idx);
+    assert_eq!(app.fragment_preset_draft, 1);
+    app.handle_key(KeyCode::Char(' '), KeyModifiers::NONE);
+    assert_eq!(app.fragment_preset_draft, 0);
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(app.config.tls_fragment.is_none());
+}
+
+#[test]
+fn tls_fragment_custom_entry_edits_json_and_commits() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.wizard_step = WizardStep::Settings;
+    let fragment_idx = SettingField::ALL
+        .iter()
+        .position(|field| *field == SettingField::TlsFragment)
+        .unwrap();
+    app.start_edit(fragment_idx);
+
+    // Activate the custom entry with Enter on its row.
+    app.fragment_preset_cursor = crate::proxy::TLS_FRAGMENT_PRESETS.len();
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        app.fragment_preset_draft,
+        crate::proxy::TLS_FRAGMENT_PRESETS.len(),
+        "Enter on the custom row should open the raw-JSON editor"
+    );
+
+    let json = r#"{"packets":"tlshello","length":"50-80","interval":"2-5"}"#;
+    app.edit_buffer = json.to_string();
+    app.edit_caret = app.edit_buffer.len();
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.edit_field, None);
+    assert_eq!(app.config.tls_fragment.as_ref().unwrap().xray_json(), json);
+
+    // An unmatched custom spec reopens the picker with the custom row checked.
+    app.start_edit(fragment_idx);
+    assert_eq!(
+        app.fragment_preset_draft,
+        crate::proxy::TLS_FRAGMENT_PRESETS.len()
+    );
+}
+
+#[test]
+fn mouse_tap_selects_or_commits_the_clicked_fragment_row() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.wizard_step = WizardStep::Settings;
+    let fragment_idx = SettingField::ALL
+        .iter()
+        .position(|field| *field == SettingField::TlsFragment)
+        .unwrap();
+    app.start_edit(fragment_idx);
+
+    draw(&mut app, 160, 60);
+    let inner = app.settings_inner.unwrap();
+    let preset_row = app
+        .fragment_row_map
+        .iter()
+        .position(|entry| *entry == Some(1))
+        .unwrap();
+    let custom_row = app
+        .fragment_row_map
+        .iter()
+        .position(|entry| *entry == Some(crate::proxy::TLS_FRAGMENT_PRESETS.len()))
+        .unwrap();
+
+    let tap = |app: &mut App, row: usize| {
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x + 2,
+            row: inner.y + row as u16,
+            modifiers: KeyModifiers::NONE,
+        });
+    };
+
+    let crate::proxy::FragmentProfile::Xray(expected) =
+        crate::proxy::TLS_FRAGMENT_PRESETS[1].1.as_ref().unwrap()
+    else {
+        panic!("preset 1 must be a single xray fragment");
+    };
+    tap(&mut app, preset_row);
+    assert_eq!(app.edit_field, None, "tap on a preset should commit it");
+    assert_eq!(app.config.tls_fragment.as_ref(), Some(expected));
+
+    app.start_edit(fragment_idx);
+    tap(&mut app, custom_row);
+    assert_eq!(app.edit_field, Some(fragment_idx));
+    assert_eq!(
+        app.fragment_preset_draft,
+        crate::proxy::TLS_FRAGMENT_PRESETS.len(),
+        "tap on the custom row should open the raw-JSON editor"
+    );
 }

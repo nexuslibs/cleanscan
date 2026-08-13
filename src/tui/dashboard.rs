@@ -1,4 +1,6 @@
-use crate::scanner::{result_confidence, result_status, ProbeFailureCounts, ProbeResult};
+use crate::scanner::{
+    result_confidence, result_status, working_port_results, ProbeFailureCounts, ProbeResult,
+};
 use crate::tui::theme;
 use crate::tui::{
     modal_overlay, widgets, App, ButtonAction, ButtonKind, RunKind, ScanDashboardView,
@@ -38,7 +40,7 @@ pub const RESULT_COLUMNS: [&str; 14] = [
 const WIDTHS: [Constraint; 14] = [
     Constraint::Length(5),
     Constraint::Length(42),
-    Constraint::Length(8),
+    Constraint::Length(14),
     Constraint::Length(5),
     Constraint::Length(6),
     Constraint::Length(10),
@@ -54,185 +56,86 @@ const WIDTHS: [Constraint; 14] = [
 
 /// Render the live scanning dashboard.
 pub fn render(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) {
-    let compact = area.width < 168;
-    let minimum_height = if compact { 12 } else { 15 };
-    if area.width < 72 || area.height < minimum_height {
-        render_micro(app, frame, area);
-        render_result_details(app, frame, area, elapsed);
-        return;
-    }
-
-    // The full 14-column table needs 153 (WIDTHS) + 13 column separators
-    // + 2 border columns = 168 columns to render without clipping.
-    if compact {
-        render_compact(app, frame, area);
-    } else {
-        render_wide(app, frame, area);
-    }
-
+    render_dashboard(app, frame, area, area.width < 168);
     render_result_details(app, frame, area, elapsed);
 }
 
-/// Progressive fallback for very small terminals. It keeps the live scan,
-/// selection, status, and quit affordances usable instead of replacing the
-/// product with a resize warning.
-fn render_micro(app: &mut App, frame: &mut Frame, area: Rect) {
-    let chunks = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Length(4),
-        Constraint::Min(1),
-        Constraint::Length(2),
+/// Vertical layout for the scanning dashboard. The results table is reserved
+/// first (its frame plus the header row plus one data row), and the remaining
+/// rows go to the chrome sections in priority order: footer, tabs, stats,
+/// header. The table therefore keeps at least one data row at every terminal
+/// height and grows monotonically as the terminal grows, so resizing can
+/// never empty the results table.
+fn dashboard_chunks(area: Rect, compact: bool) -> std::rc::Rc<[Rect]> {
+    let height = area.height;
+    // Table frame (2 borders) + header row + one data row.
+    let mut left = height.saturating_sub(4);
+    let footer = left.min(4);
+    left -= footer;
+    let tabs = left.min(2);
+    left -= tabs;
+    // The wide stats panel needs its full 8 rows; below that the compact
+    // 4-row panel is used so a short terminal cannot starve the table.
+    let stats_cap = if compact || height < 30 { 4 } else { 8 };
+    let stats = left.min(stats_cap);
+    left -= stats;
+    let header = left.min(3);
+    let table = height.saturating_sub(footer + tabs + stats + header);
+    Layout::vertical([
+        Constraint::Length(header),
+        Constraint::Length(stats),
+        Constraint::Length(tabs),
+        Constraint::Length(table),
+        Constraint::Length(footer),
     ])
-    .split(area);
-    render_micro_header(app, frame, chunks[0]);
-    render_compact_stats(app, frame, chunks[1]);
+    .split(area)
+}
 
-    if app.dashboard_view != ScanDashboardView::Results {
-        render_scan_view(app, frame, chunks[2], true);
-        let isolated_work = app.investigation.is_some() || app.pending_isolation.is_some();
-        let hints: &[widgets::KeyHint] = if app.scan_complete && isolated_work {
-            &[("x", "stop"), ("q", "quit"), ("p", "resume"), ("o", "view")]
-        } else if app.scan_complete {
-            &[("q", "quit"), ("o", "view"), ("↑/↓", "select")]
-        } else {
-            &[("x", "stop"), ("q", "quit"), ("p", "pause"), ("o", "view")]
-        };
-        widgets::status_bar(frame, chunks[3], hints, app.visible_message());
-        return;
+fn render_dashboard(app: &mut App, frame: &mut Frame, area: Rect, compact: bool) {
+    let chunks = dashboard_chunks(area, compact);
+    if chunks[0].height > 0 {
+        render_header(app, frame, chunks[0]);
     }
-    let block = widgets::panel_block("Results — Enter details", app.focus_index == 0);
-    let inner = block.inner(chunks[2]);
-    app.table_inner = Some(inner);
-    app.table_header = Some(Rect::new(inner.x, inner.y, inner.width, 1));
-    app.table_col_indices = vec![0, 1, 8];
-    app.table_col_bounds = vec![
-        (inner.x, inner.x.saturating_add(4)),
-        (inner.x.saturating_add(4), inner.x.saturating_add(4 + 12)),
-        (inner.right().saturating_sub(10), inner.right()),
-    ];
-    let visible = inner.height.saturating_sub(1) as usize;
-    let display_len = app.sorted_results().len().min(app.config.top);
-    app.result_cursor = app.result_cursor.min(display_len.saturating_sub(1));
-    let max_start = display_len.saturating_sub(visible);
-    app.scroll = app
-        .scroll
-        .max(app.result_cursor.saturating_sub(visible.saturating_sub(1)))
-        .min(app.result_cursor)
-        .min(max_start);
-    let sorted = app.sorted_results();
-    let rows = sorted
-        .iter()
-        .skip(app.scroll)
-        .take(visible)
-        .enumerate()
-        .map(|(index, result)| {
-            let status = result_status(result);
-            let selected = app.scroll + index == app.result_cursor;
-            Row::new(vec![
-                Cell::from(format!("{}", app.scroll + index + 1)),
-                Cell::from(result.ip.clone()),
-                Cell::from(fmt_ms(result.p95)),
-                Cell::from(status),
-            ])
-            .style(if selected {
-                theme::row_selected_style()
-            } else {
-                Style::default()
-            })
-        });
-    frame.render_widget(
-        Table::new(
-            rows,
-            [
-                Constraint::Length(4),
-                Constraint::Min(12),
-                Constraint::Length(10),
-                Constraint::Length(10),
-            ],
-        )
-        .header(Row::new(["#", "IP", "P95", "Status"]).style(theme::title_style()))
-        .block(block),
-        chunks[2],
-    );
+    if chunks[1].height >= 8 {
+        let stats =
+            Layout::vertical([Constraint::Length(6), Constraint::Length(1)]).split(chunks[1]);
+        render_stats_panel(app, frame, stats[0]);
+        render_failure_summary(app, frame, stats[1]);
+    } else if chunks[1].height > 0 {
+        render_compact_stats(app, frame, chunks[1]);
+    }
+    if chunks[2].height > 0 {
+        render_scan_tabs(app, frame, chunks[2]);
+    }
+    render_scan_view(app, frame, chunks[3], compact);
+    if area.width < 72 {
+        render_micro_footer(app, frame, chunks[4]);
+    } else if compact {
+        render_compact_footer(app, frame, chunks[4]);
+    } else {
+        render_footer(app, frame, chunks[4]);
+    }
+}
+
+/// Minimal status-bar footer for very narrow terminals: no buttons, just the
+/// short hint strip so the scan stays controllable at ~60 columns.
+fn render_micro_footer(app: &App, frame: &mut Frame, area: Rect) {
     let isolated_work = app.investigation.is_some() || app.pending_isolation.is_some();
     let hints: &[widgets::KeyHint] = if app.scan_complete && isolated_work {
-        &[("x", "stop"), ("q", "quit"), ("p", "resume")]
+        &[("x", "stop"), ("q", "quit"), ("p", "resume"), ("o", "view")]
     } else if app.scan_complete {
         &[
             ("q", "quit"),
-            ("↑/↓", "select"),
-            (widgets::enter_key(), "details"),
-        ]
-    } else {
-        &[
-            ("x", "stop"),
-            ("q", "quit"),
-            ("p", "pause"),
+            ("o", "view"),
+            ("R", "retest"),
+            ("d", "degraded"),
+            ("g", "fragments"),
             ("↑/↓", "select"),
         ]
-    };
-    widgets::status_bar(frame, chunks[3], hints, app.visible_message());
-}
-
-fn render_micro_header(app: &App, frame: &mut Frame, area: Rect) {
-    let status = match app.scan_lifecycle {
-        ScanLifecycle::Completed => "DONE",
-        ScanLifecycle::Paused => "PAUSED",
-        ScanLifecycle::Cancelling => "CANCELLING",
-        ScanLifecycle::Failed => "FAILED",
-        ScanLifecycle::Cancelled => "CANCELLED",
-        ScanLifecycle::Running => "SCANNING",
-    };
-    let status_text = if status == "SCANNING" {
-        format!("{} {}", widgets::spinner_frame(app.tick), status)
     } else {
-        status.to_string()
+        &[("x", "stop"), ("q", "quit"), ("p", "pause"), ("o", "view")]
     };
-    widgets::app_header(
-        frame,
-        area,
-        Some((&status_text, theme::status_style(status))),
-        &[],
-    );
-}
-
-fn render_wide(app: &mut App, frame: &mut Frame, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Header
-            Constraint::Length(7), // Stats panel + failure summary
-            Constraint::Length(2), // Dashboard view tabs
-            Constraint::Min(1),    // Results table
-            Constraint::Length(4), // Footer: buttons + status bar
-        ])
-        .split(area);
-
-    render_header(app, frame, chunks[0]);
-    let stats = Layout::vertical([Constraint::Length(6), Constraint::Length(1)]).split(chunks[1]);
-    render_stats_panel(app, frame, stats[0]);
-    render_failure_summary(app, frame, stats[1]);
-    render_scan_tabs(app, frame, chunks[2]);
-    render_scan_view(app, frame, chunks[3], false);
-    render_footer(app, frame, chunks[4]);
-}
-
-fn render_compact(app: &mut App, frame: &mut Frame, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(4),
-            Constraint::Length(2),
-            Constraint::Min(1),
-            Constraint::Length(4), // Footer: buttons + status bar
-        ])
-        .split(area);
-    render_header(app, frame, chunks[0]);
-    render_compact_stats(app, frame, chunks[1]);
-    render_scan_tabs(app, frame, chunks[2]);
-    render_scan_view(app, frame, chunks[3], true);
-    render_compact_footer(app, frame, chunks[4]);
+    widgets::status_bar(frame, area, hints, app.visible_message());
 }
 
 fn render_scan_tabs(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -701,11 +604,13 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         ]
     } else if app.scan_complete {
         &[
+            ("R", "retest IP"),
+            ("d", "retest degraded"),
+            ("g", "fragments"),
             ("Tab", "focus"),
             (widgets::enter_key(), "details"),
             ("e", "export"),
             ("t", "speed"),
-            ("g", "fragments"),
             ("f", "failures"),
             ("/", "commands"),
             ("?", "help"),
@@ -797,12 +702,20 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect, elapsed: 
 
     match app.detail_tab {
         0 => {
-            let lines = vec![
+            let mut lines = vec![
                 Line::from(format!("Status      : {}", result_status(result))),
                 Line::from(format!(
                     "Protocol    : {} (port {})",
                     result.protocol, result.port
                 )),
+            ];
+            if working_port_results(result).len() > 1 {
+                lines.push(Line::from(format!(
+                    "Ports       : {}",
+                    port_detail_text(result)
+                )));
+            }
+            lines.extend([
                 Line::from(format!(
                     "Colo        : {}",
                     result.colo.clone().unwrap_or_else(|| "unknown".to_string())
@@ -855,7 +768,7 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect, elapsed: 
                     result.min_score, result.max_score
                 )),
                 Line::from(format!("Decision    : {}", result.decision)),
-            ];
+            ]);
             render_detail_text(frame, chunks[2], lines);
         }
         1 => {
@@ -1552,14 +1465,61 @@ fn render_decision_panel(app: &App, frame: &mut Frame, area: Rect) {
             theme::bad_style(),
         )));
     }
-    lines.push(Line::from(Span::styled(
+    lines.push(Line::from(vec![
+        Span::styled("Actions: ", theme::title_style()),
+        Span::styled("R", theme::highlight_style()),
+        Span::raw(" retest this IP • "),
+        Span::styled("d", theme::highlight_style()),
+        Span::raw(" retest degraded • "),
+        Span::styled("g", theme::highlight_style()),
+        Span::raw(" test fragments • "),
+        Span::styled("G", theme::highlight_style()),
+        Span::raw(" manual profiles"),
+    ]));
+    let mut hint = String::from(
         "Ranking: recommendation score first, then success rate, p95, jitter, packet loss, and average latency • f: show failures",
-        theme::hint_style(),
-    )));
+    );
+    if degraded + failed > 0 {
+        hint.push_str(" • d: retest degraded");
+    }
+    lines.push(Line::from(Span::styled(hint, theme::hint_style())));
     frame.render_widget(
         Paragraph::new(lines).block(widgets::panel_block("Scan result — decision view", false)),
         area,
     );
+}
+
+/// Port-cell text for the results table. Shows the best port as
+/// `protocol@port` and appends every other working port as `+port` so an IP
+/// verified on multiple ports is not hidden.
+fn port_cell_text(r: &ProbeResult) -> String {
+    let ports = working_port_results(r);
+    if ports.len() <= 1 {
+        return format!("{}@{}", r.protocol, r.port);
+    }
+    let mut text = format!("{}@{}", r.protocol, r.port);
+    for port in ports.iter().skip(1) {
+        text.push_str(&format!("+{}", port.port));
+    }
+    text
+}
+
+/// Detail-view line listing every working port with its own success count and
+/// p95, best port first.
+fn port_detail_text(r: &ProbeResult) -> String {
+    let ports = working_port_results(r);
+    let mut parts = Vec::with_capacity(ports.len());
+    for port in ports {
+        parts.push(format!(
+            "{} ({}) {}/{}  p95 {}",
+            port.port,
+            port.protocol,
+            port.ok,
+            port.completed,
+            fmt_ms(port.p95)
+        ));
+    }
+    parts.join(" · ")
 }
 
 fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -1685,7 +1645,7 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
             let cells = vec![
                 Cell::from(rank_text).style(base_style),
                 Cell::from(ip_text).style(base_style),
-                Cell::from(format!("{}@{}", r.protocol, r.port)).style(base_style),
+                Cell::from(port_cell_text(r)).style(base_style),
                 Cell::from(r.ok.to_string()).style(base_style),
                 Cell::from(r.fail.to_string()).style(if is_selected {
                     base_style
@@ -2468,6 +2428,14 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
             ButtonKind::Primary,
             app.focus_index == 3,
         );
+        app.button_ex(
+            frame,
+            chunks[4],
+            "Fragments (g)",
+            ButtonAction::FragmentTest,
+            ButtonKind::Secondary,
+            false,
+        );
     } else {
         app.button_ex(
             frame,
@@ -2545,6 +2513,8 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
             ("r", "rerun targets"),
             ("n", "new sample"),
             ("m", "comparison export"),
+            ("g", "fragments"),
+            ("d", "retest degraded"),
             ("w", "customize"),
             ("/", "commands"),
             ("?", "help"),
@@ -2573,7 +2543,8 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
 mod tests {
     use super::{
         canonical_results_by_ip, failure_summary_line, latency_bucket, latency_summary, median,
-        recommendation_ip, selected_latency_index, unique_ip_counts, FailureSummaryMode,
+        port_cell_text, port_detail_text, recommendation_ip, selected_latency_index,
+        unique_ip_counts, FailureSummaryMode,
     };
     use crate::config::AppConfig;
     use crate::scanner::{ProbeFailureCounts, ProbeResult};
@@ -2687,6 +2658,79 @@ mod tests {
         let canonical = canonical_results_by_ip(&results);
         assert_eq!(canonical.len(), 1);
         assert_eq!(canonical["192.0.2.1"].completed, 4);
+    }
+
+    fn port_result(port: u16, ok: usize, score: f64) -> crate::scanner::PortResult {
+        crate::scanner::PortResult {
+            port,
+            protocol: "h2".to_string(),
+            ok,
+            fail: usize::from(ok == 0),
+            completed: ok.max(1),
+            avg: 0.02,
+            p50: 0.02,
+            p90: 0.02,
+            p95: 0.02,
+            max: 0.03,
+            jitter: 0.0,
+            stddev: 0.0,
+            loss: usize::from(ok == 0),
+            packet_loss: f64::from(ok == 0),
+            samples: Vec::new(),
+            failures: Vec::new(),
+            diagnostics: Vec::new(),
+            success_rate: 1.0,
+            score,
+            colo: None,
+            country: None,
+            cold_ms: None,
+            stopped_early: false,
+            min_score: score,
+            max_score: score,
+            success_rate_lower: 1.0,
+            success_rate_upper: 1.0,
+            score_confidence: 0.95,
+            decision: "competitive".to_string(),
+            checks: Vec::new(),
+            health_ok: true,
+        }
+    }
+
+    #[test]
+    fn port_cell_single_port_matches_legacy_format() {
+        assert_eq!(port_cell_text(&result("192.0.2.1", 1.0, &[0.01])), "h2@443");
+        let mut aggregate = result("192.0.2.1", 1.0, &[0.01]);
+        aggregate.port = 2027;
+        aggregate.port_results = vec![port_result(2027, 1, 50.0)];
+        assert_eq!(port_cell_text(&aggregate), "h2@2027");
+    }
+
+    #[test]
+    fn port_cell_lists_extra_working_ports_best_first() {
+        let mut aggregate = result("192.0.2.1", 1.0, &[0.01]);
+        aggregate.port_results = vec![
+            port_result(2027, 1, 45.0),
+            port_result(443, 1, 50.0),
+            port_result(8443, 0, 30.0),
+        ];
+        assert_eq!(port_cell_text(&aggregate), "h2@443+2027");
+        assert_eq!(
+            port_detail_text(&aggregate),
+            "443 (h2) 1/1  p95 20.0ms · 2027 (h2) 1/1  p95 20.0ms"
+        );
+    }
+
+    #[test]
+    fn port_cell_collapses_duplicate_port_entries() {
+        let mut aggregate = result("192.0.2.1", 1.0, &[0.01]);
+        aggregate.port = 8443;
+        aggregate.port_results = vec![
+            port_result(8443, 1, 40.0),
+            port_result(8443, 1, 55.0),
+            port_result(8443, 1, 30.0),
+        ];
+        assert_eq!(port_cell_text(&aggregate), "h2@8443");
+        assert_eq!(port_detail_text(&aggregate), "8443 (h2) 1/1  p95 20.0ms");
     }
 
     #[test]

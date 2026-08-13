@@ -345,7 +345,7 @@ pub fn run_tui(
                     // check future closes its sockets immediately.
                     let check = tokio::select! {
                         _ = cancel_watcher(&fragment_cancel) => None,
-                        check = crate::proxy::check_candidate_fragmented(
+                        check = crate::proxy::check_candidate_fragmented_profile(
                             &transport,
                             &ip,
                             timeout_ms,
@@ -1061,7 +1061,7 @@ pub fn run_tui(
             }
 
             if app.pending_fragment_start
-                && app.screen == Screen::FragmentSelect
+                && matches!(app.screen, Screen::FragmentSelect | Screen::FragmentTesting)
                 && fragment_runner.is_none()
             {
                 app.pending_fragment_start = false;
