@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.37.0](https://github.com/nexuslibs/cleanscan/compare/v0.36.0...v0.37.0) (2026-08-13)
+
+
+### Features
+
+* **tui:** add TLS fragment tester for DPI-bypass profiles ([fd14411](https://github.com/nexuslibs/cleanscan/commit/fd14411b7a0a8cca08446c2f62c817ea7651cf53))
+* **tui:** add TLS fragment tester for DPI-bypass profiles ([c19e610](https://github.com/nexuslibs/cleanscan/commit/c19e61048ebc703a4f32a0c596afb9a75921f16f))
+* **tui:** enhance TLS fragment handling and UI interactions ([5b7038b](https://github.com/nexuslibs/cleanscan/commit/5b7038b2df0f2f6f3324db182a1a46e0d09c9be2))
+* **tui:** improve TLS fragment handling and error reporting in TUI ([445582e](https://github.com/nexuslibs/cleanscan/commit/445582e64f739112997088c9982e8fd30ce33b6d))
+
 ## [0.36.0](https://github.com/nexuslibs/cleanscan/compare/v0.35.0...v0.36.0) (2026-08-11)
 
 
