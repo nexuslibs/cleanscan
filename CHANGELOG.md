@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.38.0](https://github.com/nexuslibs/cleanscan/compare/v0.37.0...v0.38.0) (2026-08-15)
+
+
+### Features
+
+* **proxy:** support double TLS fragmentation profiles ([5924802](https://github.com/nexuslibs/cleanscan/commit/5924802ef3ed2f44efba633701d20088e50df862))
+* **proxy:** support double TLS fragmentation profiles ([fdf0656](https://github.com/nexuslibs/cleanscan/commit/fdf0656fe70d7506c7838204d4f280ac4ccdec08))
+* **tui:** add optional and weighted health checks, improve fragment handling ([839b52e](https://github.com/nexuslibs/cleanscan/commit/839b52ebbc6a6f8fb4a1b2ce76e6c888259b05ca))
+
 ## [0.37.0](https://github.com/nexuslibs/cleanscan/compare/v0.36.0...v0.37.0) (2026-08-13)
 
 
