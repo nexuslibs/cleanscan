@@ -942,6 +942,13 @@ fn split_stage(
             }
             split_num += 1;
         }
+        if payload.is_empty() {
+            if merge {
+                merged.extend_from_slice(&data[..5]);
+            } else {
+                segments.push((data[..5].to_vec(), pending_delay));
+            }
+        }
         if merge {
             let mut out = Vec::new();
             if !merged.is_empty() {
@@ -1737,6 +1744,29 @@ mod tests {
             .flat_map(|(bytes, _)| bytes.iter().copied())
             .collect();
         assert_eq!(reassembled, *merged);
+    }
+
+    #[test]
+    fn tlshello_zero_length_record_survives_fragmentation() {
+        let mut rng = StdRng::seed_from_u64(7);
+        // A zero-length TLS record (header only) must still be emitted as a
+        // valid five-byte record instead of producing an empty segment list.
+        let empty = tls_record(&[]);
+        let (items, trailing) = split_stage(&mut rng, &DOUBLE_FRAGMENT_STAGES[0], &empty);
+        assert_eq!(trailing, 0);
+        assert_eq!(items.len(), 1, "empty record must still produce one write");
+        assert_eq!(
+            items[0].0, empty,
+            "five-byte header must pass through untouched"
+        );
+
+        // Trailing data after the empty record is preserved in merge mode.
+        let mut data = empty.clone();
+        data.extend_from_slice(&tls_record(b"tail"));
+        let (items, trailing) = split_stage(&mut rng, &DOUBLE_FRAGMENT_STAGES[0], &data);
+        assert_eq!(trailing, 0);
+        let out: Vec<u8> = items.iter().flat_map(|(b, _)| b.iter().copied()).collect();
+        assert_eq!(out, data, "empty record header and tail must both survive");
     }
 
     #[tokio::test]

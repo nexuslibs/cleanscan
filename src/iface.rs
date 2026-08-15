@@ -155,8 +155,10 @@ pub fn bypass_vpn_interface() -> Option<String> {
         let (ipv4, ipv6) = preferred_addresses(&entry.addresses);
         let usable = ipv4
             .map(IpAddr::V4)
-            .or_else(|| ipv6.map(IpAddr::V6))
-            .is_some_and(|addr| is_off_link_capable(&addr));
+            .is_some_and(|addr| is_off_link_capable(&addr))
+            || ipv6
+                .map(IpAddr::V6)
+                .is_some_and(|addr| is_off_link_capable(&addr));
         if !usable {
             continue;
         }

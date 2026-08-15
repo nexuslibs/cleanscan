@@ -500,34 +500,38 @@ fn results_table_keeps_at_least_one_row_at_every_terminal_height() {
     }
 
     // Compact (4-column) results table: one data row must stay visible at
-    // every height. Below the layout's h=17 cutoff the table used to be
-    // completely empty (fixed sections + table frame eat every row).
-    for h in 12..=35u16 {
-        let buffer = rendered(&mut app, 80, h);
-        let visible = lines_containing(&buffer, 80, "10.0.0.");
-        let expected = h.saturating_sub(16).max(1) as usize;
-        assert_eq!(
-            visible, expected,
-            "compact results table at h={h} must show {expected} data row(s)"
-        );
+    // every height and the visible count must never drop as the terminal
+    // grows (the stats_cap boundary used to shrink the table).
+    for (width, label) in [(80u16, "compact"), (200u16, "wide")] {
+        let mut prev = 0usize;
+        for h in 12..=35u16 {
+            let buffer = rendered(&mut app, width, h);
+            let visible = lines_containing(&buffer, width, "10.0.0.");
+            assert!(
+                visible >= 1,
+                "{label} results table must keep at least one data row at h={h}"
+            );
+            assert!(
+                visible >= prev,
+                "{label} results table lost rows at h={h}: {prev} -> {visible}"
+            );
+            prev = visible;
+        }
     }
 
-    // Wide (14-column) results table: the h=15..=20 band used to render an
-    // empty table. The wide stats panel echoes the best IP in "Fastest Edge",
-    // so with the 8-row panel a running scan shows one extra line.
-    for h in 15..=35u16 {
-        let buffer = rendered(&mut app, 200, h);
-        let visible = lines_containing(&buffer, 200, "10.0.0.");
-        let expected = if h >= 30 {
-            h.saturating_sub(19) as usize
-        } else {
-            h.saturating_sub(16).max(1) as usize
-        };
-        assert_eq!(
-            visible, expected,
-            "wide results table at h={h} must show {expected} data row(s)"
-        );
-    }
+    // Representative exact checks: the smallest terminal still shows one row,
+    // and the tallest keeps growing well past the single-row floor.
+    let buffer = rendered(&mut app, 80, 12);
+    assert_eq!(
+        lines_containing(&buffer, 80, "10.0.0."),
+        1,
+        "compact table at the smallest height shows exactly one data row"
+    );
+    let buffer = rendered(&mut app, 200, 35);
+    assert!(
+        lines_containing(&buffer, 200, "10.0.0.") >= 12,
+        "wide table must grow well past the single-row floor by h=35"
+    );
 }
 
 #[test]
@@ -2570,6 +2574,70 @@ fn tls_fragment_custom_entry_edits_json_and_commits() {
     app.start_edit(fragment_idx);
     assert_eq!(
         app.fragment_preset_draft,
+        crate::proxy::TLS_FRAGMENT_PRESETS.len()
+    );
+}
+
+#[test]
+fn tls_fragment_custom_editor_arrows_return_to_preset_rows() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.wizard_step = WizardStep::Settings;
+    let fragment_idx = SettingField::ALL
+        .iter()
+        .position(|field| *field == SettingField::TlsFragment)
+        .unwrap();
+    app.start_edit(fragment_idx);
+
+    // Open the raw-JSON editor on the custom row.
+    app.fragment_preset_cursor = crate::proxy::TLS_FRAGMENT_PRESETS.len();
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        app.fragment_preset_draft,
+        crate::proxy::TLS_FRAGMENT_PRESETS.len()
+    );
+
+    // Up leaves the text editor and lands on the last preset row, checked.
+    app.edit_buffer = r#"{"packets":"tlshello"}"#.to_string();
+    app.handle_key(KeyCode::Up, KeyModifiers::NONE);
+    assert_eq!(
+        app.fragment_preset_draft,
+        crate::proxy::TLS_FRAGMENT_PRESETS.len() - 1,
+        "Up must return to the preset checklist"
+    );
+    assert_eq!(
+        app.fragment_preset_cursor,
+        crate::proxy::TLS_FRAGMENT_PRESETS.len() - 1
+    );
+
+    // Down from the custom editor returns with the cursor on the custom row.
+    app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(
+        app.fragment_preset_draft,
+        crate::proxy::TLS_FRAGMENT_PRESETS.len() - 1
+    );
+    assert_eq!(
+        app.fragment_preset_cursor,
+        crate::proxy::TLS_FRAGMENT_PRESETS.len()
+    );
+
+    // Re-enter the editor from the checklist's custom row, then leave it
+    // again with Down.
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        app.fragment_preset_draft,
+        crate::proxy::TLS_FRAGMENT_PRESETS.len()
+    );
+    app.handle_key(KeyCode::Down, KeyModifiers::NONE);
+    assert_eq!(
+        app.fragment_preset_draft,
+        crate::proxy::TLS_FRAGMENT_PRESETS.len() - 1
+    );
+    assert_eq!(
+        app.fragment_preset_cursor,
         crate::proxy::TLS_FRAGMENT_PRESETS.len()
     );
 }

@@ -2308,11 +2308,6 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
                                 .any(|(i, entry)| i != idx && entry.cidr == s);
                             if collision {
                                 app.toast_error(format!("CIDR {s} already exists"));
-                            } else if crate::scanner::DEFAULT_CLOUDFLARE_CIDRS.contains(&s.as_str())
-                            {
-                                app.toast_error(format!(
-                                    "{s} is a built-in range; choose a different value"
-                                ));
                             } else {
                                 app.cidr_candidates[idx].cidr = s.clone();
                                 app.cursor = idx;
@@ -2589,6 +2584,14 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
                         app.edit_field = None;
                         app.edit_buffer.clear();
                         app.edit_caret = 0;
+                    }
+                    KeyCode::Up => {
+                        app.fragment_preset_draft = TLS_FRAGMENT_PRESETS.len() - 1;
+                        app.fragment_preset_cursor = TLS_FRAGMENT_PRESETS.len() - 1;
+                    }
+                    KeyCode::Down => {
+                        app.fragment_preset_draft = TLS_FRAGMENT_PRESETS.len() - 1;
+                        app.fragment_preset_cursor = TLS_FRAGMENT_PRESETS.len();
                     }
                     KeyCode::Backspace if app.edit_caret > 0 => {
                         let previous = previous_char_boundary(&app.edit_buffer, app.edit_caret);
@@ -3111,6 +3114,28 @@ mod tests {
         handle_ranges_key(app, crossterm::event::KeyCode::Enter);
     }
 
+    /// Restores `HOME`/`XDG_CONFIG_HOME` and removes the throwaway config
+    /// directory on drop, even when the closure panics.
+    struct IsolatedConfigGuard {
+        old_home: Option<std::ffi::OsString>,
+        old_xdg: Option<std::ffi::OsString>,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for IsolatedConfigGuard {
+        fn drop(&mut self) {
+            match &self.old_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.old_xdg {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
     /// Run `f` with config writes redirected to a throwaway directory so
     /// tests never touch the developer's real config.json. Serialized because
     /// `HOME`/`XDG_CONFIG_HOME` are process-global.
@@ -3125,16 +3150,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("HOME", &dir);
         std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let cleanup = IsolatedConfigGuard {
+            old_home,
+            old_xdg,
+            dir,
+        };
         f();
-        match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
-        }
-        match old_xdg {
-            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(cleanup);
     }
 
     fn field_position(field: SettingField) -> usize {

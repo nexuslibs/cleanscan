@@ -1060,28 +1060,29 @@ pub fn run_tui(
                 ));
             }
 
-            if app.pending_fragment_start
-                && matches!(app.screen, Screen::FragmentSelect | Screen::FragmentTesting)
-                && fragment_runner.is_none()
-            {
+            if app.pending_fragment_start {
                 app.pending_fragment_start = false;
-                if app.fragment_ip.is_empty() {
-                    app.toast_warn("Enter a target IP first (Enter on the IP row)");
-                } else if app.config.host.is_empty() {
-                    app.toast_warn("Set a Host before testing fragments");
-                } else {
-                    let enabled = app.fragment_enabled.clone();
-                    app.fragment_results.clear();
-                    app.fragment_complete = false;
-                    app.fragment_cancel.store(false, Ordering::Relaxed);
-                    app.fragment_start_time = Instant::now();
-                    app.screen = Screen::FragmentTesting;
-                    fragment_runner = Some(spawn_fragment(
-                        app.fragment_ip.clone(),
-                        app.fragment_port,
-                        Arc::new(app.config.clone()),
-                        enabled,
-                    ));
+                if matches!(app.screen, Screen::FragmentSelect | Screen::FragmentTesting)
+                    && fragment_runner.is_none()
+                {
+                    if app.fragment_ip.is_empty() {
+                        app.toast_warn("Enter a target IP first (Enter on the IP row)");
+                    } else if app.config.host.is_empty() {
+                        app.toast_warn("Set a Host before testing fragments");
+                    } else {
+                        let enabled = app.fragment_enabled.clone();
+                        app.fragment_results.clear();
+                        app.fragment_complete = false;
+                        app.fragment_cancel.store(false, Ordering::Relaxed);
+                        app.fragment_start_time = Instant::now();
+                        app.screen = Screen::FragmentTesting;
+                        fragment_runner = Some(spawn_fragment(
+                            app.fragment_ip.clone(),
+                            app.fragment_port,
+                            Arc::new(app.config.clone()),
+                            enabled,
+                        ));
+                    }
                 }
             }
         }

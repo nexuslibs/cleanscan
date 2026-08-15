@@ -63,10 +63,11 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) {
 /// Vertical layout for the scanning dashboard. The results table is reserved
 /// first (its frame plus the header row plus one data row), and the remaining
 /// rows go to the chrome sections in priority order: footer, tabs, stats,
-/// header. The table therefore keeps at least one data row at every terminal
-/// height and grows monotonically as the terminal grows, so resizing can
-/// never empty the results table.
-fn dashboard_chunks(area: Rect, compact: bool) -> std::rc::Rc<[Rect]> {
+/// header. The wide stats panel's extra rows only appear once the table has
+/// reached its wide-mode size, so the table keeps at least one data row at
+/// every terminal height and grows monotonically as the terminal grows:
+/// resizing can never empty or shrink the results table.
+fn dashboard_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
     let height = area.height;
     // Table frame (2 borders) + header row + one data row.
     let mut left = height.saturating_sub(4);
@@ -75,12 +76,17 @@ fn dashboard_chunks(area: Rect, compact: bool) -> std::rc::Rc<[Rect]> {
     let tabs = left.min(2);
     left -= tabs;
     // The wide stats panel needs its full 8 rows; below that the compact
-    // 4-row panel is used so a short terminal cannot starve the table.
-    let stats_cap = if compact || height < 30 { 4 } else { 8 };
+    // 4-row panel is used so a short terminal cannot starve the table. The
+    // band just below the threshold pins the table at its wide-mode size so
+    // switching to wide stats never shrinks it.
+    let stats_cap = if height >= 30 { 8 } else { 4 };
     let stats = left.min(stats_cap);
     left -= stats;
     let header = left.min(3);
-    let table = height.saturating_sub(footer + tabs + stats + header);
+    let mut table = height.saturating_sub(footer + tabs + stats + header);
+    if height < 30 {
+        table = table.min(13);
+    }
     Layout::vertical([
         Constraint::Length(header),
         Constraint::Length(stats),
@@ -92,7 +98,7 @@ fn dashboard_chunks(area: Rect, compact: bool) -> std::rc::Rc<[Rect]> {
 }
 
 fn render_dashboard(app: &mut App, frame: &mut Frame, area: Rect, compact: bool) {
-    let chunks = dashboard_chunks(area, compact);
+    let chunks = dashboard_chunks(area);
     if chunks[0].height > 0 {
         render_header(app, frame, chunks[0]);
     }
@@ -1498,7 +1504,7 @@ fn port_cell_text(r: &ProbeResult) -> String {
         return format!("{}@{}", r.protocol, r.port);
     }
     let mut text = format!("{}@{}", r.protocol, r.port);
-    for port in ports.iter().skip(1) {
+    for port in ports.iter().filter(|port| port.port != r.port) {
         text.push_str(&format!("+{}", port.port));
     }
     text

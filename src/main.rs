@@ -51,6 +51,14 @@ pub struct Args {
     #[arg(long = "check")]
     pub checks: Vec<String>,
 
+    /// Mark the named --check as optional (required=false). Repeatable.
+    #[arg(long = "check-optional")]
+    pub check_optional: Vec<String>,
+
+    /// Set the weight of the named --check in NAME=WEIGHT form. Repeatable.
+    #[arg(long = "check-weight")]
+    pub check_weights: Vec<String>,
+
     /// Expected HTTP status code. Repeat to allow multiple statuses; empty means any 2xx.
     #[arg(long = "expect-status")]
     pub expected_statuses: Vec<u16>,
@@ -367,6 +375,32 @@ fn main() -> Result<()> {
             .iter()
             .map(|value| parse_health_check(value))
             .collect::<Result<Vec<_>>>()?;
+    }
+    for name in &args.check_optional {
+        let check = config
+            .health_checks
+            .iter_mut()
+            .find(|check| check.name == *name)
+            .ok_or_else(|| anyhow::anyhow!("--check-optional {name:?} does not match a --check"))?;
+        check.required = false;
+    }
+    for expression in &args.check_weights {
+        let (name, weight) = expression.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("--check-weight must use NAME=WEIGHT form, got {expression:?}")
+        })?;
+        let weight = weight
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| anyhow::anyhow!("--check-weight for {name:?} must be a number"))?;
+        if !weight.is_finite() || weight < 0.0 {
+            anyhow::bail!("--check-weight for {name:?} must be non-negative");
+        }
+        let check = config
+            .health_checks
+            .iter_mut()
+            .find(|check| check.name == name)
+            .ok_or_else(|| anyhow::anyhow!("--check-weight {name:?} does not match a --check"))?;
+        check.weight = weight;
     }
     if !args.expected_statuses.is_empty() {
         config.expected_statuses = args.expected_statuses.clone();

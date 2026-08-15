@@ -2202,6 +2202,8 @@ impl App {
         self.settings_inner = None;
         self.settings_row_map.clear();
         self.ports_row_map.clear();
+        self.interface_row_map.clear();
+        self.fragment_row_map.clear();
         self.table_inner = None;
         self.table_header = None;
         self.table_col_bounds.clear();

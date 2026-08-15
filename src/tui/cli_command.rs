@@ -44,6 +44,16 @@ pub fn command_string(
                 "--check",
                 shell_quote(&format!("{}={}", check.name, check.path)),
             );
+            if !check.required {
+                kv(&mut parts, "--check-optional", shell_quote(&check.name));
+            }
+            if check.weight != 1.0 {
+                kv(
+                    &mut parts,
+                    "--check-weight",
+                    shell_quote(&format!("{}={}", check.name, check.weight)),
+                );
+            }
         }
     }
     for port in &config.ports {
@@ -230,6 +240,51 @@ mod tests {
         );
         assert!(command.contains("--check home=/index"));
         assert!(!command.contains("/cdn-cgi/trace"));
+    }
+
+    #[test]
+    fn health_check_required_and_weight_are_preserved() {
+        let mut config = base_config();
+        config.health_checks.push(crate::config::HealthCheck {
+            name: "liveness".to_string(),
+            path: "/health".to_string(),
+            required: false,
+            weight: 1.0,
+        });
+        config.health_checks.push(crate::config::HealthCheck {
+            name: "readiness".to_string(),
+            path: "/ready".to_string(),
+            required: true,
+            weight: 0.5,
+        });
+        config.health_checks.push(crate::config::HealthCheck {
+            name: "defaults".to_string(),
+            path: "/probe".to_string(),
+            required: true,
+            weight: 1.0,
+        });
+        let command = command_string(&config, &[], 0, None);
+        assert!(command.contains("--check liveness=/health"));
+        assert!(
+            command.contains("--check-optional liveness"),
+            "optional checks must keep their required flag"
+        );
+        assert!(command.contains("--check readiness=/ready"));
+        assert!(
+            command.contains("--check-weight readiness=0.5"),
+            "custom weights must be emitted"
+        );
+        assert!(command.contains("--check defaults=/probe"));
+        assert!(
+            !command.contains("--check-optional defaults"),
+            "required checks omit the optional flag"
+        );
+        assert!(
+            !command.contains("--check-weight defaults"),
+            "default weight is omitted"
+        );
+        assert!(!command.contains("--check-optional readiness"));
+        assert!(!command.contains("--check-weight liveness"));
     }
 
     #[test]
