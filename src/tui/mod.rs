@@ -1,3 +1,4 @@
+mod cli_command;
 mod clipboard;
 pub mod dashboard;
 pub mod fragment;
@@ -37,7 +38,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     symbols::border::ROUNDED,
     text::{Line, Span},
-    widgets::{Block, Borders, ListState, Paragraph},
+    widgets::{Block, Borders, ListState, Paragraph, Wrap},
     Frame,
 };
 
@@ -112,11 +113,26 @@ pub struct App {
     pub interface_cursor: usize,
     /// Live interface list shown by the network-interface picker.
     pub interface_list: Vec<crate::iface::InterfaceInfo>,
+    /// Non-VPN uplink the "Bypass VPN (auto)" picker row pins, resolved when
+    /// the interface picker opens. `None` when every interface is a tunnel
+    /// or otherwise unusable (loopback-only host).
+    pub bypass_vpn: Option<String>,
+    /// Row cursor while the TLS fragment preset picker is being edited.
+    pub fragment_preset_cursor: usize,
+    /// Checked row of the TLS fragment picker draft; `TLS_FRAGMENT_PRESETS.len()`
+    /// selects the custom-JSON text entry.
+    pub fragment_preset_draft: usize,
     /// Cached `(ip)` suffix for the review screen's interface row; computed
     /// once per interface change instead of on every rendered frame.
     pub review_interface_suffix: Option<String>,
     /// When true, the user is typing a custom CIDR in the ranges step.
     pub custom_input_mode: bool,
+    /// Index of the custom CIDR being edited in the ranges step; `None` when
+    /// the input mode is adding a new range rather than editing one.
+    pub cidr_edit_index: Option<usize>,
+    /// Custom CIDR armed for removal by the ranges step; a second `x` on the
+    /// same row removes it, any other key cancels the pending removal.
+    pub pending_cidr_delete: Option<usize>,
     pub input_buffer: String,
     /// Index of the settings field currently being edited, if any.
     pub edit_field: Option<usize>,
@@ -225,6 +241,9 @@ pub struct App {
     /// Maps each rendered settings row to a network-interface row index while
     /// the interface field is being edited (`None` otherwise), for mouse hit-testing.
     pub interface_row_map: Vec<Option<usize>>,
+    /// Maps each rendered settings row to a TLS fragment picker row while the
+    /// fragment field is being edited (`None` otherwise), for mouse hit-testing.
+    pub fragment_row_map: Vec<Option<usize>>,
     pub table_inner: Option<Rect>,
     pub table_header: Option<Rect>,
     pub table_col_bounds: Vec<(u16, u16)>,
@@ -284,6 +303,12 @@ pub struct App {
     /// Full statistics drawer for the currently selected latency result.
     pub show_result_details: bool,
     pub detail_tab: usize,
+    /// Popup showing the equivalent CLI command for the current scan settings.
+    pub show_cli_command: bool,
+    /// Cached command text, rebuilt each time the popup opens.
+    pub cli_command: String,
+    /// Vertical scroll offset into the wrapped command text.
+    pub cli_command_scroll: usize,
     pub watch_interval: Option<Duration>,
     /// Source identity used to keep watch promotion/demotion state stable
     /// when a cycle is relaunched through the exact-target rescan path.
@@ -310,6 +335,7 @@ pub struct App {
     pub command_palette_overlay: OverlayState,
     pub column_picker_overlay: OverlayState,
     pub result_details_overlay: OverlayState,
+    pub cli_command_overlay: OverlayState,
     pub scan_action_overlay: OverlayState,
     /// Last frame timestamp used to derive per-frame animation deltas.
     anim_clock: Option<Instant>,
@@ -344,7 +370,7 @@ impl App {
             Screen::Wizard => match self.wizard_step {
                 WizardStep::Ranges => 3,
                 WizardStep::Settings => 3,
-                WizardStep::Review => 3,
+                WizardStep::Review => 4,
             },
             Screen::Scanning => {
                 if self.scan_complete && self.scan_lifecycle != ScanLifecycle::Cancelling {
@@ -377,7 +403,11 @@ impl App {
     }
 
     pub fn focus_target_for(&self, index: usize) -> FocusTarget {
-        if self.confirm_quit || self.show_command_palette || self.show_result_details {
+        if self.confirm_quit
+            || self.show_command_palette
+            || self.show_result_details
+            || self.show_cli_command
+        {
             return FocusTarget::Dialog;
         }
         match self.screen {
@@ -420,6 +450,8 @@ impl App {
                     && (self.wizard_step as usize > 0 || self.return_to_results))
                     || (action == Action::Next && (self.wizard_step as usize) < 2)
                     || (action == Action::Start && self.wizard_step == WizardStep::Review)
+                    || (action == Action::CopyCommand
+                        && matches!(self.wizard_step, WizardStep::Settings | WizardStep::Review))
                     || matches!(action, Action::Quit | Action::OpenHelp)
             }
             Screen::Scanning
@@ -444,6 +476,8 @@ impl App {
                         | Action::CycleScanView
                         | Action::RerunSelected
                         | Action::IsolateTarget
+                        | Action::FragmentProfiles
+                        | Action::RetestDegraded
                 ) || ((self.investigation.is_some() || self.pending_isolation.is_some())
                     && matches!(action, Action::PauseResume | Action::StopKeepResults))
             }
@@ -533,6 +567,7 @@ impl App {
             cidr_candidates.push(CidrEntry {
                 cidr: c.to_string(),
                 selected,
+                custom: false,
             });
         }
 
@@ -543,6 +578,7 @@ impl App {
                 cidr_candidates.push(CidrEntry {
                     cidr: c.clone(),
                     selected,
+                    custom: true,
                 });
             }
         }
@@ -562,8 +598,13 @@ impl App {
             port_cursor: 0,
             interface_cursor: 0,
             interface_list: Vec::new(),
+            bypass_vpn: None,
+            fragment_preset_cursor: 0,
+            fragment_preset_draft: 0,
             review_interface_suffix: None,
             custom_input_mode: false,
+            cidr_edit_index: None,
+            pending_cidr_delete: None,
             input_buffer: String::new(),
             edit_field: None,
             edit_buffer: String::new(),
@@ -647,6 +688,7 @@ impl App {
             settings_row_map: Vec::new(),
             ports_row_map: Vec::new(),
             interface_row_map: Vec::new(),
+            fragment_row_map: Vec::new(),
             table_inner: None,
             table_header: None,
             table_col_bounds: Vec::new(),
@@ -695,6 +737,9 @@ impl App {
             column_picker_list_state: ListState::default(),
             show_result_details: false,
             detail_tab: 0,
+            show_cli_command: false,
+            cli_command: String::new(),
+            cli_command_scroll: 0,
             watch_interval: None,
             watch_source_fingerprint: None,
             watch_cycle: 0,
@@ -719,6 +764,7 @@ impl App {
             command_palette_overlay: modal_state(),
             column_picker_overlay: modal_state(),
             result_details_overlay: modal_state(),
+            cli_command_overlay: modal_state(),
             scan_action_overlay: modal_state(),
             anim_clock: None,
             explicit_target_source: None,
@@ -753,38 +799,43 @@ impl App {
         }
     }
 
-    pub fn save_config(&mut self) {
-        let default_set: std::collections::HashSet<String> =
-            crate::scanner::DEFAULT_CLOUDFLARE_CIDRS
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-
-        let mut custom_cidrs = Vec::new();
-        for candidate in &self.cidr_candidates {
-            if !default_set.contains(&candidate.cidr) {
-                custom_cidrs.push(candidate.cidr.clone());
-            }
-        }
-
-        let selected_cidrs: Vec<String> = self
+    /// The configuration that the current candidate selection would persist.
+    /// Pure (no disk I/O) so tests can assert the staged state, and kept in
+    /// sync with `self.config` so no stale write can ever drop a CIDR.
+    fn staged_config(&self) -> AppConfig {
+        let mut current_config = self.config.clone();
+        current_config.custom_cidrs = self
             .cidr_candidates
             .iter()
-            .filter(|e| e.selected)
-            .map(|e| e.cidr.clone())
+            .filter(|entry| entry.custom)
+            .map(|entry| entry.cidr.clone())
             .collect();
+        current_config.selected_cidrs = self
+            .cidr_candidates
+            .iter()
+            .filter(|entry| entry.selected)
+            .map(|entry| entry.cidr.clone())
+            .collect();
+        current_config.selected_cidrs_persisted = true;
+        current_config
+    }
 
-        let mut current_config = self.config.clone();
-        current_config.custom_cidrs = custom_cidrs;
-        current_config.selected_cidrs = selected_cidrs;
-
-        if let Err(e) = crate::config::save_config(&current_config) {
+    pub fn save_config(&mut self) {
+        let staged = self.staged_config();
+        self.config.custom_cidrs = staged.custom_cidrs.clone();
+        self.config.selected_cidrs = staged.selected_cidrs.clone();
+        self.config.selected_cidrs_persisted = true;
+        if let Err(e) = crate::config::save_config(&staged) {
             self.toast_error(format!("Config save failed: {e}"));
         }
     }
 
     /// Switch to the scanning dashboard once targets are known. Resets per-scan state.
     pub fn begin_scan(&mut self, total: usize) {
+        // Targeted reruns (R / d) re-probe a subset of the current results;
+        // keep the existing rows so the table stays populated and the retested
+        // IPs update in place as their probes complete.
+        let preserve_results = self.pending_run_kind == RunKind::Targeted;
         self.archive_current_run();
         self.active_run_kind = self.pending_run_kind;
         self.current_source_run_id = self.pending_source_run_id;
@@ -830,7 +881,9 @@ impl App {
         self.scan_error = None;
         self.quit_after_cancel = false;
         self.edit_after_stop = false;
-        self.results.clear();
+        if !preserve_results {
+            self.results.clear();
+        }
         self.results_revision = self.results_revision.wrapping_add(1);
         self.sorted_cache.borrow_mut().take();
         self.scroll = 0;
@@ -1143,6 +1196,15 @@ impl App {
     }
 
     pub fn add_result(&mut self, result: ProbeResult) {
+        // Retest / watch updates reorder the table; remember the IP under the
+        // cursor before mutation so it can be re-pinned after the resort.
+        let watched = if self.scan_complete {
+            self.sorted_results()
+                .get(self.result_cursor)
+                .map(|r| r.ip.clone())
+        } else {
+            None
+        };
         self.scan_started_ips.insert(result.ip.clone());
         self.scan_result_ips.insert(result.ip.clone());
         if result.ok > 0 {
@@ -1162,13 +1224,28 @@ impl App {
         self.last_completion_at = Some(now);
         // Multi-port and multi-check scans forward per-port/per-check rows and
         // then the merged aggregate; keep only the latest (merged) row per IP.
+        // A partial row (no port results yet) that failed must never overwrite
+        // a working row mid-scan, or the IP would vanish from the results
+        // table until the merged aggregate arrives.
         if let Some(existing) = self.results.iter_mut().find(|r| r.ip == result.ip) {
+            let hide_working = existing.ok > 0
+                && result.ok == 0
+                && !self.scan_complete
+                && result.port_results.is_empty();
+            if hide_working {
+                return;
+            }
             *existing = result;
         } else {
             self.results.push(result);
         }
         self.results_revision = self.results_revision.wrapping_add(1);
         self.sorted_cache.borrow_mut().take();
+        if let Some(ip) = watched {
+            if let Some(index) = self.sorted_results().iter().position(|r| r.ip == ip) {
+                self.result_cursor = index;
+            }
+        }
     }
 
     pub fn apply_scan_progress(&mut self, progress: ScanProgress) {
@@ -1282,6 +1359,41 @@ impl App {
         };
         match clipboard::copy(&ip) {
             Ok(destination) => self.toast_success(format!("Copied {ip} to {destination}")),
+            Err(error) => self.toast_error(format!("Copy failed: {error}")),
+        }
+    }
+
+    /// Build the equivalent CLI command for the current scan settings and
+    /// selected CIDRs.
+    pub fn current_cli_command(&self) -> String {
+        let (cidrs, ips) = match &self.explicit_target_source {
+            Some((explicit_cidrs, explicit_ips)) => {
+                (explicit_cidrs.clone(), explicit_ips.as_deref())
+            }
+            None => (
+                self.cidr_candidates
+                    .iter()
+                    .filter(|entry| entry.selected)
+                    .map(|entry| entry.cidr.clone())
+                    .collect::<Vec<_>>(),
+                None,
+            ),
+        };
+        cli_command::command_string(&self.config, &cidrs, self.scan_seed, ips)
+    }
+
+    /// Open the popup showing the equivalent CLI command.
+    pub fn open_cli_command(&mut self) {
+        self.cli_command = self.current_cli_command();
+        self.cli_command_scroll = 0;
+        self.show_cli_command = true;
+    }
+
+    /// Copy the equivalent CLI command to the clipboard.
+    pub fn copy_cli_command(&mut self) {
+        let command = self.current_cli_command();
+        match clipboard::copy(&command) {
+            Ok(destination) => self.toast_success(format!("Copied CLI command to {destination}")),
             Err(error) => self.toast_error(format!("Copy failed: {error}")),
         }
     }
@@ -1533,7 +1645,7 @@ impl App {
         };
         writeln!(
             f,
-            "rank\tip\tport\tcolo\tcountry\tprotocol\tok\tfail\tavg\tp50\tp90\tp95\tmax\tjitter\tpacket_loss"
+            "rank\tip\tport\tcolo\tcountry\tprotocol\tok\tfail\tavg\tp50\tp90\tp95\tmax\tjitter\tpacket_loss\tports"
         )?;
         for (i, r) in ranked_export_results(&self.results, self.config.top)
             .into_iter()
@@ -1612,8 +1724,16 @@ fn ranked_export_results(results: &[ProbeResult], top: usize) -> Vec<&ProbeResul
 }
 
 fn export_tsv_line(rank: usize, result: &ProbeResult) -> String {
+    let mut ports = crate::scanner::working_port_results(result)
+        .iter()
+        .map(|port_result| port_result.port.to_string())
+        .collect::<Vec<_>>();
+    if ports.is_empty() {
+        ports.push(result.port.to_string());
+    }
+    let ports = ports.join(",");
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}%",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}%\t{}",
         rank,
         result.ip,
         result.port,
@@ -1629,6 +1749,7 @@ fn export_tsv_line(rank: usize, result: &ProbeResult) -> String {
         result.max,
         result.jitter,
         result.packet_loss * 100.0,
+        ports,
     )
 }
 
@@ -1666,6 +1787,7 @@ impl App {
                     match action {
                         Some(PendingScanAction::RepeatTargets) => self.repeat_targets_now(),
                         Some(PendingScanAction::NewSample) => self.generate_new_sample_now(),
+                        Some(PendingScanAction::RetestDegraded) => self.retest_degraded_now(),
                         None => {}
                     }
                 }
@@ -1702,6 +1824,29 @@ impl App {
                         .min(dashboard::RESULT_COLUMNS.len().saturating_sub(1))
                 }
                 KeyCode::Char(' ') | KeyCode::Enter => self.toggle_column(),
+                _ => {}
+            }
+            return;
+        }
+
+        if self.show_cli_command {
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    self.show_cli_command = false
+                }
+                KeyCode::Char('c')
+                | KeyCode::Char('C')
+                | KeyCode::Enter
+                | KeyCode::Char('y')
+                | KeyCode::Char('Y') => self.copy_cli_command(),
+                KeyCode::Up => self.cli_command_scroll = self.cli_command_scroll.saturating_sub(1),
+                KeyCode::Down => self.cli_command_scroll += 1,
+                KeyCode::PageUp => {
+                    self.cli_command_scroll = self.cli_command_scroll.saturating_sub(10)
+                }
+                KeyCode::PageDown => self.cli_command_scroll += 10,
+                KeyCode::Home => self.cli_command_scroll = 0,
+                KeyCode::End => self.cli_command_scroll = usize::MAX,
                 _ => {}
             }
             return;
@@ -1963,6 +2108,7 @@ impl App {
             Action::PauseResume => self.activate_button(ButtonAction::PauseResume),
             Action::SpeedTest => self.activate_button(ButtonAction::SpeedTest),
             Action::FragmentTest => self.activate_button(ButtonAction::FragmentTest),
+            Action::FragmentProfiles => self.open_fragment_selection(),
             Action::CopyIp => self.copy_selected_ip(),
             Action::OpenDetails => {
                 if self.scan_lifecycle != ScanLifecycle::Cancelling {
@@ -1975,6 +2121,7 @@ impl App {
                 self.help_scroll = 0;
             }
             Action::OpenCommandPalette => self.open_command_palette(),
+            Action::CopyCommand => self.open_cli_command(),
             Action::ConfigureColumns => {
                 if self.screen == Screen::Scanning {
                     self.show_column_picker = true;
@@ -2038,6 +2185,11 @@ impl App {
             Action::CycleScanView => self.cycle_scan_view(),
             Action::IsolateTarget => self.isolate_selected_target(),
             Action::RerunSelected => self.rerun_selected_targets(),
+            Action::RetestDegraded => {
+                if self.screen == Screen::Scanning && self.scan_complete {
+                    self.retest_degraded();
+                }
+            }
             Action::StopKeepResults => self.send_scan_control(ScanControl::StopAndKeepResults),
         }
     }
@@ -2050,6 +2202,8 @@ impl App {
         self.settings_inner = None;
         self.settings_row_map.clear();
         self.ports_row_map.clear();
+        self.interface_row_map.clear();
+        self.fragment_row_map.clear();
         self.table_inner = None;
         self.table_header = None;
         self.table_col_bounds.clear();
@@ -2079,6 +2233,7 @@ impl App {
         self.render_speed_confirm(frame, frame.area(), elapsed);
         self.render_command_palette(frame, frame.area(), elapsed);
         self.render_column_picker(frame, frame.area(), elapsed);
+        self.render_cli_command(frame, frame.area(), elapsed);
     }
 
     fn render_scan_action_confirm(&mut self, frame: &mut Frame, area: Rect, elapsed: Duration) {
@@ -2099,6 +2254,9 @@ impl App {
             }
             Some(PendingScanAction::NewSample) => {
                 "Generate a new sample? Current results will be replaced."
+            }
+            Some(PendingScanAction::RetestDegraded) => {
+                "Retest degraded and failed targets? Current results will be replaced."
             }
             None => return,
         };
@@ -2161,6 +2319,48 @@ impl App {
         frame.render_widget(
             Paragraph::new("↑/↓ move • Space toggle • Esc close").style(theme::hint_style()),
             body[1],
+        );
+    }
+
+    fn render_cli_command(&mut self, frame: &mut Frame, area: Rect, elapsed: Duration) {
+        let overlay = modal_overlay(" CLI command ", 84, 62);
+        if self.show_cli_command {
+            self.cli_command_overlay.open();
+        } else {
+            self.cli_command_overlay.close();
+        }
+        self.cli_command_overlay.tick(elapsed);
+        frame.render_stateful_widget(overlay, area, &mut self.cli_command_overlay);
+        let Some(inner) = self.cli_command_overlay.inner_area() else {
+            return;
+        };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+        frame.render_widget(
+            Paragraph::new("Run this in a terminal to reproduce the current scan:")
+                .style(theme::title_style()),
+            chunks[0],
+        );
+        let para = Paragraph::new(self.cli_command.clone())
+            .style(ratatui::style::Style::default())
+            .wrap(Wrap { trim: false });
+        let max_scroll = para
+            .line_count(chunks[1].width)
+            .saturating_sub(chunks[1].height as usize);
+        self.cli_command_scroll = self.cli_command_scroll.min(max_scroll);
+        frame.render_widget(
+            para.scroll((self.cli_command_scroll.min(u16::MAX as usize) as u16, 0)),
+            chunks[1],
+        );
+        frame.render_widget(
+            Paragraph::new("c / Enter copy • ↑/↓ scroll • Esc close").style(theme::hint_style()),
+            chunks[2],
         );
     }
 
@@ -2390,6 +2590,12 @@ impl App {
             KeyCode::Char('e') => self.activate_action(Action::Export),
             KeyCode::Char('t') if self.scan_complete => self.activate_action(Action::SpeedTest),
             KeyCode::Char('g') if self.scan_complete => self.activate_action(Action::FragmentTest),
+            KeyCode::Char('G') if self.scan_complete => {
+                self.activate_action(Action::FragmentProfiles)
+            }
+            KeyCode::Char('d') if self.scan_complete => {
+                self.activate_action(Action::RetestDegraded)
+            }
             KeyCode::Char('c') => self.activate_action(Action::CopyIp),
             KeyCode::Up => self.move_scan_cursor(-1),
             KeyCode::Down => {
@@ -2642,6 +2848,41 @@ impl App {
         self.pending_source_run_id = Some(self.current_run_id);
         self.rescan_targets = Some(targets);
         self.pending_start = true;
+    }
+
+    /// IPs from the current results (unfiltered, matching the decision panel
+    /// counts) whose status is degraded or failed.
+    fn degraded_targets(&self) -> Vec<String> {
+        self.results
+            .iter()
+            .filter(|result| matches!(crate::scanner::result_status(result), "DEGRADED" | "FAILED"))
+            .map(|result| result.ip.clone())
+            .collect()
+    }
+
+    fn retest_degraded(&mut self) {
+        if self.investigation.is_some() || self.pending_isolation.is_some() {
+            self.toast_warn("Stop or finish the isolated investigation before retesting");
+            return;
+        }
+        if self.degraded_targets().is_empty() {
+            self.toast_info("No degraded or failed targets to retest");
+            return;
+        }
+        self.confirm_scan_action = Some(PendingScanAction::RetestDegraded);
+    }
+
+    fn retest_degraded_now(&mut self) {
+        let targets = self.degraded_targets();
+        if targets.is_empty() {
+            self.toast_warn("No degraded or failed targets to retest");
+            return;
+        }
+        self.pending_run_kind = RunKind::Targeted;
+        self.pending_source_run_id = Some(self.current_run_id);
+        self.rescan_targets = Some(targets);
+        self.pending_start = true;
+        self.toast_info("Retesting degraded and failed targets");
     }
 
     fn adjust_runtime_worker_override(&mut self, delta: i32) {
@@ -3009,6 +3250,41 @@ impl App {
         }
     }
 
+    /// Auto-run every TLS fragment profile against the cursor-selected result,
+    /// skipping the manual profile selection screen entirely.
+    fn open_fragment_test_auto(&mut self) {
+        if self.dashboard_view != ScanDashboardView::Results {
+            self.toast_warn("Move to the results view to auto-test fragments");
+            return;
+        }
+        let Some(result) = self.sorted_results().get(self.result_cursor).copied() else {
+            self.toast_warn("Select a result row to test fragments");
+            return;
+        };
+        let result = result.clone();
+        if self.config.host.is_empty() {
+            self.toast_warn("Set a Host before testing fragments");
+            return;
+        }
+        self.fragment_ip = result.ip.clone();
+        self.fragment_port = result.port;
+        self.fragment_enabled = vec![true; crate::proxy::TLS_FRAGMENT_PRESETS.len()];
+        self.fragment_ip_editing = false;
+        self.fragment_results.clear();
+        self.fragment_result_cursor = 0;
+        self.fragment_complete = false;
+        self.fragment_cancel.store(false, Ordering::Relaxed);
+        self.quit_after_cancel = false;
+        self.scroll = 0;
+        self.pending_fragment_start = true;
+        self.screen = Screen::FragmentTesting;
+        self.toast_info(format!(
+            "Auto-testing {} fragment profiles on {}",
+            crate::proxy::TLS_FRAGMENT_PRESETS.len(),
+            result.ip
+        ));
+    }
+
     /// Open the TLS fragment tester, prefilling the target IP from the best
     /// selected result (or the first successful one), carrying its port.
     fn open_fragment_selection(&mut self) {
@@ -3202,6 +3478,7 @@ impl App {
             || self.command_palette_overlay.inner_area().is_some()
             || self.column_picker_overlay.inner_area().is_some()
             || self.result_details_overlay.inner_area().is_some()
+            || self.cli_command_overlay.inner_area().is_some()
         {
             return;
         }
@@ -3289,6 +3566,22 @@ impl App {
                                 // individual ports instead of committing the
                                 // whole edit. Other rows keep the normal
                                 // commit-and-activate behavior.
+                                if self
+                                    .edit_field
+                                    .map(|i| SettingField::ALL[i] == SettingField::TlsFragment)
+                                    .unwrap_or(false)
+                                {
+                                    if let Some(Some(row_idx)) =
+                                        self.fragment_row_map.get(row).copied()
+                                    {
+                                        self.fragment_preset_cursor = row_idx;
+                                        self.fragment_preset_draft = row_idx;
+                                        if row_idx < crate::proxy::TLS_FRAGMENT_PRESETS.len() {
+                                            self.commit_fragment_selection();
+                                        }
+                                        return;
+                                    }
+                                }
                                 if self
                                     .edit_field
                                     .map(|i| SettingField::ALL[i] == SettingField::Interface)
@@ -3490,7 +3783,7 @@ impl App {
                 self.send_scan_control(ScanControl::StopAndKeepResults)
             }
             ButtonAction::SpeedTest => self.open_speed_selection(),
-            ButtonAction::FragmentTest => self.open_fragment_selection(),
+            ButtonAction::FragmentTest => self.open_fragment_test_auto(),
             ButtonAction::FragmentStart => {
                 if self.fragment_ip.is_empty() {
                     self.toast_warn("Enter a target IP first (Enter on the IP row)");
@@ -3526,6 +3819,7 @@ impl App {
                     Err(error) => self.toast_error(format!("Clipboard failed: {error}")),
                 }
             }
+            ButtonAction::CopyCliCommand => self.copy_cli_command(),
             ButtonAction::CustomizeScan => {
                 if self.screen == Screen::Scanning && self.scan_complete {
                     self.enter_customization();

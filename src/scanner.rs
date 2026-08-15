@@ -2508,6 +2508,25 @@ fn merge_port_results(results: &[ProbeResult]) -> Option<ProbeResult> {
                 })
         })
         .or_else(|| {
+            // No port is fully healthy: prefer ports with any successful
+            // probe, so a dead port (zero samples, score 0) can never stand
+            // in for a working one in the aggregate's top-level fields.
+            results
+                .iter()
+                .filter(|result| result.ok > 0)
+                .max_by(|left, right| {
+                    left.score
+                        .partial_cmp(&right.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            right
+                                .success_rate
+                                .partial_cmp(&left.success_rate)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                })
+        })
+        .or_else(|| {
             results.iter().max_by(|left, right| {
                 left.score
                     .partial_cmp(&right.score)
@@ -2521,9 +2540,84 @@ fn merge_port_results(results: &[ProbeResult]) -> Option<ProbeResult> {
             })
         })?;
     let mut merged = best.clone();
-    merged.port_results = results.iter().map(port_result).collect();
+    merged.port_results = dedupe_port_results(results.iter().map(port_result).collect());
     merged.health_ok = results.iter().any(|result| result.health_ok);
     Some(merged)
+}
+
+/// Which of two per-port entries is stronger for display/merge purposes:
+/// successful probes first, then higher score, then lower p95.
+fn port_entry_better(left: &PortResult, right: &PortResult) -> bool {
+    match (left.ok > 0, right.ok > 0) {
+        (true, false) => return true,
+        (false, true) => return false,
+        _ => {}
+    }
+    match left.score.partial_cmp(&right.score) {
+        Some(std::cmp::Ordering::Greater) => return true,
+        Some(std::cmp::Ordering::Less) => return false,
+        _ => {}
+    }
+    left.p95 < right.p95
+}
+
+/// Collapse per-port entries to one per port, keeping the strongest entry.
+/// Defensive: a port should never appear twice in a merged result, but
+/// duplicate ports in the raw per-target results must not surface as
+/// repeated entries in `port_results`.
+fn dedupe_port_results(entries: Vec<PortResult>) -> Vec<PortResult> {
+    let mut by_port: BTreeMap<u16, PortResult> = BTreeMap::new();
+    for entry in entries {
+        match by_port.get_mut(&entry.port) {
+            Some(current) => {
+                if port_entry_better(&entry, current) {
+                    *current = entry;
+                }
+            }
+            None => {
+                by_port.insert(entry.port, entry);
+            }
+        }
+    }
+    by_port.into_values().collect()
+}
+
+/// Per-port results with at least one successful probe, ordered the same way
+/// the merged aggregate picks its best port (highest score, then lowest p95).
+/// Duplicate ports are collapsed to their strongest entry. Empty when the
+/// result carries no per-port breakdown (e.g. single-port scans or comparison
+/// snapshots loaded from JSON).
+pub fn working_port_results(result: &ProbeResult) -> Vec<&PortResult> {
+    let mut by_port: BTreeMap<u16, &PortResult> = BTreeMap::new();
+    for entry in result
+        .port_results
+        .iter()
+        .filter(|port_result| port_result.ok > 0)
+    {
+        match by_port.get_mut(&entry.port) {
+            Some(current) => {
+                if port_entry_better(entry, current) {
+                    *current = entry;
+                }
+            }
+            None => {
+                by_port.insert(entry.port, entry);
+            }
+        }
+    }
+    let mut working: Vec<&PortResult> = by_port.into_values().collect();
+    working.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                left.p95
+                    .partial_cmp(&right.p95)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    working
 }
 
 /// Run every configured health check and merge the per-path results into one
@@ -2760,7 +2854,20 @@ fn merge_profile_results(
         });
     let aggregate_healthy = entries.iter().any(|(_, result)| result.ok > 0);
 
-    merged.protocol = summary.protocol.clone();
+    merged.protocol = if summary.protocol == "—" || summary.protocol.is_empty() {
+        // The p95-worst required check may have zero successes while another
+        // check works; prefer any recorded protocol so the merged row never
+        // shows "—" for a target that answered on this port.
+        entries
+            .iter()
+            .find(|(_, result)| {
+                result.ok > 0 && result.protocol != "—" && !result.protocol.is_empty()
+            })
+            .map(|(_, result)| result.protocol.clone())
+            .unwrap_or_else(|| summary.protocol.clone())
+    } else {
+        summary.protocol.clone()
+    };
     merged.ok = ok;
     merged.fail = fail;
     merged.completed = completed;
@@ -3171,13 +3278,13 @@ pub async fn run_discovery_scan_with_progress(
 mod tests {
     use super::{
         adaptive_progress_reason, bootstrap_score_interval, cidr_valid,
-        collect_from_cidrs_with_seed, https_authority, merge_port_results, merge_profile_results,
-        parse_colo, reconcile_worker_permits, record_best, remaining_measured_work,
-        resolve_host_for_ip, result_confidence, result_status, scheduler_can_launch,
-        score_from_samples, select_focus_cidrs, select_next_scan_index, select_next_target,
-        select_next_warmup, should_stop_early, validate_response, wilson_interval,
-        DiagnosticCategory, DiagnosticPhase, ProbeDiagnostic, ProbeFailureCounts, ProbeResult,
-        ReadyQueue, TargetState,
+        collect_from_cidrs_with_seed, dedupe_port_results, https_authority, merge_port_results,
+        merge_profile_results, parse_colo, port_result, reconcile_worker_permits, record_best,
+        remaining_measured_work, resolve_host_for_ip, result_confidence, result_status,
+        scheduler_can_launch, score_from_samples, select_focus_cidrs, select_next_scan_index,
+        select_next_target, select_next_warmup, should_stop_early, validate_response,
+        wilson_interval, working_port_results, DiagnosticCategory, DiagnosticPhase,
+        ProbeDiagnostic, ProbeFailureCounts, ProbeResult, ReadyQueue, TargetState,
     };
     use crate::adaptive::{Action, ApplyResult, Decision, SignalDirection};
     use crate::config::{AppConfig, HealthCheck};
@@ -4223,6 +4330,110 @@ mod tests {
         assert!(merged.health_ok);
         assert_eq!(merged.port_results.len(), 2);
         assert_eq!(merged.port_results[0].port, 443);
+    }
+
+    #[test]
+    fn working_ports_skips_failed_and_orders_by_score() {
+        let mut result = focus_result("192.0.2.1", None, 2.0, 1);
+        result.port = 2053;
+        let mut best = focus_result("192.0.2.1", None, 9.0, 1);
+        best.port = 443;
+        let mut failed = focus_result("192.0.2.1", None, 5.0, 0);
+        failed.port = 8443;
+        result.port_results = vec![
+            port_result(&result),
+            port_result(&best),
+            port_result(&failed),
+        ];
+        let ports: Vec<u16> = working_port_results(&result)
+            .iter()
+            .map(|port_result| port_result.port)
+            .collect();
+        assert_eq!(ports, vec![443, 2053]);
+        assert!(working_port_results(&best).is_empty());
+    }
+
+    #[test]
+    fn working_ports_collapses_duplicate_ports_to_strongest_entry() {
+        let mut result = focus_result("192.0.2.1", None, 2.0, 1);
+        result.port = 8443;
+        let mut weak = port_result(&result);
+        weak.score = 3.0;
+        let mut strong = port_result(&result);
+        strong.score = 8.0;
+        result.port_results = vec![weak.clone(), strong.clone(), weak.clone()];
+        let working = working_port_results(&result);
+        assert_eq!(working.len(), 1);
+        assert_eq!(working[0].score, 8.0);
+    }
+
+    #[test]
+    fn merge_deduplicates_port_results_keeping_best_entry() {
+        let mut best = focus_result("192.0.2.1", None, 9.0, 1);
+        best.port = 8443;
+        let mut weak = focus_result("192.0.2.1", None, 3.0, 1);
+        weak.port = 8443;
+        let mut other = focus_result("192.0.2.1", None, 7.0, 1);
+        other.port = 443;
+        let merged = merge_port_results(&[best, weak, other]).unwrap();
+        let ports: Vec<u16> = merged
+            .port_results
+            .iter()
+            .map(|port_result| port_result.port)
+            .collect();
+        assert_eq!(ports, vec![443, 8443]);
+        let deduped = dedupe_port_results(vec![port_result(&merged), port_result(&merged)]);
+        assert_eq!(deduped.len(), 1);
+        let working = working_port_results(&merged);
+        assert_eq!(working.len(), 2);
+        assert_eq!(working[0].port, 8443);
+    }
+
+    #[test]
+    fn merge_prefers_working_port_when_no_port_is_healthy() {
+        let mut dead = focus_result("192.0.2.1", None, 100.0, 0);
+        dead.port = 443;
+        dead.health_ok = false;
+        let mut working = focus_result("192.0.2.1", None, 2.0, 3);
+        working.port = 8443;
+        working.health_ok = false;
+        let merged = merge_port_results(&[dead, working]).unwrap();
+        assert_eq!(merged.port, 8443);
+        assert_eq!(merged.ok, 3);
+    }
+
+    #[test]
+    fn profile_merge_keeps_protocol_from_working_check() {
+        let mut passing = focus_result("192.0.2.1", Some("FRA"), 8.0, 2);
+        passing.protocol = "h2".to_string();
+        let mut failing = focus_result("192.0.2.1", Some("AMS"), 2.0, 0);
+        failing.protocol = "—".to_string();
+        failing.p95 = 1.0;
+        failing.fail = 2;
+        failing.completed = 2;
+        failing.success_rate = 0.0;
+        failing.samples.clear();
+        let checks = vec![
+            HealthCheck {
+                name: "primary".to_string(),
+                path: "/".to_string(),
+                required: true,
+                weight: 1.0,
+            },
+            HealthCheck {
+                name: "fallback".to_string(),
+                path: "/health".to_string(),
+                required: true,
+                weight: 1.0,
+            },
+        ];
+        let merged = merge_profile_results(
+            &[(checks[0].clone(), passing), (checks[1].clone(), failing)],
+            &checks,
+        )
+        .unwrap();
+        assert_eq!(merged.protocol, "h2");
+        assert_eq!(merged.ok, 2);
     }
 
     #[test]

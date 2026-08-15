@@ -106,6 +106,73 @@ fn is_off_link_capable(ip: &IpAddr) -> bool {
     }
 }
 
+/// Interface prefixes that mark a link as a VPN (or generic tunnel) device.
+/// Lowercase; the common names across macOS (`utun`, `ipsec`), Linux
+/// (`tun`, `tap`, `ppp`, `wg`), and Windows WireGuard/OpenVPN adapters.
+const VPN_INTERFACE_PREFIXES: &[&str] = &["utun", "tun", "tap", "ppp", "wg", "ipsec"];
+
+/// Heuristic: does this interface look like a VPN tunnel? Case-insensitive
+/// prefix match against the well-known tunnel names. This is a hint, not
+/// proof: macOS also creates `utun` devices for System Extensions and
+/// iCloud Private Relay, and some VPNs use plain ethernet-style names.
+pub fn is_vpn_interface(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    VPN_INTERFACE_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
+/// Interface prefixes for virtual network devices that are not real
+/// uplinks: bridges, container veth pairs, VM adapters, and Apple's
+/// AWDL (Wi-Fi Direct) link.
+const VIRTUAL_INTERFACE_PREFIXES: &[&str] = &[
+    "bridge", "br", "veth", "docker", "vmnet", "vboxnet", "virbr", "awdl", "llw",
+];
+
+/// Heuristic: is this a virtual (bridge/VM/container) device rather than a
+/// physical uplink? Used to prefer real interfaces for VPN bypass.
+fn is_virtual_interface(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    VIRTUAL_INTERFACE_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+}
+
+/// The best candidate for routing *around* a VPN: the first non-VPN
+/// physical uplink that carries at least one off-link-capable address.
+/// Loopback, VPN, and virtual (bridge/VM/container) interfaces are skipped
+/// first; if no physical uplink qualifies, the first usable virtual
+/// interface is used as a fallback so the row still works on unusual
+/// setups. Returns `None` when every interface is a tunnel or otherwise
+/// unusable.
+pub fn bypass_vpn_interface() -> Option<String> {
+    let interfaces = list_interfaces().ok()?;
+    let mut virtual_fallback = None;
+    for entry in interfaces {
+        if is_vpn_interface(&entry.name) || entry.addresses.iter().any(IpAddr::is_loopback) {
+            continue;
+        }
+        let (ipv4, ipv6) = preferred_addresses(&entry.addresses);
+        let usable = ipv4
+            .map(IpAddr::V4)
+            .is_some_and(|addr| is_off_link_capable(&addr))
+            || ipv6
+                .map(IpAddr::V6)
+                .is_some_and(|addr| is_off_link_capable(&addr));
+        if !usable {
+            continue;
+        }
+        if is_virtual_interface(&entry.name) {
+            if virtual_fallback.is_none() {
+                virtual_fallback = Some(entry.name);
+            }
+            continue;
+        }
+        return Some(entry.name);
+    }
+    virtual_fallback
+}
+
 /// Normalize a user-supplied interface value: empty, `auto`, or `default`
 /// mean "let the OS route" (`None`); anything else is a pinned interface
 /// name. Keeps the CLI (`--interface auto`) and the TUI editor in sync.
@@ -256,6 +323,81 @@ mod tests {
 
         let (ipv4, ipv6) = preferred_addresses(&[]);
         assert_eq!((ipv4, ipv6), (None, None));
+    }
+
+    #[test]
+    fn vpn_interface_prefixes_are_recognized_case_insensitively() {
+        for name in [
+            "utun3", "tun0", "tap1", "ppp0", "wg0", "ipsec0", "UTUN2", "Tun4",
+        ] {
+            assert!(is_vpn_interface(name), "{name} should look like a VPN");
+        }
+        for name in ["en0", "eth0", "wlan0", "lo0", "awdl0", "bridge100", ""] {
+            assert!(!is_vpn_interface(name), "{name} should not look like a VPN");
+        }
+    }
+
+    #[test]
+    fn bypass_vpn_interface_prefers_a_non_vpn_uplink() {
+        let interfaces = list_interfaces().unwrap();
+        assert!(
+            interfaces
+                .iter()
+                .any(|entry| entry.addresses.iter().any(|addr| !addr.is_loopback())),
+            "expected a non-loopback interface among {interfaces:?}"
+        );
+        let Some(name) = bypass_vpn_interface() else {
+            return; // loopback-only host: there is nothing to bypass with
+        };
+        let entry = interfaces
+            .iter()
+            .find(|entry| entry.name == name)
+            .expect("bypass candidate must be a live interface");
+        assert!(
+            !is_vpn_interface(&entry.name),
+            "bypass candidate must not be a VPN interface"
+        );
+        assert!(
+            entry.addresses.iter().any(|addr| !addr.is_loopback()),
+            "bypass candidate must have a non-loopback address"
+        );
+        let has_physical = interfaces.iter().any(|entry| {
+            !is_vpn_interface(&entry.name)
+                && !is_virtual_interface(&entry.name)
+                && entry.addresses.iter().any(|addr| !addr.is_loopback())
+        });
+        if has_physical {
+            assert!(
+                !is_virtual_interface(&entry.name),
+                "bypass candidate must prefer a physical uplink when one exists"
+            );
+        }
+    }
+
+    #[test]
+    fn virtual_interface_prefixes_are_recognized() {
+        for name in [
+            "bridge100",
+            "br0",
+            "vethabc12",
+            "docker0",
+            "vmnet8",
+            "vboxnet0",
+            "virbr0",
+            "awdl0",
+            "llw0",
+        ] {
+            assert!(
+                is_virtual_interface(name),
+                "{name} should look like a virtual device"
+            );
+        }
+        for name in ["en0", "en5", "eth0", "wlan0", "utun3", "wg0", "lo0", ""] {
+            assert!(
+                !is_virtual_interface(name),
+                "{name} should not look like a virtual device"
+            );
+        }
     }
 
     #[test]

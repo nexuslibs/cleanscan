@@ -274,116 +274,220 @@ impl<'de> Deserialize<'de> for FragmentSpec {
     }
 }
 
-/// Curated xray-style fragment profiles offered by the TUI tester. Each entry
-/// is `(label, spec)`; the first entry (`None`) is the unfragmented control.
-pub const TLS_FRAGMENT_PRESETS: &[(&str, Option<FragmentSpec>)] = &[
+/// One stage of a v2rayNG-style multi-stage stream fragment, JSON shape:
+/// `{"type":"fragment","settings":{"packets":"tlshello","lengths":["5","94","1"],
+/// "delays":["0"],"maxSplit":"0"}}`.
+///
+/// Port of xray-core `transport/internet/finalmask/fragment` semantics:
+/// - `packets` picks which writes this stage splits (`tlshello` = first TLS
+///   ClientHello record only, `""` = every write, `"1-1"` = write count range);
+/// - `lengths` / `delays` are per-segment patterns whose **last entry repeats**
+///   (xray's `lengthForSegment` clamping), each entry a range like `"5"` or
+///   `"8-16"`;
+/// - a `tlshello` stage re-wraps payload chunks as complete TLS records; when
+///   `delays` is a single zero entry the whole hello is merged into one write;
+/// - `max_split` caps the segment count (the capped segment takes the rest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FragmentStage {
+    pub packets: FragmentPackets,
+    pub lengths: &'static [Int32Range],
+    pub delays: &'static [Int32Range],
+    pub max_split: Option<Int32Range>,
+}
+
+/// A TLS-fragmentation profile: a single xray `freedom` fragment
+/// ([`FragmentSpec`]) or a multi-stage v2rayNG-style stream fragment config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FragmentProfile {
+    Xray(FragmentSpec),
+    V2rayNg { stages: &'static [FragmentStage] },
+}
+
+impl FragmentProfile {
+    /// Serialize to the exact JSON pasted into xray / v2rayNG: the freedom
+    /// fragment object for [`FragmentProfile::Xray`], the `{"tcp":[...]}`
+    /// stream-fragment config for [`FragmentProfile::V2rayNg`].
+    pub fn xray_json(&self) -> String {
+        match self {
+            FragmentProfile::Xray(spec) => spec.xray_json(),
+            FragmentProfile::V2rayNg { stages } => {
+                let items = stages
+                    .iter()
+                    .map(|stage| {
+                        format!(
+                            "{{\"type\":\"fragment\",\"settings\":{{\"packets\":{},\"lengths\":{},\"delays\":{},\"maxSplit\":{}}}}}",
+                            serde_json::to_string(&stage.packets).unwrap_or_default(),
+                            serde_json::to_string(
+                                &stage
+                                    .lengths
+                                    .iter()
+                                    .map(Int32Range::to_string)
+                                    .collect::<Vec<_>>()
+                            )
+                            .unwrap_or_default(),
+                            serde_json::to_string(
+                                &stage
+                                    .delays
+                                    .iter()
+                                    .map(Int32Range::to_string)
+                                    .collect::<Vec<_>>()
+                            )
+                            .unwrap_or_default(),
+                            serde_json::to_string(
+                                &stage
+                                    .max_split
+                                    .map(|r| r.to_string())
+                                    .unwrap_or_else(|| "0".to_string())
+                            )
+                            .unwrap_or_default(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{{\"tcp\":[{items}]}}")
+            }
+        }
+    }
+}
+
+/// The well-known two-stage Cloudflare fragment: split the ClientHello into
+/// 5/94/1-byte TLS records (delay 0 → one merged write), then re-split the
+/// first write into 109/1-byte chunks with 1 ms pauses (max 355 segments).
+pub const DOUBLE_FRAGMENT_STAGES: &[FragmentStage] = &[
+    FragmentStage {
+        packets: FragmentPackets::TlsHello,
+        lengths: &[
+            Int32Range::new(5, 5),
+            Int32Range::new(94, 94),
+            Int32Range::new(1, 1),
+        ],
+        delays: &[Int32Range::new(0, 0)],
+        max_split: Some(Int32Range::new(0, 0)),
+    },
+    FragmentStage {
+        packets: FragmentPackets::TcpRange { from: 1, to: 1 },
+        lengths: &[Int32Range::new(109, 109), Int32Range::new(1, 1)],
+        delays: &[Int32Range::new(1, 1)],
+        max_split: Some(Int32Range::new(355, 355)),
+    },
+];
+
+/// Curated fragment profiles offered by the TUI tester. Each entry is
+/// `(label, profile)`; the first entry (`None`) is the unfragmented control.
+pub const TLS_FRAGMENT_PRESETS: &[(&str, Option<FragmentProfile>)] = &[
     ("Off (control)", None),
     (
         "1-1",
-        Some(FragmentSpec {
+        Some(FragmentProfile::Xray(FragmentSpec {
             packets: FragmentPackets::TlsHello,
             length: Int32Range::new(1, 1),
             interval: Int32Range::new(0, 0),
             max_split: None,
-        }),
+        })),
     ),
     (
         "2-2",
-        Some(FragmentSpec {
+        Some(FragmentProfile::Xray(FragmentSpec {
             packets: FragmentPackets::TlsHello,
             length: Int32Range::new(2, 2),
             interval: Int32Range::new(0, 0),
             max_split: None,
-        }),
+        })),
     ),
     (
         "4-4",
-        Some(FragmentSpec {
+        Some(FragmentProfile::Xray(FragmentSpec {
             packets: FragmentPackets::TlsHello,
             length: Int32Range::new(4, 4),
             interval: Int32Range::new(0, 0),
             max_split: None,
-        }),
+        })),
     ),
     (
         "8-8",
-        Some(FragmentSpec {
+        Some(FragmentProfile::Xray(FragmentSpec {
             packets: FragmentPackets::TlsHello,
             length: Int32Range::new(8, 8),
             interval: Int32Range::new(0, 0),
             max_split: None,
-        }),
+        })),
     ),
     (
         "16-16",
-        Some(FragmentSpec {
+        Some(FragmentProfile::Xray(FragmentSpec {
             packets: FragmentPackets::TlsHello,
             length: Int32Range::new(16, 16),
             interval: Int32Range::new(0, 0),
             max_split: None,
-        }),
+        })),
     ),
     (
         "32-32",
-        Some(FragmentSpec {
+        Some(FragmentProfile::Xray(FragmentSpec {
             packets: FragmentPackets::TlsHello,
             length: Int32Range::new(32, 32),
             interval: Int32Range::new(0, 0),
             max_split: None,
-        }),
+        })),
     ),
     (
         "64-64",
-        Some(FragmentSpec {
+        Some(FragmentProfile::Xray(FragmentSpec {
             packets: FragmentPackets::TlsHello,
             length: Int32Range::new(64, 64),
             interval: Int32Range::new(0, 0),
             max_split: None,
-        }),
+        })),
     ),
     (
         "128-128",
-        Some(FragmentSpec {
+        Some(FragmentProfile::Xray(FragmentSpec {
             packets: FragmentPackets::TlsHello,
             length: Int32Range::new(128, 128),
             interval: Int32Range::new(0, 0),
             max_split: None,
-        }),
+        })),
     ),
     (
         "256-256",
-        Some(FragmentSpec {
+        Some(FragmentProfile::Xray(FragmentSpec {
             packets: FragmentPackets::TlsHello,
             length: Int32Range::new(256, 256),
             interval: Int32Range::new(0, 0),
             max_split: None,
-        }),
+        })),
     ),
     (
         "1-3 classic",
-        Some(FragmentSpec {
+        Some(FragmentProfile::Xray(FragmentSpec {
             packets: FragmentPackets::TlsHello,
             length: Int32Range::new(1, 3),
             interval: Int32Range::new(0, 0),
             max_split: None,
-        }),
+        })),
     ),
     (
         "10-20 / 10-20ms (xray default)",
-        Some(FragmentSpec {
+        Some(FragmentProfile::Xray(FragmentSpec {
             packets: FragmentPackets::TlsHello,
             length: Int32Range::new(10, 20),
             interval: Int32Range::new(10, 20),
             max_split: None,
-        }),
+        })),
     ),
     (
         "100-200 / 10-20ms",
-        Some(FragmentSpec {
+        Some(FragmentProfile::Xray(FragmentSpec {
             packets: FragmentPackets::TlsHello,
             length: Int32Range::new(100, 200),
             interval: Int32Range::new(10, 20),
             max_split: None,
+        })),
+    ),
+    (
+        "5/94/1 + 109/1 (double)",
+        Some(FragmentProfile::V2rayNg {
+            stages: DOUBLE_FRAGMENT_STAGES,
         }),
     ),
 ];
@@ -762,6 +866,319 @@ impl<S: AsyncRead + AsyncWrite + Unpin, R: Rng + Unpin> AsyncRead for FragmentWr
     }
 }
 
+/// Clamp a per-segment pattern lookup to the last entry, mirroring xray's
+/// `lengthForSegment` / `delayForSegment` (`(min, max)` in ms or bytes).
+fn clamped_range(list: &[Int32Range], index: u64) -> (u64, u64) {
+    let Some(range) = list.last() else {
+        return (1, 1);
+    };
+    let range = if index as usize >= list.len() {
+        range
+    } else {
+        &list[index as usize]
+    };
+    (range.from.max(0) as u64, range.to.max(0) as u64)
+}
+
+/// Whether a write at `count` (1-based, per-stage) matches a stage's
+/// `packets` gate, mirroring xray's `fragmentConn.Write` dispatch.
+fn stage_matches(stage: &FragmentStage, data: &[u8], count: u64) -> bool {
+    match stage.packets {
+        FragmentPackets::TlsHello => {
+            count == 1
+                && data.len() > 5
+                && data[0] == 22
+                && data.len() >= 5 + (((data[3] as usize) << 8) | data[4] as usize)
+        }
+        FragmentPackets::TcpAll => true,
+        FragmentPackets::TcpRange { from, to } => {
+            count >= u64::from(from) && count <= u64::from(to)
+        }
+    }
+}
+
+/// Split `data` into `(bytes, delay_ms)` segments per one stage, plus the
+/// trailing delay carried after the final segment (xray sleeps after every
+/// segment, including the last). The `tlshello` path re-wraps payload chunks
+/// as TLS records and merges them into a single write when `delays` is one
+/// zero entry, exactly like xray's `mergeTlsHelloSegments`.
+fn split_stage(
+    rng: &mut impl Rng,
+    stage: &FragmentStage,
+    data: &[u8],
+) -> (Vec<(Vec<u8>, u64)>, u64) {
+    let max_split = match stage.max_split {
+        Some(range) => rand_between(rng, range.from.max(0) as u64, range.to.max(0) as u64),
+        None => 0,
+    };
+    if stage.packets == FragmentPackets::TlsHello {
+        let record_len = 5 + (((data[3] as usize) << 8) | data[4] as usize);
+        let payload = &data[5..record_len];
+        let merge = stage.delays.len() == 1 && stage.delays[0].to.max(0) == 0;
+        let mut segments: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut merged: Vec<u8> = Vec::new();
+        let mut split_num: u64 = 0;
+        let mut from = 0usize;
+        let mut pending_delay = 0u64;
+        while from < payload.len() {
+            let (length_min, length_max) = clamped_range(stage.lengths, split_num);
+            let mut to = from.saturating_add(rand_between(rng, length_min, length_max) as usize);
+            if to > payload.len() || (max_split > 0 && split_num + 1 >= max_split) {
+                to = payload.len();
+            }
+            let len = to - from;
+            let mut fragment = Vec::with_capacity(5 + len);
+            fragment.extend_from_slice(&data[..3]);
+            fragment.push((len >> 8) as u8);
+            fragment.push(len as u8);
+            fragment.extend_from_slice(&payload[from..to]);
+            from = to;
+            if merge {
+                merged.extend_from_slice(&fragment);
+            } else {
+                segments.push((fragment, pending_delay));
+                let (delay_min, delay_max) = clamped_range(stage.delays, split_num);
+                pending_delay = rand_between(rng, delay_min, delay_max);
+            }
+            split_num += 1;
+        }
+        if payload.is_empty() {
+            if merge {
+                merged.extend_from_slice(&data[..5]);
+            } else {
+                segments.push((data[..5].to_vec(), pending_delay));
+            }
+        }
+        if merge {
+            let mut out = Vec::new();
+            if !merged.is_empty() {
+                out.push((merged, 0));
+            }
+            if data.len() > record_len {
+                out.push((data[record_len..].to_vec(), 0));
+            }
+            (out, 0)
+        } else {
+            (segments, pending_delay)
+        }
+    } else {
+        let mut segments: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut split_num: u64 = 0;
+        let mut from = 0usize;
+        let mut pending_delay = 0u64;
+        while from < data.len() {
+            let (length_min, length_max) = clamped_range(stage.lengths, split_num);
+            let mut to = from.saturating_add(rand_between(rng, length_min, length_max) as usize);
+            if to > data.len() || (max_split > 0 && split_num + 1 >= max_split) {
+                to = data.len();
+            }
+            segments.push((data[from..to].to_vec(), pending_delay));
+            from = to;
+            let (delay_min, delay_max) = clamped_range(stage.delays, split_num);
+            pending_delay = rand_between(rng, delay_min, delay_max);
+            split_num += 1;
+        }
+        (segments, pending_delay)
+    }
+}
+
+/// Multi-stage stream fragmentation, a port of xray-core
+/// `transport/internet/finalmask/fragment.fragmentConn`: stages run in order,
+/// each seeing the writes emitted by the previous stage with its own write
+/// counter, so a second stage with `packets: "1-1"` re-splits the first write
+/// of the stream below it (e.g. the merged TLS-hello burst).
+pub struct FinalMaskWriter<S, R> {
+    inner: S,
+    stages: &'static [FragmentStage],
+    rng: R,
+    counts: Vec<u64>,
+    carries: Vec<u64>,
+    queue: VecDeque<FragmentItem>,
+    pending: Option<FragmentItem>,
+    current: Option<(Vec<u8>, usize)>,
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    flushed: bool,
+    write_len: usize,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin, R: Rng + Unpin> FinalMaskWriter<S, R> {
+    pub fn new(inner: S, stages: &'static [FragmentStage], rng: R) -> Self {
+        Self {
+            inner,
+            stages,
+            rng,
+            counts: vec![0; stages.len()],
+            carries: vec![0; stages.len()],
+            queue: VecDeque::new(),
+            pending: None,
+            current: None,
+            sleep: None,
+            flushed: true,
+            write_len: 0,
+        }
+    }
+
+    /// Transform one logical write through every stage into the final
+    /// `(bytes, delay_ms)` queue items. Each stage sees the writes the
+    /// previous stage emitted (its own counter), and a stage's trailing delay
+    /// lands before the next item it processes, exactly like chained
+    /// `fragmentConn.Write` calls on the wire.
+    fn push_write(&mut self, buf: &[u8]) {
+        self.write_len = buf.len();
+        let mut items: Vec<(Vec<u8>, u64)> = vec![(buf.to_vec(), 0)];
+        for (stage_index, stage) in self.stages.iter().enumerate() {
+            let mut carry = self.carries[stage_index];
+            let mut out: Vec<(Vec<u8>, u64)> = Vec::new();
+            for (data, delay) in items {
+                self.counts[stage_index] += 1;
+                if stage_matches(stage, &data, self.counts[stage_index]) {
+                    let (segments, trailing) = split_stage(&mut self.rng, stage, &data);
+                    let mut first = true;
+                    for (bytes, segment_delay) in segments {
+                        if first {
+                            out.push((
+                                bytes,
+                                delay.saturating_add(carry).saturating_add(segment_delay),
+                            ));
+                            first = false;
+                        } else {
+                            out.push((bytes, segment_delay));
+                        }
+                    }
+                    carry = trailing;
+                } else {
+                    out.push((data, delay.saturating_add(carry)));
+                    carry = 0;
+                }
+            }
+            self.carries[stage_index] = carry;
+            items = out;
+        }
+        for (bytes, delay_ms) in items {
+            self.queue.push_back(FragmentItem { bytes, delay_ms });
+        }
+    }
+}
+
+/// Write queued multi-stage fragments (and the armed inter-fragment sleep) to
+/// the inner stream until nothing is left, the sleep is pending, or the inner
+/// stream blocks. The incoming `buf` is not touched: poll retries pass the
+/// same logical write, whose bytes are already in the queue.
+fn drain_stage_queue<S: AsyncRead + AsyncWrite + Unpin, R: Rng + Unpin>(
+    this: &mut FinalMaskWriter<S, R>,
+    cx: &mut Context<'_>,
+) -> DrainOutcome {
+    loop {
+        if let Some(sleep) = this.sleep.as_mut() {
+            if sleep.as_mut().poll(cx).is_pending() {
+                return DrainOutcome::Pending;
+            }
+            this.sleep = None;
+        }
+        if let Some(item) = this.pending.take() {
+            this.current = Some((item.bytes, 0));
+            continue;
+        }
+        if let Some((bytes, written)) = this.current.as_mut() {
+            while *written < bytes.len() {
+                let slice = &bytes[*written..];
+                match Pin::new(&mut this.inner).poll_write(cx, slice) {
+                    Poll::Ready(Ok(0)) => {
+                        return DrainOutcome::Error(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "finalmask writer: zero-length write",
+                        ))
+                    }
+                    Poll::Ready(Ok(n)) => *written += n,
+                    Poll::Pending => return DrainOutcome::Pending,
+                    Poll::Ready(Err(error)) => return DrainOutcome::Error(error),
+                }
+            }
+            this.current = None;
+            continue;
+        }
+        if let Some(item) = this.queue.pop_front() {
+            if item.delay_ms > 0 {
+                this.sleep = Some(Box::pin(tokio::time::sleep(Duration::from_millis(
+                    item.delay_ms,
+                ))));
+                this.pending = Some(item);
+            } else {
+                this.current = Some((item.bytes, 0));
+            }
+            continue;
+        }
+        return DrainOutcome::Drained;
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin, R: Rng + Unpin> AsyncWrite for FinalMaskWriter<S, R> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = &mut *self;
+        match drain_stage_queue(this, cx) {
+            DrainOutcome::Pending => return Poll::Pending,
+            DrainOutcome::Error(error) => return Poll::Ready(Err(error)),
+            DrainOutcome::Drained => {}
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if !this.flushed && buf.len() != this.write_len {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "finalmask writer: poll retry passed a buffer of a different \
+                 length than the write being drained",
+            )));
+        }
+        if this.flushed {
+            this.flushed = false;
+            this.push_write(buf);
+            match drain_stage_queue(this, cx) {
+                DrainOutcome::Pending => return Poll::Pending,
+                DrainOutcome::Error(error) => return Poll::Ready(Err(error)),
+                DrainOutcome::Drained => {}
+            }
+        }
+        this.flushed = true;
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let buf = bufs
+            .iter()
+            .flat_map(|slice| slice.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        self.poll_write(cx, &buf)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin, R: Rng + Unpin> AsyncRead for FinalMaskWriter<S, R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
 pub fn parse_share_url(raw: &str) -> Result<ProxyTransport> {
     let url = Url::parse(raw.trim()).map_err(|e| anyhow!("invalid proxy URL: {e}"))?;
     let protocol = match url.scheme() {
@@ -871,6 +1288,25 @@ pub async fn check_candidate_fragmented(
     interface: Option<crate::iface::InterfaceAddrs>,
     fragment: Option<&FragmentSpec>,
 ) -> SurvivabilityResult {
+    check_candidate_fragmented_profile(
+        transport,
+        ip,
+        timeout_ms,
+        interface,
+        fragment.cloned().map(FragmentProfile::Xray).as_ref(),
+    )
+    .await
+}
+
+/// Probe one candidate IP with an optional fragment profile: a single xray
+/// freedom fragment or a multi-stage v2rayNG-style stream config.
+pub async fn check_candidate_fragmented_profile(
+    transport: &ProxyTransport,
+    ip: &str,
+    timeout_ms: u64,
+    interface: Option<crate::iface::InterfaceAddrs>,
+    fragment: Option<&FragmentProfile>,
+) -> SurvivabilityResult {
     let started = Instant::now();
     let timeout_duration = Duration::from_millis(timeout_ms.max(500));
     let addr = match ip.parse::<IpAddr>() {
@@ -922,7 +1358,7 @@ pub async fn check_candidate_fragmented(
         websocket_reached: None,
         websocket_accepted: None,
         fragment: if transport.tls {
-            fragment.map(FragmentSpec::xray_json)
+            fragment.map(FragmentProfile::xray_json)
         } else {
             None
         },
@@ -936,11 +1372,14 @@ pub async fn check_candidate_fragmented(
             let name = ServerName::try_from(transport.sni.to_string())
                 .map_err(|_| anyhow!("invalid TLS SNI"))?;
             let stream: BoxedStream = match fragment {
-                Some(spec) => Box::new(FragmentWriter::new(
+                Some(FragmentProfile::Xray(spec)) => Box::new(FragmentWriter::new(
                     stream,
                     spec.clone(),
                     StdRng::from_entropy(),
                 )),
+                Some(FragmentProfile::V2rayNg { stages }) => {
+                    Box::new(FinalMaskWriter::new(stream, stages, StdRng::from_entropy()))
+                }
                 None => Box::new(stream),
             };
             Ok::<_, anyhow::Error>(tls_config()?.connect(name, stream).await?)
@@ -1064,7 +1503,7 @@ async fn websocket_probe<S: AsyncRead + AsyncWrite + Unpin>(
 fn failed(
     ip: &str,
     transport: &ProxyTransport,
-    fragment: Option<&FragmentSpec>,
+    fragment: Option<&FragmentProfile>,
     started: Instant,
     error: String,
 ) -> SurvivabilityResult {
@@ -1078,7 +1517,7 @@ fn failed(
         websocket_reached: None,
         websocket_accepted: None,
         fragment: if transport.tls {
-            fragment.map(FragmentSpec::xray_json)
+            fragment.map(FragmentProfile::xray_json)
         } else {
             None
         },
@@ -1092,7 +1531,8 @@ fn failed(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_share_url, rand_between, FragmentPackets, FragmentSpec, FragmentWriter, Int32Range,
+        parse_share_url, rand_between, split_stage, FinalMaskWriter, FragmentPackets,
+        FragmentProfile, FragmentSpec, FragmentWriter, Int32Range, DOUBLE_FRAGMENT_STAGES,
         TLS_FRAGMENT_PRESETS,
     };
     use rand::{rngs::StdRng, SeedableRng};
@@ -1229,15 +1669,119 @@ mod tests {
     }
 
     #[test]
-    fn presets_are_valid_xray_specs() {
+    fn presets_are_valid_fragment_profiles() {
         assert_eq!(TLS_FRAGMENT_PRESETS[0].0, "Off (control)");
         assert!(TLS_FRAGMENT_PRESETS[0].1.is_none());
-        for (label, spec) in &TLS_FRAGMENT_PRESETS[1..] {
-            let spec = spec.as_ref().unwrap();
-            spec.validate().unwrap_or_else(|e| panic!("{label}: {e}"));
-            assert_eq!(spec.packets, FragmentPackets::TlsHello);
-            assert!(spec.length.from > 0);
+        for (label, profile) in &TLS_FRAGMENT_PRESETS[1..] {
+            match profile.as_ref().unwrap() {
+                FragmentProfile::Xray(spec) => {
+                    spec.validate().unwrap_or_else(|e| panic!("{label}: {e}"));
+                    assert_eq!(spec.packets, FragmentPackets::TlsHello);
+                    assert!(spec.length.from > 0);
+                }
+                FragmentProfile::V2rayNg { stages } => {
+                    assert!(!stages.is_empty(), "{label} must have at least one stage");
+                    for stage in *stages {
+                        assert!(!stage.lengths.is_empty());
+                        assert!(!stage.delays.is_empty());
+                        assert!(stage.lengths.last().unwrap().from > 0);
+                    }
+                }
+            }
         }
+    }
+
+    #[test]
+    fn double_fragment_profile_serializes_to_v2rayng_json() {
+        let json = FragmentProfile::V2rayNg {
+            stages: DOUBLE_FRAGMENT_STAGES,
+        }
+        .xray_json();
+        let actual: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":["5","94","1"],"delays":["0"],"maxSplit":"0"}},{"type":"fragment","settings":{"packets":"1-1","lengths":["109","1"],"delays":["1"],"maxSplit":"355"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn double_fragment_stage_splitting_matches_xray_semantics() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let payload: Vec<u8> = (0..178u8).collect();
+        let record = tls_record(&payload);
+
+        // Stage 1 (tlshello 5/94/1, delays ["0"]): payload chunks 5, 94, then
+        // 1-byte tails (last entry repeats), re-wrapped as TLS records and
+        // merged into one write (xray `mergeTlsHelloSegments`).
+        let (items, trailing) = split_stage(&mut rng, &DOUBLE_FRAGMENT_STAGES[0], &record);
+        assert_eq!(trailing, 0);
+        assert_eq!(items.len(), 1, "hello must merge into a single write");
+        assert_eq!(items[0].1, 0);
+        let merged = &items[0].0;
+        assert_eq!(merged.len(), 5 * 81 + 178, "81 TLS records");
+        assert_eq!(merged[4] as usize, 5, "first record payload is 5 bytes");
+        assert_eq!(merged[14] as usize, 94, "second record payload is 94 bytes");
+        assert_eq!(merged[113] as usize, 1, "third record payload is 1 byte");
+
+        // Stage 2 (packets 1-1, lengths 109/1, delay 1 ms, maxSplit 355):
+        // the merged write is split 109 + 1×353 + remainder, one segment per
+        // 1 ms pause.
+        let (chunks, trailing) = split_stage(&mut rng, &DOUBLE_FRAGMENT_STAGES[1], merged);
+        assert_eq!(trailing, 1, "delay pattern repeats after the final segment");
+        assert_eq!(chunks.len(), 355, "maxSplit caps the segment count");
+        assert_eq!(chunks[0].0.len(), 109);
+        assert_eq!(chunks[0].1, 0);
+        assert_eq!(chunks[1].0.len(), 1);
+        assert_eq!(chunks[1].1, 1);
+        assert_eq!(
+            chunks[354].0.len(),
+            583 - 109 - 353,
+            "capped segment takes the rest"
+        );
+        let reassembled: Vec<u8> = chunks
+            .iter()
+            .flat_map(|(bytes, _)| bytes.iter().copied())
+            .collect();
+        assert_eq!(reassembled, *merged);
+    }
+
+    #[test]
+    fn tlshello_zero_length_record_survives_fragmentation() {
+        let mut rng = StdRng::seed_from_u64(7);
+        // A zero-length TLS record (header only) must still be emitted as a
+        // valid five-byte record instead of producing an empty segment list.
+        let empty = tls_record(&[]);
+        let (items, trailing) = split_stage(&mut rng, &DOUBLE_FRAGMENT_STAGES[0], &empty);
+        assert_eq!(trailing, 0);
+        assert_eq!(items.len(), 1, "empty record must still produce one write");
+        assert_eq!(
+            items[0].0, empty,
+            "five-byte header must pass through untouched"
+        );
+
+        // Trailing data after the empty record is preserved in merge mode.
+        let mut data = empty.clone();
+        data.extend_from_slice(&tls_record(b"tail"));
+        let (items, trailing) = split_stage(&mut rng, &DOUBLE_FRAGMENT_STAGES[0], &data);
+        assert_eq!(trailing, 0);
+        let out: Vec<u8> = items.iter().flat_map(|(b, _)| b.iter().copied()).collect();
+        assert_eq!(out, data, "empty record header and tail must both survive");
+    }
+
+    #[tokio::test]
+    async fn finalmask_writer_merges_hello_then_splits_first_write() {
+        let payload: Vec<u8> = (0..11u8).collect();
+        let (client, mut server) = tokio::io::duplex(4096);
+        let mut writer =
+            FinalMaskWriter::new(client, DOUBLE_FRAGMENT_STAGES, StdRng::seed_from_u64(42));
+        writer.write_all(&tls_record(&payload)).await.unwrap();
+        drop(writer);
+        let mut received = Vec::new();
+        server.read_to_end(&mut received).await.unwrap();
+        let mut expected = tls_record(&payload[..5]);
+        expected.extend_from_slice(&tls_record(&payload[5..]));
+        assert_eq!(received, expected);
     }
 
     /// Write a fake TLS handshake record through a `FragmentWriter` and

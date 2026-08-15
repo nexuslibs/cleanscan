@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use crate::config::{
     validate_ports, AppConfig, DiscoveryDriver, HealthCheck, CLOUDFLARE_HTTPS_PORTS,
 };
+use crate::proxy::{FragmentProfile, TLS_FRAGMENT_PRESETS};
 use crate::tui::theme;
 use crate::tui::{widgets, App, ButtonAction, ButtonKind, WizardStep};
 use tui_slider::{Slider, SliderState};
@@ -195,8 +196,8 @@ impl SettingField {
             SettingField::FollowRedirects => "Follow redirects during validation. Off preserves the default strict behavior.",
             SettingField::HealthChecks => "Optional checks encoded as name|path|required|weight;... . Leave empty to use the primary path.",
             SettingField::Warmup => "Send a discarded connection-establishment request before measured latency probes.",
-            SettingField::Interface => "Network interface used for probes, discovery sweeps, and speed tests. Auto (default) lets the OS route every connection; picking an interface (e.g. en0, wlan0, tun0) binds outbound connections to that interface's address so all test traffic leaves through the chosen link (on Linux the interface must have its own route to the targets, as VPN tunnels do). Useful on hosts with multiple uplinks or VPNs. The CLI equivalent is --interface <name>; `--list-interfaces` prints the available ones.",
-            SettingField::TlsFragment => "Xray-style TLS ClientHello fragmentation (xray `freedom` fragment settings) applied to protocol checks (`--proxy-url`) and the TLS fragment tester. Paste a full xray fragment object, e.g. {\"packets\":\"tlshello\",\"length\":\"100-200\",\"interval\":\"10-20\"}; empty disables fragmentation. tlshello splits only the ClientHello into random-length fragments re-wrapped as TLS records; with interval 0 they are combined into a single packet. Find the value that defeats your ISP's DPI with the tester (g on the results screen), then paste it here and in your xray config.",
+            SettingField::Interface => "Network interface used for probes, discovery sweeps, and speed tests. Auto (default) lets the OS route every connection; picking an interface (e.g. en0, wlan0, tun0) binds outbound connections to that interface's address so all test traffic leaves through the chosen link (on Linux the interface must have its own route to the targets, as VPN tunnels do). Useful on hosts with multiple uplinks or VPNs. The picker tags tunnel-shaped interfaces (utun, tun, tap, ppp, wg, ipsec) with (VPN) and offers a 'Bypass VPN (auto)' row that pins the first non-VPN uplink, so probes stay off the tunnel when one is running. The CLI equivalent is --interface <name>; `--list-interfaces` prints the available ones, marking VPN links.",
+            SettingField::TlsFragment => "Xray-style TLS ClientHello fragmentation (xray `freedom` fragment settings) applied to protocol checks (`--proxy-url`) and the TLS fragment tester. Press Enter to open a checklist of curated profiles (Off, 1-1, 2-2, ... up to the xray default 10-20 / 10-20ms): Space toggles a profile on, Enter confirms it. The last entry, Custom (paste JSON), accepts any full xray fragment object, e.g. {\"packets\":\"tlshello\",\"length\":\"100-200\",\"interval\":\"10-20\"}. tlshello splits only the ClientHello into random-length fragments re-wrapped as TLS records; with interval 0 they are combined into a single packet. Find the value that defeats your ISP's DPI with the tester (g on the results screen), then apply the same setting in your xray config.",
             SettingField::DownloadPath => "Static file endpoint used for download speed tests.",
             SettingField::UploadPath => "POST endpoint used for upload speed tests; it should consume and discard the request body.",
             SettingField::SpeedPayloadMb => "Payload size used for each upload/download repetition. Larger payloads reduce short-test noise but use more bandwidth.",
@@ -1161,20 +1162,38 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
         let primary = format!("{checkbox}{}", e.cidr);
         let row_width = inner.width.saturating_sub(2) as usize;
         let metadata_width = count.chars().count();
-        let primary_width = primary.chars().count();
+        let tag = if e.custom {
+            Some(Span::styled(
+                " custom",
+                theme::row_metadata_style(selected_row),
+            ))
+        } else {
+            None
+        };
+        let tag_width = tag
+            .as_ref()
+            .map(|span| span.content.chars().count())
+            .unwrap_or(0);
+        let primary_width = primary.chars().count() + tag_width;
         let right_aligned = row_width >= primary_width + metadata_width + 3;
         let inline = !right_aligned && row_width >= primary_width + metadata_width + 2;
         let row = if right_aligned {
-            Line::from(vec![
-                Span::styled(primary, label_style),
-                Span::raw(" ".repeat(row_width - primary_width - metadata_width)),
-                Span::styled(count, theme::row_metadata_style(selected_row)),
-            ])
+            let mut spans = vec![Span::styled(primary, label_style)];
+            if let Some(tag) = tag {
+                spans.push(tag);
+            }
+            spans.push(Span::raw(
+                " ".repeat(row_width - primary_width - metadata_width),
+            ));
+            spans.push(Span::styled(count, theme::row_metadata_style(selected_row)));
+            Line::from(spans)
         } else if inline {
-            Line::from(vec![
-                Span::styled(format!("{primary}  "), label_style),
-                Span::styled(count, theme::row_metadata_style(selected_row)),
-            ])
+            let mut spans = vec![Span::styled(format!("{primary}  "), label_style)];
+            if let Some(tag) = tag {
+                spans.push(tag);
+            }
+            spans.push(Span::styled(count, theme::row_metadata_style(selected_row)));
+            Line::from(spans)
         } else {
             // Keep the checkbox and complete CIDR visible even at the
             // smallest useful width; metadata yields rather than truncating
@@ -1272,6 +1291,14 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
             Span::raw("Add a custom CIDR range"),
         ]),
         Line::from(vec![
+            Span::styled("  e  ", theme::highlight_style()),
+            Span::raw("Edit the focused custom range"),
+        ]),
+        Line::from(vec![
+            Span::styled("  x  ", theme::highlight_style()),
+            Span::raw("Remove the focused custom range"),
+        ]),
+        Line::from(vec![
             Span::styled("  s  ", theme::highlight_style()),
             Span::raw("Toggle full-range sweep"),
         ]),
@@ -1290,7 +1317,11 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
     } else {
         "  press 'a' to add a custom CIDR range  ".to_string()
     };
-    let title = " Add CIDR ";
+    let title = if app.custom_input_mode && app.cidr_edit_index.is_some() {
+        " Edit CIDR "
+    } else {
+        " Add CIDR "
+    };
     let input =
         Paragraph::new(input_line).block(widgets::panel_block(title, app.custom_input_mode));
     frame.render_widget(input, chunks[1]);
@@ -1384,6 +1415,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     let mut row_map: Vec<Option<usize>> = Vec::new();
     let mut ports_row_map: Vec<Option<usize>> = Vec::new();
     let mut interface_row_map: Vec<Option<usize>> = Vec::new();
+    let mut fragment_row_map: Vec<Option<usize>> = Vec::new();
     let ports_field_index = SettingField::ALL
         .iter()
         .position(|field| *field == SettingField::Ports)
@@ -1392,6 +1424,10 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         .iter()
         .position(|field| *field == SettingField::Interface)
         .expect("interface setting field must exist");
+    let fragment_field_index = SettingField::ALL
+        .iter()
+        .position(|field| *field == SettingField::TlsFragment)
+        .expect("tls fragment setting field must exist");
     let editing_ports = matches!(
         app.edit_field,
         Some(i) if i == ports_field_index
@@ -1400,19 +1436,52 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         app.edit_field,
         Some(i) if i == interface_field_index
     );
-    let interface_rows: Vec<(String, bool)> =
-        std::iter::once(("Auto (default)".to_string(), app.config.interface.is_none()))
-            .chain(app.interface_list.iter().map(|entry| {
-                let addresses = entry
+    let editing_fragment = matches!(
+        app.edit_field,
+        Some(i) if i == fragment_field_index
+    );
+    let bypass_vpn = app.bypass_vpn.clone();
+    let interface_rows: Vec<(String, bool, bool)> = std::iter::once((
+        "Auto (default)".to_string(),
+        app.config.interface.is_none(),
+        false,
+    ))
+    .chain(bypass_vpn.into_iter().map(|name| {
+        let addresses = app
+            .interface_list
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| {
+                entry
                     .addresses
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
-                    .join(", ");
-                let selected = matches!(&app.config.interface, Some(name) if *name == entry.name);
-                (format!("{}  {}", entry.name, addresses), selected)
-            }))
-            .collect();
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        let selected = app.config.interface.as_deref() == Some(name.as_str());
+        (
+            format!("Bypass VPN (auto)  {name}  {addresses}"),
+            selected,
+            false,
+        )
+    }))
+    .chain(app.interface_list.iter().map(|entry| {
+        let addresses = entry
+            .addresses
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let selected = matches!(&app.config.interface, Some(name) if *name == entry.name);
+        (
+            format!("{}  {}", entry.name, addresses),
+            selected,
+            crate::iface::is_vpn_interface(&entry.name),
+        )
+    }))
+    .collect();
     let mut field_idx = 0usize;
     for (header, count) in SettingField::GROUPS {
         let group_start = field_idx;
@@ -1425,6 +1494,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
             row_map.push(None);
             ports_row_map.push(None);
             interface_row_map.push(None);
+            fragment_row_map.push(None);
             field_idx += count;
             continue;
         }
@@ -1435,6 +1505,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         row_map.push(None);
         ports_row_map.push(None);
         interface_row_map.push(None);
+        fragment_row_map.push(None);
         for _ in 0..count {
             let i = field_idx;
             let f = SettingField::ALL[i];
@@ -1472,6 +1543,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
                     row_map.push(Some(i));
                     ports_row_map.push(Some(index));
                     interface_row_map.push(None);
+                    fragment_row_map.push(None);
                 }
                 field_idx += 1;
                 continue;
@@ -1479,15 +1551,15 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
             if editing_interface && i == interface_field_index {
                 // One row per selectable interface (Auto first), with the
                 // interface's addresses alongside the name.
-                for (index, (label, selected)) in interface_rows.iter().enumerate() {
+                for (index, (label, selected, is_vpn)) in interface_rows.iter().enumerate() {
                     let cursor_here = index == app.interface_cursor;
                     let style = if cursor_here {
                         theme::row_selected_style()
                     } else {
                         Style::default().fg(theme::palette().subtitle)
                     };
-                    let row = format!(
-                        "{}{}{}",
+                    let mut line = Line::from(format!(
+                        "  {}{}{}",
                         if cursor_here {
                             widgets::focus_marker()
                         } else {
@@ -1499,12 +1571,91 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
                             widgets::unchecked_marker()
                         },
                         label
+                    ));
+                    if *is_vpn {
+                        line.push_span(Span::styled(" (VPN)", theme::warn_style()));
+                    }
+                    lines.push(line.style(style));
+                    row_map.push(Some(i));
+                    ports_row_map.push(None);
+                    interface_row_map.push(Some(index));
+                    fragment_row_map.push(None);
+                }
+                field_idx += 1;
+                continue;
+            }
+            if editing_fragment && i == fragment_field_index {
+                // One row per preset (off first), with a checkbox marking the
+                // current pick, followed by a custom-JSON entry that opens the
+                // plain text editor when activated.
+                let custom_row = TLS_FRAGMENT_PRESETS.len();
+                let checked_row = app.fragment_preset_draft;
+                for (row_index, (label, spec)) in TLS_FRAGMENT_PRESETS.iter().enumerate() {
+                    let cursor_here = row_index == app.fragment_preset_cursor;
+                    let style = if cursor_here {
+                        theme::row_selected_style()
+                    } else {
+                        Style::default().fg(theme::palette().subtitle)
+                    };
+                    let spec_text = spec
+                        .as_ref()
+                        .map(FragmentProfile::xray_json)
+                        .unwrap_or_else(|| "unfragmented control".to_string());
+                    let row = format!(
+                        "{}{}{:<18} {}",
+                        if cursor_here {
+                            widgets::focus_marker()
+                        } else {
+                            " "
+                        },
+                        if row_index == checked_row {
+                            widgets::checkbox_checked_symbol()
+                        } else {
+                            widgets::checkbox_unchecked_symbol()
+                        },
+                        label,
+                        spec_text,
                     );
                     lines.push(Line::from(format!("  {row}")).style(style));
                     row_map.push(Some(i));
                     ports_row_map.push(None);
-                    interface_row_map.push(Some(index));
+                    interface_row_map.push(None);
+                    fragment_row_map.push(Some(row_index));
                 }
+                let cursor_here = app.fragment_preset_cursor == custom_row;
+                let style = if cursor_here {
+                    theme::row_selected_style()
+                } else {
+                    Style::default().fg(theme::palette().subtitle)
+                };
+                let value = if checked_row == custom_row {
+                    let (before, after) = app
+                        .edit_buffer
+                        .split_at(app.edit_caret.min(app.edit_buffer.len()));
+                    format!("{before}{after}_")
+                } else {
+                    String::new()
+                };
+                let row = format!(
+                    "{}{}{:<18} {}",
+                    if cursor_here {
+                        widgets::focus_marker()
+                    } else {
+                        " "
+                    },
+                    if checked_row == custom_row {
+                        widgets::checkbox_checked_symbol()
+                    } else {
+                        widgets::checkbox_unchecked_symbol()
+                    },
+                    "Custom (paste JSON)",
+                    value,
+                );
+                lines.push(Line::from(format!("  {row}")).style(style));
+                row_map.push(Some(i));
+                ports_row_map.push(None);
+                interface_row_map.push(None);
+                fragment_row_map.push(Some(custom_row));
                 field_idx += 1;
                 continue;
             }
@@ -1540,12 +1691,13 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
             row_map.push(Some(i));
             ports_row_map.push(None);
             interface_row_map.push(None);
+            fragment_row_map.push(None);
             field_idx += 1;
         }
     }
 
     let items = lines.into_iter().map(ListItem::new).collect::<Vec<_>>();
-    let selected_row = if editing_ports || editing_interface {
+    let selected_row = if editing_ports || editing_interface || editing_fragment {
         // While editing one of the list fields, the list highlight follows
         // the focused row so the List widget keeps it inside the viewport as
         // the cursor moves and the row map slices stay aligned with the
@@ -1556,8 +1708,10 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
             .map(|row| {
                 row + if editing_ports {
                     app.port_cursor
-                } else {
+                } else if editing_interface {
                     app.interface_cursor
+                } else {
+                    app.fragment_preset_cursor
                 }
             })
     } else {
@@ -1571,7 +1725,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         List::new(items)
             .block(block)
             .highlight_style(theme::row_selected_style())
-            .highlight_symbol(if editing_ports || editing_interface {
+            .highlight_symbol(if editing_ports || editing_interface || editing_fragment {
                 ""
             } else {
                 widgets::focus_marker()
@@ -1585,6 +1739,7 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     app.settings_row_map = row_map[start..end].to_vec();
     app.ports_row_map = ports_row_map[start..end].to_vec();
     app.interface_row_map = interface_row_map[start..end].to_vec();
+    app.fragment_row_map = fragment_row_map[start..end].to_vec();
 
     // Right Side Description Panel
     let current_field = SettingField::ALL[app.cursor.min(SettingField::ALL.len() - 1)];
@@ -1611,6 +1766,14 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
             "  Press Enter to edit; then use ↑/↓ to adjust the numeric value.",
         ));
         desc_para_lines.push(Line::from("  Use j/k to move between fields."));
+    }
+    if current_field == SettingField::TlsFragment {
+        desc_para_lines.push(Line::from(
+            "  Press Enter to open the profile checklist; ↑/↓ moves, Space toggles,",
+        ));
+        desc_para_lines.push(Line::from(
+            "  Enter confirms. The Custom entry opens the raw-JSON editor.",
+        ));
     }
 
     let (_, workload) = selected_cidrs_and_workload(app);
@@ -1728,9 +1891,13 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
     };
 
     let main_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(6)])
+        .split(area);
+    let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
+        .split(main_layout[0]);
 
     let mut summary_left = vec![
         Line::from(vec![Span::styled(
@@ -1798,6 +1965,11 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
             Span::raw(match &app.config.interface {
                 None => "auto".to_string(),
                 Some(name) => {
+                    let vpn = if crate::iface::is_vpn_interface(name) {
+                        " (VPN)"
+                    } else {
+                        ""
+                    };
                     let suffix = app.review_interface_suffix.get_or_insert_with(|| {
                         crate::iface::interface_addrs(name)
                             .ok()
@@ -1805,7 +1977,7 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
                             .map(|ip| format!(" ({ip})"))
                             .unwrap_or_default()
                     });
-                    format!("{name}{suffix}")
+                    format!("{name}{vpn}{suffix}")
                 }
             }),
         ]),
@@ -1881,11 +2053,23 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
 
     let block_left = widgets::panel_block("Target configuration", false);
     let para_left = Paragraph::new(summary_left).block(block_left);
-    frame.render_widget(para_left, main_layout[0]);
+    frame.render_widget(para_left, columns[0]);
 
     let block_right = widgets::panel_block("Scope & Workload", false);
     let para_right = Paragraph::new(summary_right).block(block_right);
-    frame.render_widget(para_right, main_layout[1]);
+    frame.render_widget(para_right, columns[1]);
+
+    let cli_focused = app.focus_index == 2;
+    let block_cli = widgets::panel_block(" CLI equivalent — C: full view ", cli_focused);
+    let cli_inner = block_cli.inner(main_layout[1]);
+    frame.render_widget(block_cli, main_layout[1]);
+    let command = app.current_cli_command();
+    frame.render_widget(
+        Paragraph::new(command)
+            .style(ratatui::style::Style::default())
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        cli_inner,
+    );
 }
 
 /// Whether the driver sweeps every candidate address in the selected ranges
@@ -1964,6 +2148,11 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         .constraints([
             Constraint::Length(16),
             Constraint::Min(0),
+            Constraint::Length(if app.wizard_step == WizardStep::Review {
+                10
+            } else {
+                0
+            }),
             Constraint::Length(16),
         ])
         .split(area);
@@ -1986,6 +2175,21 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         app.focus_index == 1,
     );
 
+    if app.wizard_step == WizardStep::Review {
+        app.button_ex(
+            frame,
+            chunks[2],
+            "Copy",
+            ButtonAction::CopyCliCommand,
+            if app.focus_index == 2 {
+                ButtonKind::Primary
+            } else {
+                ButtonKind::Secondary
+            },
+            app.focus_index == 2,
+        );
+    }
+
     let right_action = match app.wizard_step {
         WizardStep::Review => ButtonAction::Start,
         _ => ButtonAction::Next,
@@ -1994,7 +2198,12 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         WizardStep::Review => "Start scan",
         _ => "Next",
     };
-    let right_focused = app.focus_index == 2;
+    let right_focused = app.focus_index
+        == if app.wizard_step == WizardStep::Review {
+            3
+        } else {
+            2
+        };
     let right_kind = if right_focused {
         ButtonKind::Primary
     } else {
@@ -2002,7 +2211,7 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     };
     app.button_ex(
         frame,
-        chunks[2],
+        chunks[3],
         right_label,
         right_action,
         right_kind,
@@ -2046,6 +2255,7 @@ fn render_hint(app: &App, frame: &mut Frame, area: Rect) {
                     (widgets::enter_key(), "toggle/edit/next"),
                     ("↑/↓", "move"),
                     ("x", "advanced"),
+                    ("C", "CLI command"),
                     ("/", "commands"),
                     ("?", "help"),
                 ]
@@ -2056,6 +2266,7 @@ fn render_hint(app: &App, frame: &mut Frame, area: Rect) {
             (widgets::enter_key(), "start"),
             ("s", "new sample"),
             ("c", "save targets"),
+            ("C", "CLI command"),
             ("Esc", "back"),
             ("/", "commands"),
             ("?", "help"),
@@ -2079,14 +2290,33 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
             KeyCode::Enter => {
                 let s = app.input_buffer.trim().to_string();
                 if s.is_empty() {
-                    app.custom_input_mode = false;
-                    app.input_buffer.clear();
-                    app.edit_caret = 0;
+                    app.exit_cidr_input();
                     return;
                 }
                 match crate::scanner::cidr_valid(&s) {
                     Ok(_) => {
-                        if let Some((idx, entry)) = app
+                        if let Some(idx) = app.cidr_edit_index {
+                            // Editing an existing custom range in place.
+                            if app.cidr_candidates[idx].cidr == s {
+                                app.exit_cidr_input();
+                                return;
+                            }
+                            let collision = app
+                                .cidr_candidates
+                                .iter()
+                                .enumerate()
+                                .any(|(i, entry)| i != idx && entry.cidr == s);
+                            if collision {
+                                app.toast_error(format!("CIDR {s} already exists"));
+                            } else {
+                                app.cidr_candidates[idx].cidr = s.clone();
+                                app.cursor = idx;
+                                app.toast_success(format!("Updated to {s}"));
+                                app.invalidate_preview();
+                                app.exit_cidr_input();
+                                app.save_config();
+                            }
+                        } else if let Some((idx, entry)) = app
                             .cidr_candidates
                             .iter_mut()
                             .enumerate()
@@ -2095,28 +2325,26 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
                             entry.selected = true;
                             app.cursor = idx;
                             app.toast_warn(format!("CIDR {s} already exists; selected it"));
+                            app.invalidate_preview();
+                            app.exit_cidr_input();
+                            app.save_config();
                         } else {
                             app.cidr_candidates.push(crate::tui::CidrEntry {
                                 cidr: s.clone(),
                                 selected: true,
+                                custom: true,
                             });
                             app.cursor = app.cidr_candidates.len() - 1;
                             app.toast_success(format!("Added {s}"));
+                            app.invalidate_preview();
+                            app.exit_cidr_input();
+                            app.save_config();
                         }
-                        app.invalidate_preview();
-                        app.input_buffer.clear();
-                        app.edit_caret = 0;
-                        app.custom_input_mode = false;
-                        app.save_config();
                     }
                     Err(e) => app.toast_error(format!("Invalid CIDR '{s}': {e}")),
                 }
             }
-            KeyCode::Esc => {
-                app.custom_input_mode = false;
-                app.input_buffer.clear();
-                app.edit_caret = 0;
-            }
+            KeyCode::Esc => app.exit_cidr_input(),
             KeyCode::Backspace if app.edit_caret > 0 => {
                 let previous = previous_char_boundary(&app.input_buffer, app.edit_caret);
                 app.input_buffer.drain(previous..app.edit_caret);
@@ -2146,12 +2374,14 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Up | KeyCode::Char('k') if app.cursor > 0 => {
             app.cursor -= 1;
+            app.pending_cidr_delete = None;
         }
         KeyCode::Down | KeyCode::Char('j') => {
             let last = app.cidr_candidates.len().saturating_sub(1);
             if app.cursor < last {
                 app.cursor += 1;
             }
+            app.pending_cidr_delete = None;
         }
         KeyCode::Char(' ') => {
             if let Some(e) = app.cidr_candidates.get_mut(app.cursor) {
@@ -2162,6 +2392,8 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
         }
         KeyCode::Char('a') => {
             app.custom_input_mode = true;
+            app.cidr_edit_index = None;
+            app.pending_cidr_delete = None;
             app.input_buffer.clear();
             app.edit_caret = 0;
         }
@@ -2171,6 +2403,10 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
             }
             app.invalidate_preview();
             app.save_config();
+            app.toast_success(format!(
+                "All CIDRs selected ({} ranges)",
+                app.cidr_candidates.len()
+            ));
         }
         KeyCode::Char('s') | KeyCode::Char('S') => {
             let selected: Vec<String> = app
@@ -2211,13 +2447,48 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
             app.invalidate_preview();
             app.save_config();
         }
-        KeyCode::Char('N') | KeyCode::Char('n') | KeyCode::Char('d') | KeyCode::Char('D') => {
+        KeyCode::Char('n') | KeyCode::Char('N') => {
             for e in app.cidr_candidates.iter_mut() {
                 e.selected = false;
             }
             app.invalidate_preview();
             app.save_config();
+            app.toast_warn("All CIDRs deselected");
         }
+        KeyCode::Char('e') => {
+            app.pending_cidr_delete = None;
+            match app.cidr_candidates.get(app.cursor) {
+                Some(entry) if entry.custom => {
+                    app.custom_input_mode = true;
+                    app.cidr_edit_index = Some(app.cursor);
+                    app.input_buffer = entry.cidr.clone();
+                    app.edit_caret = app.input_buffer.len();
+                }
+                Some(_) => app.toast_warn("Built-in ranges are not editable"),
+                None => {}
+            }
+        }
+        KeyCode::Char('x') | KeyCode::Char('X') => match app.cidr_candidates.get(app.cursor) {
+            Some(entry) if entry.custom => {
+                if app.pending_cidr_delete == Some(app.cursor) {
+                    app.pending_cidr_delete = None;
+                    let removed = app.cidr_candidates[app.cursor].cidr.clone();
+                    app.cidr_candidates.remove(app.cursor);
+                    app.cursor = app.cursor.min(app.cidr_candidates.len().saturating_sub(1));
+                    app.invalidate_preview();
+                    app.save_config();
+                    app.toast_success(format!("Removed {removed}"));
+                } else {
+                    app.pending_cidr_delete = Some(app.cursor);
+                    app.toast_warn(format!("Press x again to remove {}", entry.cidr));
+                }
+            }
+            Some(_) => {
+                app.pending_cidr_delete = None;
+                app.toast_warn("Built-in ranges cannot be removed");
+            }
+            None => app.pending_cidr_delete = None,
+        },
         KeyCode::Char('c') => {
             app.wizard_step = WizardStep::Settings;
             app.cursor = 0;
@@ -2235,7 +2506,20 @@ fn handle_ranges_key(app: &mut App, code: KeyCode) {
             }
         },
         KeyCode::Esc if app.return_to_results => app.return_to_results(),
-        _ => {}
+        _ => {
+            app.pending_cidr_delete = None;
+        }
+    }
+}
+
+/// Leave the ranges input mode (add or edit), resetting the edit target and
+/// the input buffer.
+impl App {
+    fn exit_cidr_input(&mut self) {
+        self.custom_input_mode = false;
+        self.cidr_edit_index = None;
+        self.input_buffer.clear();
+        self.edit_caret = 0;
     }
 }
 
@@ -2282,10 +2566,88 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
                 KeyCode::Up if app.interface_cursor > 0 => {
                     app.interface_cursor -= 1;
                 }
-                KeyCode::Down if app.interface_cursor + 1 < app.interface_list.len() + 1 => {
+                KeyCode::Down if app.interface_cursor + 1 < app.interface_row_count() => {
                     app.interface_cursor += 1;
                 }
                 _ => {}
+            }
+            return;
+        }
+        if field == SettingField::TlsFragment {
+            if app.fragment_preset_draft == TLS_FRAGMENT_PRESETS.len() {
+                // The custom-JSON entry selected: plain text editing.
+                match code {
+                    KeyCode::Enter => {
+                        app.commit_edit();
+                    }
+                    KeyCode::Esc => {
+                        app.edit_field = None;
+                        app.edit_buffer.clear();
+                        app.edit_caret = 0;
+                    }
+                    KeyCode::Up => {
+                        app.fragment_preset_draft = TLS_FRAGMENT_PRESETS.len() - 1;
+                        app.fragment_preset_cursor = TLS_FRAGMENT_PRESETS.len() - 1;
+                    }
+                    KeyCode::Down => {
+                        app.fragment_preset_draft = TLS_FRAGMENT_PRESETS.len() - 1;
+                        app.fragment_preset_cursor = TLS_FRAGMENT_PRESETS.len();
+                    }
+                    KeyCode::Backspace if app.edit_caret > 0 => {
+                        let previous = previous_char_boundary(&app.edit_buffer, app.edit_caret);
+                        app.edit_buffer.drain(previous..app.edit_caret);
+                        app.edit_caret = previous;
+                    }
+                    KeyCode::Delete if app.edit_caret < app.edit_buffer.len() => {
+                        let next = next_char_boundary(&app.edit_buffer, app.edit_caret);
+                        app.edit_buffer.drain(app.edit_caret..next);
+                    }
+                    KeyCode::Left if app.edit_caret > 0 => {
+                        app.edit_caret = previous_char_boundary(&app.edit_buffer, app.edit_caret);
+                    }
+                    KeyCode::Right if app.edit_caret < app.edit_buffer.len() => {
+                        app.edit_caret = next_char_boundary(&app.edit_buffer, app.edit_caret);
+                    }
+                    KeyCode::Home => app.edit_caret = 0,
+                    KeyCode::End => app.edit_caret = app.edit_buffer.len(),
+                    KeyCode::Char(c) => {
+                        app.edit_buffer.insert(app.edit_caret, c);
+                        app.edit_caret += c.len_utf8();
+                    }
+                    _ => {}
+                }
+            } else {
+                // Preset checklist: Space toggles the checked row, Enter commits.
+                match code {
+                    KeyCode::Enter if app.fragment_preset_cursor == TLS_FRAGMENT_PRESETS.len() => {
+                        app.fragment_preset_draft = TLS_FRAGMENT_PRESETS.len();
+                    }
+                    KeyCode::Enter => {
+                        app.commit_fragment_selection();
+                    }
+                    KeyCode::Esc => {
+                        app.edit_field = None;
+                        app.edit_buffer.clear();
+                        app.edit_caret = 0;
+                    }
+                    KeyCode::Up if app.fragment_preset_cursor > 0 => {
+                        app.fragment_preset_cursor -= 1;
+                    }
+                    KeyCode::Down
+                        if app.fragment_preset_cursor + 1 < TLS_FRAGMENT_PRESETS.len() + 1 =>
+                    {
+                        app.fragment_preset_cursor += 1;
+                    }
+                    KeyCode::Char(' ') => {
+                        app.fragment_preset_draft =
+                            if app.fragment_preset_draft == app.fragment_preset_cursor {
+                                0
+                            } else {
+                                app.fragment_preset_cursor
+                            };
+                    }
+                    _ => {}
+                }
             }
             return;
         }
@@ -2339,6 +2701,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             }
             app.settings_scroll = 0;
         }
+        KeyCode::Char('C') => app.open_cli_command(),
         KeyCode::Char(' ') if SettingField::ALL[app.cursor].is_toggle() => {
             SettingField::ALL[app.cursor].toggle(&mut app.config);
             app.invalidate_preview();
@@ -2460,18 +2823,33 @@ pub(super) fn toggle_port_buffer(app: &mut App) {
         .join(",");
 }
 
+/// Row of the TLS fragment picker matching `config.tls_fragment`: row 0 is
+/// off, preset rows mirror `TLS_FRAGMENT_PRESETS` (which starts with the off
+/// entry), and the final row is the custom-JSON entry.
+fn fragment_preset_row(config: &AppConfig) -> usize {
+    match &config.tls_fragment {
+        None => 0,
+        Some(spec) => TLS_FRAGMENT_PRESETS
+            .iter()
+            .position(|(_, preset)| matches!(preset, Some(FragmentProfile::Xray(s)) if s == spec))
+            .unwrap_or(TLS_FRAGMENT_PRESETS.len()),
+    }
+}
+
 fn handle_review_key(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Char('s') => {
             app.regenerate_preview();
         }
         KeyCode::Char('c') => app.save_target_manifest(),
+        KeyCode::Char('C') => app.open_cli_command(),
         KeyCode::Enter => match app.focus_index {
             1 => {
                 app.wizard_step = WizardStep::Settings;
                 app.cursor = 0;
             }
-            2 => app.pending_start = true,
+            2 => app.copy_cli_command(),
+            3 => app.pending_start = true,
             _ => app.pending_start = true,
         },
         KeyCode::Left | KeyCode::Esc => {
@@ -2494,6 +2872,12 @@ impl App {
         let field = SettingField::ALL[i];
         if field == SettingField::Interface {
             self.commit_interface_selection();
+            return true;
+        }
+        if field == SettingField::TlsFragment
+            && self.fragment_preset_draft < TLS_FRAGMENT_PRESETS.len()
+        {
+            self.commit_fragment_selection();
             return true;
         }
         let mut updated_config = self.config.clone();
@@ -2557,29 +2941,87 @@ impl App {
             }
             if field == SettingField::Interface {
                 self.interface_list = crate::iface::list_interfaces().unwrap_or_default();
+                self.bypass_vpn = crate::iface::bypass_vpn_interface();
                 self.interface_cursor = match &self.config.interface {
                     None => 0,
+                    Some(name) if self.bypass_vpn.as_deref() == Some(name.as_str()) => 1,
                     Some(name) => self
                         .interface_list
                         .iter()
                         .position(|entry| entry.name == *name)
-                        .map(|index| index + 1)
+                        .map(|index| index + 1 + usize::from(self.bypass_vpn.is_some()))
                         .unwrap_or(0),
                 };
+            }
+            if field == SettingField::TlsFragment {
+                let row = fragment_preset_row(&self.config);
+                self.fragment_preset_cursor = row;
+                self.fragment_preset_draft = row;
             }
         }
     }
 
+    /// Commit the currently checked TLS fragment picker row: row 0 disables
+    /// fragmentation, any preset row applies that profile, and the custom row
+    /// is only committed through the text editor (`commit_edit`).
+    pub fn commit_fragment_selection(&mut self) {
+        let row = self.fragment_preset_draft;
+        if row < TLS_FRAGMENT_PRESETS.len() {
+            match TLS_FRAGMENT_PRESETS[row].1.as_ref() {
+                Some(FragmentProfile::Xray(spec)) => {
+                    self.config.tls_fragment = Some(spec.clone());
+                }
+                Some(FragmentProfile::V2rayNg { .. }) => {
+                    self.toast_warn(
+                        "Double-fragment profiles are tester-only; leaving TLS fragment unchanged",
+                    );
+                    return;
+                }
+                None => self.config.tls_fragment = None,
+            }
+            self.edit_field = None;
+            self.edit_buffer.clear();
+            self.edit_caret = 0;
+            self.invalidate_preview();
+            self.save_config();
+        }
+    }
+
+    /// Number of rows in the interface picker: the Auto row, the optional
+    /// Bypass VPN row, then one row per interface.
+    pub fn interface_row_count(&self) -> usize {
+        self.interface_list.len() + 1 + usize::from(self.bypass_vpn.is_some())
+    }
+
+    /// The pin selected by picker `row`: row 0 is auto (`None`), the Bypass
+    /// VPN row pins its candidate, and any other row pins that interface.
+    /// Rows past the end resolve to `None` (no row) so the cursor can never
+    /// commit a pin from outside the picker.
+    fn interface_selection_at_row(&self, row: usize) -> Option<Option<String>> {
+        if row == 0 {
+            return Some(None);
+        }
+        if self.bypass_vpn.is_some() {
+            if row == 1 {
+                return Some(self.bypass_vpn.clone());
+            }
+            return self
+                .interface_list
+                .get(row - 2)
+                .map(|entry| Some(entry.name.clone()));
+        }
+        self.interface_list
+            .get(row - 1)
+            .map(|entry| Some(entry.name.clone()))
+    }
+
     /// Commit the currently highlighted interface row: row 0 clears the
-    /// pin (auto), any other row pins that interface.
+    /// pin (auto), the Bypass VPN row pins its candidate, any other row
+    /// pins that interface.
     pub fn commit_interface_selection(&mut self) {
-        let selection = if self.interface_cursor == 0 {
-            None
-        } else {
-            self.interface_list
-                .get(self.interface_cursor - 1)
-                .map(|entry| entry.name.clone())
-        };
+        let selection = self
+            .interface_selection_at_row(self.interface_cursor)
+            .flatten();
         self.config.interface = selection;
         self.review_interface_suffix = None;
         self.edit_field = None;
@@ -2642,6 +3084,7 @@ mod tests {
     };
     use crate::config::{AppConfig, DiscoveryDriver};
     use crate::tui::{App, CidrEntry};
+    use crossterm::event::KeyCode;
     use std::sync::{atomic::AtomicBool, Arc};
 
     fn settings_app() -> App {
@@ -2650,6 +3093,70 @@ mod tests {
             false,
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    fn type_input(app: &mut App, text: &str) {
+        for c in text.chars() {
+            handle_ranges_key(app, crossterm::event::KeyCode::Char(c));
+        }
+    }
+
+    fn clear_input_via_backspaces(app: &mut App) {
+        while !app.input_buffer.is_empty() {
+            handle_ranges_key(app, crossterm::event::KeyCode::Backspace);
+        }
+    }
+
+    fn add_cidr_via_keys(app: &mut App, cidr: &str) {
+        handle_ranges_key(app, crossterm::event::KeyCode::Char('a'));
+        assert!(app.custom_input_mode);
+        type_input(app, cidr);
+        handle_ranges_key(app, crossterm::event::KeyCode::Enter);
+    }
+
+    /// Restores `HOME`/`XDG_CONFIG_HOME` and removes the throwaway config
+    /// directory on drop, even when the closure panics.
+    struct IsolatedConfigGuard {
+        old_home: Option<std::ffi::OsString>,
+        old_xdg: Option<std::ffi::OsString>,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for IsolatedConfigGuard {
+        fn drop(&mut self) {
+            match &self.old_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.old_xdg {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Run `f` with config writes redirected to a throwaway directory so
+    /// tests never touch the developer's real config.json. Serialized because
+    /// `HOME`/`XDG_CONFIG_HOME` are process-global.
+    fn with_isolated_config(f: impl FnOnce()) {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old_home = std::env::var_os("HOME");
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let dir =
+            std::env::temp_dir().join(format!("cleanscan-test-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("HOME", &dir);
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        let cleanup = IsolatedConfigGuard {
+            old_home,
+            old_xdg,
+            dir,
+        };
+        f();
+        drop(cleanup);
     }
 
     fn field_position(field: SettingField) -> usize {
@@ -2712,11 +3219,12 @@ mod tests {
             "expected at least a loopback interface"
         );
 
-        // Down clamps to the last row (interfaces after the Auto row).
-        for _ in 0..app.interface_list.len() + 5 {
+        // Down clamps to the last row: Auto, the Bypass VPN row (when a
+        // candidate exists), then one row per interface.
+        for _ in 0..app.interface_row_count() + 5 {
             handle_settings_key(&mut app, crossterm::event::KeyCode::Down);
         }
-        assert_eq!(app.interface_cursor, app.interface_list.len());
+        assert_eq!(app.interface_cursor, app.interface_row_count() - 1);
 
         handle_settings_key(&mut app, crossterm::event::KeyCode::Enter);
         assert_eq!(app.edit_field, None);
@@ -2728,12 +3236,38 @@ mod tests {
         // Reopening the picker highlights the pinned interface; walking back
         // to Auto and committing clears the pin.
         app.start_edit(index);
-        assert_eq!(app.interface_cursor, app.interface_list.len());
+        assert_eq!(app.interface_cursor, app.interface_row_count() - 1);
         while app.interface_cursor > 0 {
             handle_settings_key(&mut app, crossterm::event::KeyCode::Up);
         }
         handle_settings_key(&mut app, crossterm::event::KeyCode::Enter);
         assert_eq!(app.config.interface, None);
+    }
+
+    #[test]
+    fn bypass_vpn_row_pins_the_non_vpn_candidate() {
+        let mut app = settings_app();
+        app.wizard_step = crate::tui::WizardStep::Settings;
+        let index = field_position(SettingField::Interface);
+        app.start_edit(index);
+        let Some(candidate) = app.bypass_vpn.clone() else {
+            return; // loopback-only host: there is no non-VPN uplink to pin
+        };
+        assert!(
+            !crate::iface::is_vpn_interface(&candidate),
+            "bypass candidate must not be a VPN interface"
+        );
+
+        // One Down from Auto lands on the Bypass VPN row; Enter pins it.
+        handle_settings_key(&mut app, crossterm::event::KeyCode::Down);
+        assert_eq!(app.interface_cursor, 1);
+        handle_settings_key(&mut app, crossterm::event::KeyCode::Enter);
+        assert_eq!(app.edit_field, None);
+        assert_eq!(app.config.interface.as_deref(), Some(candidate.as_str()));
+
+        // Reopening the picker highlights the bypass row again.
+        app.start_edit(index);
+        assert_eq!(app.interface_cursor, 1);
     }
 
     #[test]
@@ -2935,6 +3469,7 @@ mod tests {
         app.cidr_candidates = vec![CidrEntry {
             cidr: "10.0.0.0/24".to_string(),
             selected: true,
+            custom: true,
         }];
         assert_eq!(app.config.discovery_driver, DiscoveryDriver::Sampling);
 
@@ -2960,6 +3495,182 @@ mod tests {
             app.config.two_phase,
             "s restores the two-phase setting saved before the sweep"
         );
+    }
+
+    #[test]
+    fn deselect_all_binding_is_n_only_and_toasts() {
+        with_isolated_config(|| {
+            let mut app = settings_app();
+            assert!(app.cidr_candidates.iter().all(|e| e.selected));
+
+            handle_ranges_key(&mut app, KeyCode::Char('d'));
+            assert!(
+                app.cidr_candidates.iter().all(|e| e.selected),
+                "d must not deselect the built-in ranges"
+            );
+            handle_ranges_key(&mut app, KeyCode::Char('D'));
+            assert!(app.cidr_candidates.iter().all(|e| e.selected));
+
+            handle_ranges_key(&mut app, KeyCode::Char('n'));
+            assert!(app.cidr_candidates.iter().all(|e| !e.selected));
+            assert_eq!(app.message.as_deref(), Some("All CIDRs deselected"));
+
+            handle_ranges_key(&mut app, KeyCode::Char('A'));
+            assert!(app.cidr_candidates.iter().all(|e| e.selected));
+            assert!(app
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("All CIDRs selected"));
+        });
+    }
+
+    #[test]
+    fn custom_cidr_add_edit_and_remove_roundtrip() {
+        with_isolated_config(|| {
+            let mut app = settings_app();
+            add_cidr_via_keys(&mut app, "162.159.82.1/24");
+            assert_eq!(app.cidr_candidates.len(), 17);
+            let custom_idx = app
+                .cidr_candidates
+                .iter()
+                .position(|e| e.cidr == "162.159.82.1/24")
+                .unwrap();
+            assert!(app.cidr_candidates[custom_idx].custom);
+            assert!(app.cidr_candidates[custom_idx].selected);
+
+            // The staged configuration matches the on-disk format without I/O.
+            let staged = app.staged_config();
+            assert_eq!(staged.custom_cidrs, vec!["162.159.82.1/24"]);
+            assert!(staged
+                .selected_cidrs
+                .contains(&"162.159.82.1/24".to_string()));
+
+            // Edit the focused custom range.
+            app.cursor = custom_idx;
+            handle_ranges_key(&mut app, KeyCode::Char('e'));
+            assert!(app.custom_input_mode);
+            assert_eq!(app.cidr_edit_index, Some(custom_idx));
+            assert_eq!(app.input_buffer, "162.159.82.1/24");
+            clear_input_via_backspaces(&mut app);
+            type_input(&mut app, "162.159.82.0/24");
+            handle_ranges_key(&mut app, KeyCode::Enter);
+            assert!(!app.custom_input_mode);
+            assert_eq!(app.cidr_candidates[custom_idx].cidr, "162.159.82.0/24");
+            assert!(app.cidr_candidates[custom_idx].custom);
+            assert_eq!(app.staged_config().custom_cidrs, vec!["162.159.82.0/24"]);
+
+            // A reloaded app (as on restart) restores the edited range.
+            let reloaded = App::new(app.staged_config(), false, Arc::new(AtomicBool::new(false)));
+            assert!(reloaded
+                .cidr_candidates
+                .iter()
+                .any(|e| e.cidr == "162.159.82.0/24" && e.custom));
+
+            // Remove with the two-stage confirmation.
+            handle_ranges_key(&mut app, KeyCode::Char('x'));
+            assert_eq!(app.pending_cidr_delete, Some(custom_idx));
+            assert_eq!(
+                app.cidr_candidates.len(),
+                17,
+                "first x only arms the removal"
+            );
+            handle_ranges_key(&mut app, KeyCode::Char('x'));
+            assert_eq!(app.pending_cidr_delete, None);
+            assert_eq!(app.cidr_candidates.len(), 16);
+            assert!(!app.cidr_candidates.iter().any(|e| e.custom));
+            assert!(app.staged_config().custom_cidrs.is_empty());
+        });
+    }
+
+    #[test]
+    fn custom_cidr_remove_requires_confirmation_and_cancels() {
+        with_isolated_config(|| {
+            let mut app = settings_app();
+            add_cidr_via_keys(&mut app, "10.0.0.0/24");
+            let idx = app
+                .cidr_candidates
+                .iter()
+                .position(|e| e.cidr == "10.0.0.0/24")
+                .unwrap();
+            app.cursor = idx;
+            handle_ranges_key(&mut app, KeyCode::Char('x'));
+            assert_eq!(app.pending_cidr_delete, Some(idx));
+            handle_ranges_key(&mut app, KeyCode::Down);
+            assert_eq!(
+                app.pending_cidr_delete, None,
+                "any other key cancels removal"
+            );
+            assert!(app.cidr_candidates.iter().any(|e| e.cidr == "10.0.0.0/24"));
+        });
+    }
+
+    #[test]
+    fn default_ranges_reject_edit_and_remove() {
+        let mut app = settings_app();
+        app.cursor = 0; // first built-in range
+        handle_ranges_key(&mut app, KeyCode::Char('e'));
+        assert!(
+            !app.custom_input_mode,
+            "built-in ranges must not open the editor"
+        );
+        handle_ranges_key(&mut app, KeyCode::Char('x'));
+        assert_eq!(
+            app.cidr_candidates.len(),
+            16,
+            "built-in ranges cannot be removed"
+        );
+        assert_eq!(app.pending_cidr_delete, None);
+    }
+
+    #[test]
+    fn custom_cidr_edit_rejects_duplicates_and_builtin_ranges() {
+        with_isolated_config(|| {
+            let mut app = settings_app();
+            add_cidr_via_keys(&mut app, "162.159.82.1/24");
+            let idx = app
+                .cidr_candidates
+                .iter()
+                .position(|e| e.cidr == "162.159.82.1/24")
+                .unwrap();
+            app.cursor = idx;
+
+            handle_ranges_key(&mut app, KeyCode::Char('e'));
+            clear_input_via_backspaces(&mut app);
+            type_input(&mut app, "188.114.96.0/20");
+            handle_ranges_key(&mut app, KeyCode::Enter);
+            assert_eq!(app.cidr_candidates[idx].cidr, "162.159.82.1/24");
+            assert!(app.custom_input_mode, "invalid edit keeps the editor open");
+
+            clear_input_via_backspaces(&mut app);
+            type_input(&mut app, "not-a-cidr");
+            handle_ranges_key(&mut app, KeyCode::Enter);
+            assert_eq!(app.cidr_candidates[idx].cidr, "162.159.82.1/24");
+            assert!(app.custom_input_mode);
+
+            handle_ranges_key(&mut app, KeyCode::Esc);
+            assert!(!app.custom_input_mode);
+        });
+    }
+
+    #[test]
+    fn staged_config_syncs_in_memory_config_on_save() {
+        with_isolated_config(|| {
+            let mut app = settings_app();
+            add_cidr_via_keys(&mut app, "10.0.0.0/24");
+            app.save_config();
+            assert_eq!(app.config.custom_cidrs, vec!["10.0.0.0/24"]);
+            assert!(app
+                .config
+                .selected_cidrs
+                .contains(&"10.0.0.0/24".to_string()));
+            assert!(app.config.selected_cidrs_persisted);
+
+            let reparsed = crate::config::load_config();
+            assert_eq!(reparsed.custom_cidrs, vec!["10.0.0.0/24"]);
+            assert!(reparsed.selected_cidrs.contains(&"10.0.0.0/24".to_string()));
+            assert!(reparsed.selected_cidrs_persisted);
+        });
     }
 
     #[test]
@@ -3004,6 +3715,7 @@ mod tests {
         app.cidr_candidates = vec![CidrEntry {
             cidr: "10.0.0.0/24".to_string(),
             selected: true,
+            custom: true,
         }];
         let (selected, workload) = selected_cidrs_and_workload(&app);
         let (ips, probes) = review_totals(&selected, false, 0, &app.config, workload.total_ips);
@@ -3033,6 +3745,7 @@ mod tests {
         app.cidr_candidates = vec![CidrEntry {
             cidr: "10.0.0.0/16".to_string(),
             selected: true,
+            custom: true,
         }];
         let (selected, workload) = selected_cidrs_and_workload(&app);
         assert_eq!(workload.total_ips, 100, "sampling caps at sample_per_cidr");
