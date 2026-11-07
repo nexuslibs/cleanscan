@@ -10,6 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use rand::RngExt;
+
 use crossterm::event::{self, EnableMouseCapture, Event, KeyEventKind};
 
 use crate::config::AppConfig;
@@ -269,7 +271,8 @@ pub fn run_tui(
     let spawn_fragment = |ip: String,
                           port: u16,
                           scan_config: Arc<AppConfig>,
-                          enabled: Vec<bool>|
+                          enabled: Vec<bool>,
+                          custom: Option<crate::proxy::FragmentProfile>|
      -> std::thread::JoinHandle<()> {
         let fragment_config = scan_config;
         let fragment_cancel = fragment_cancel.clone();
@@ -283,10 +286,13 @@ pub fn run_tui(
                         spec: None,
                         tcp_ok: false,
                         tls_ok: false,
+                        long_tls_ok: false,
                         http_ok: None,
                         colo: None,
                         elapsed_ms: 0.0,
                         error: Some(format!("failed to create tokio runtime: {e}")),
+                        passed: 0,
+                        attempts: 0,
                     });
                     return;
                 }
@@ -302,12 +308,15 @@ pub fn run_tui(
                             spec: None,
                             tcp_ok: false,
                             tls_ok: false,
+                            long_tls_ok: false,
                             http_ok: None,
                             colo: None,
                             elapsed_ms: 0.0,
                             error: Some(format!(
                                 "warning: {error}; fragment tests will use auto routing"
                             )),
+                            passed: 0,
+                            attempts: 0,
                         });
                         None
                     }
@@ -319,13 +328,24 @@ pub fn run_tui(
             // so the per-profile budget must cover those sleeps on top of the
             // normal probe timeout.
             let timeout_ms = fragment_config.timeout_ms.max(8_000);
+            const ATTEMPTS: usize = 3;
             rt.block_on(async move {
-                for (label, spec) in crate::proxy::TLS_FRAGMENT_PRESETS
-                    .iter()
-                    .zip(&enabled)
-                    .filter(|(_, enabled)| **enabled)
-                    .map(|((label, spec), _)| (*label, spec))
-                {
+                // Preset profiles plus the optional custom profile, unified
+                // as owned (label, Option<profile>) entries. Custom is
+                // parsed only when enabled (validate only when used) — the
+                // caller already validated, but re-parse here so the worker
+                // owns the value.
+                let mut profiles: Vec<(&'static str, Option<crate::proxy::FragmentProfile>)> =
+                    crate::proxy::TLS_FRAGMENT_PRESETS
+                        .iter()
+                        .zip(enabled.iter())
+                        .filter(|(_, enabled)| **enabled)
+                        .map(|((label, spec), _)| (*label, spec.clone()))
+                        .collect();
+                if let Some(custom_profile) = custom {
+                    profiles.push(("Custom (paste JSON)", Some(custom_profile)));
+                }
+                for (label, spec) in profiles {
                     if fragment_cancel.load(Ordering::Relaxed) {
                         break;
                     }
@@ -342,27 +362,78 @@ pub fn run_tui(
                     // Race the profile against the cancel flag so Esc / q
                     // abort the in-flight probe within ~50ms instead of after
                     // its full TCP + TLS + HTTP timeout stack. Dropping the
-                    // check future closes its sockets immediately.
-                    let check = tokio::select! {
-                        _ = cancel_watcher(&fragment_cancel) => None,
-                        check = crate::proxy::check_candidate_fragmented_profile(
-                            &transport,
-                            &ip,
-                            timeout_ms,
-                            interface,
-                            spec.as_ref(),
-                        ) => Some(check),
+                    // check future closes its sockets immediately. Each
+                    // profile is probed ATTEMPTS times with a short jitter so a
+                    // single lost packet or a transient reset does not fail it;
+                    // verdicts are majority-of-attempts.
+                    let mut checks: Vec<crate::proxy::SurvivabilityResult> =
+                        Vec::with_capacity(ATTEMPTS);
+                    for attempt in 0..ATTEMPTS {
+                        if fragment_cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if attempt > 0 {
+                            let jitter_ms = rand::rng().random_range(10..=60);
+                            tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+                        }
+                        let check = tokio::select! {
+                            _ = cancel_watcher(&fragment_cancel) => None,
+                            check = crate::proxy::check_candidate_fragmented_profile(
+                                &transport,
+                                &ip,
+                                timeout_ms,
+                                interface,
+                                fragment_config.mark,
+                                fragment_config.tls_fingerprint,
+                                fragment_config.ech,
+                                spec.as_ref(),
+                            ) => Some(check),
+                        };
+                        let Some(check) = check else { break };
+                        checks.push(check);
+                    }
+                    if checks.is_empty() {
+                        break;
+                    }
+                    let total = checks.len();
+                    let count = |pred: fn(&crate::proxy::SurvivabilityResult) -> bool| {
+                        checks.iter().filter(|check| pred(check)).count()
                     };
-                    let Some(check) = check else { break };
+                    let majority = |n: usize| n.saturating_mul(2) > total;
+                    let tcp_n = count(|c| c.tcp_ok);
+                    let tls_n = count(|c| c.tls_ok);
+                    let stable_n = count(|c| c.long_tls_ok);
+                    let http_true = count(|c| c.http_ok == Some(true));
+                    let http_false = count(|c| c.http_ok == Some(false));
+                    let passed =
+                        count(|c| c.tcp_ok && c.tls_ok && c.http_ok == Some(true) && c.long_tls_ok);
+                    let works = majority(passed);
+                    let http_ok = if majority(http_true) {
+                        Some(true)
+                    } else if http_false > 0 {
+                        Some(false)
+                    } else {
+                        None
+                    };
+                    let error = if works {
+                        None
+                    } else {
+                        checks.iter().rev().find_map(|check| check.error.clone())
+                    };
+                    let elapsed_ms =
+                        checks.iter().map(|check| check.elapsed_ms).sum::<f64>() / total as f64;
                     let _ = fragment_sender.send(crate::tui::state::FragmentTestResult {
                         name: label,
-                        spec: check.fragment,
-                        tcp_ok: check.tcp_ok,
-                        tls_ok: check.tls_ok,
-                        http_ok: check.http_ok,
-                        colo: check.colo,
-                        elapsed_ms: check.elapsed_ms,
-                        error: check.error,
+                        spec: checks[0].fragment.clone(),
+                        tcp_ok: majority(tcp_n),
+                        tls_ok: majority(tls_n),
+                        long_tls_ok: majority(stable_n),
+                        http_ok,
+                        colo: checks.iter().find_map(|check| check.colo.clone()),
+                        elapsed_ms,
+                        error,
+                        passed: passed as u8,
+                        attempts: total as u8,
                     });
                 }
             });
@@ -679,6 +750,7 @@ pub fn run_tui(
                             app.scan_complete = true;
                             app.scan_lifecycle =
                                 app.resolve_terminal_lifecycle(ScanLifecycle::Completed);
+                            app.finished_at = Some(std::time::Instant::now());
                             if app.last_targets.is_empty()
                                 && app.scan_lifecycle == ScanLifecycle::Completed
                                 && app.config.discovery_driver
@@ -691,6 +763,7 @@ pub fn run_tui(
                             app.scan_complete = true;
                             app.scan_lifecycle =
                                 app.resolve_terminal_lifecycle(ScanLifecycle::Failed);
+                            app.finished_at = Some(std::time::Instant::now());
                             app.scan_error = Some(e.to_string());
                             app.toast_error(format!("Scan failed: {e}"));
                         }
@@ -698,6 +771,7 @@ pub fn run_tui(
                             app.scan_complete = true;
                             app.scan_lifecycle =
                                 app.resolve_terminal_lifecycle(ScanLifecycle::Failed);
+                            app.finished_at = Some(std::time::Instant::now());
                             app.scan_error = Some("Scan worker panicked".to_string());
                             app.toast_error("Scan worker panicked");
                         }
@@ -1071,17 +1145,29 @@ pub fn run_tui(
                         app.toast_warn("Set a Host before testing fragments");
                     } else {
                         let enabled = app.fragment_enabled.clone();
-                        app.fragment_results.clear();
-                        app.fragment_complete = false;
-                        app.fragment_cancel.store(false, Ordering::Relaxed);
-                        app.fragment_start_time = Instant::now();
-                        app.screen = Screen::FragmentTesting;
-                        fragment_runner = Some(spawn_fragment(
-                            app.fragment_ip.clone(),
-                            app.fragment_port,
-                            Arc::new(app.config.clone()),
-                            enabled,
-                        ));
+                        let custom_result = crate::proxy::FragmentProfile::parse_custom_when_active(
+                            app.fragment_custom_enabled,
+                            &app.fragment_custom_json,
+                        );
+                        match custom_result {
+                            Ok(custom) => {
+                                app.fragment_results.clear();
+                                app.fragment_complete = false;
+                                app.fragment_cancel.store(false, Ordering::Relaxed);
+                                app.fragment_start_time = Instant::now();
+                                app.screen = Screen::FragmentTesting;
+                                fragment_runner = Some(spawn_fragment(
+                                    app.fragment_ip.clone(),
+                                    app.fragment_port,
+                                    Arc::new(app.config.clone()),
+                                    enabled,
+                                    custom,
+                                ));
+                            }
+                            Err(e) => {
+                                app.toast_error(format!("Invalid custom fragment JSON: {e}"));
+                            }
+                        }
                     }
                 }
             }

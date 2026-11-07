@@ -54,6 +54,9 @@ pub struct SpeedResult {
     pub error: Option<String>,
 }
 
+/// Build the per-target reqwest client for speed tests pinned to `ip` for
+/// `host`/`port`, with redirects disabled and the TLS fingerprint backend
+/// applied, bound to the pinned interface's source address when provided.
 fn client_for_ip(
     host: &str,
     ip: &str,
@@ -75,7 +78,7 @@ fn client_for_ip(
             builder = builder.local_address(local);
         }
     }
-    Ok(crate::proxy::apply_rustls_backend(builder).build()?)
+    Ok(crate::proxy::apply_rustls_backend(builder, args.tls_fingerprint).build()?)
 }
 
 async fn download_once(

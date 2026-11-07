@@ -5,7 +5,7 @@
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Cell, Gauge, Paragraph, Row, Table, Wrap},
     Frame,
@@ -34,6 +34,8 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
     render_footer(app, frame, chunks[2]);
 }
 
+/// Header for the fragment tester screens with the current stage title and
+/// the required host, falling back to a warning when the host is unset.
 fn render_header(app: &App, frame: &mut Frame, area: Rect) {
     let title = match app.screen {
         Screen::FragmentSelect => "TLS FRAGMENT TESTER",
@@ -41,17 +43,41 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
         Screen::FragmentResults => "TLS FRAGMENT RESULTS",
         _ => "TLS FRAGMENT TESTER",
     };
+    let host_segment = if app.config.host.is_empty() {
+        widgets::HeaderSegment {
+            label: "Host".to_string(),
+            value: "— REQUIRED".to_string(),
+            style: theme::warn_style().add_modifier(Modifier::BOLD),
+        }
+    } else {
+        widgets::HeaderSegment::new("Host", app.config.host.clone())
+    };
     widgets::app_header(
         frame,
         area,
         Some((title, theme::highlight_style())),
         &[
-            widgets::HeaderSegment::new("Host", app.config.host.clone()),
+            host_segment,
             widgets::HeaderSegment::new("IP", app.system_network.public_ip_display()),
             widgets::HeaderSegment::new("ASN", app.system_network.asn_display()),
             widgets::HeaderSegment::new("ISP", app.system_network.isp_display()),
         ],
     );
+}
+
+/// Profile selection screen: the editable target IP, the toggleable preset
+/// list plus custom-JSON row, the context panel, and start/back buttons.
+/// Physical height of a wrapped row at `width` columns (minimum 1).
+fn wrapped_row_height(row: &Line, width: u16) -> usize {
+    let row_width = row.width().max(1);
+    let width = usize::from(width.max(1));
+    row_width.div_ceil(width)
+}
+
+/// Line offset where row `row_index` starts (sum of heights of all rows
+/// before it), clamped to the last row when out of range.
+fn cursor_line_offset(heights: &[usize], row_index: usize) -> usize {
+    heights.iter().take(row_index.min(heights.len())).sum()
 }
 
 fn render_select(app: &mut App, frame: &mut Frame, area: Rect) {
@@ -68,17 +94,9 @@ fn render_select(app: &mut App, frame: &mut Frame, area: Rect) {
     frame.render_widget(block, chunks[0]);
 
     let visible = inner.height.saturating_sub(1) as usize;
-    let total = TLS_FRAGMENT_PRESETS.len() + 1;
-    let max_scroll = total.saturating_sub(visible);
+    // +1 for the IP row, +1 for the custom-JSON row.
+    let total = TLS_FRAGMENT_PRESETS.len() + 2;
     app.fragment_cursor = app.fragment_cursor.min(total.saturating_sub(1));
-    app.scroll = app
-        .scroll
-        .max(
-            app.fragment_cursor
-                .saturating_sub(visible.saturating_sub(1)),
-        )
-        .min(app.fragment_cursor)
-        .min(max_scroll);
 
     let mut rows: Vec<Line> = Vec::new();
     // Row 0: the target IP (edit with Enter while focused).
@@ -86,7 +104,7 @@ fn render_select(app: &mut App, frame: &mut Frame, area: Rect) {
         let (before, after) = app
             .edit_buffer
             .split_at(app.edit_caret.min(app.edit_buffer.len()));
-        format!("{before}{after}_")
+        format!("{before}_{after}")
     } else if app.fragment_ip.is_empty() {
         "<empty — Enter to type an IP>".to_string()
     } else {
@@ -120,7 +138,7 @@ fn render_select(app: &mut App, frame: &mut Frame, area: Rect) {
         let selected_row = app.fragment_cursor == row_index;
         let style = if selected_row {
             theme::row_selected_style()
-        } else if (row_index % 2) == 0 {
+        } else if row_index.is_multiple_of(2) {
             theme::row_alt_style()
         } else {
             Style::default().fg(theme::palette().subtitle)
@@ -151,13 +169,86 @@ fn render_select(app: &mut App, frame: &mut Frame, area: Rect) {
         ]));
     }
 
-    // Scroll window into the visible area.
-    let row_lines: Vec<Line> = rows
+    // Last row: custom JSON entry (PattNG FinalMaskField analog).
+    {
+        let row_index = TLS_FRAGMENT_PRESETS.len() + 1;
+        let enabled = app.fragment_custom_enabled;
+        let selected_row = app.fragment_cursor == row_index;
+        let style = if selected_row {
+            theme::row_selected_style()
+        } else if row_index.is_multiple_of(2) {
+            theme::row_alt_style()
+        } else {
+            Style::default().fg(theme::palette().subtitle)
+        };
+        let spec_text = if app.fragment_custom_editing {
+            let (before, after) = app
+                .edit_buffer
+                .split_at(app.edit_caret.min(app.edit_buffer.len()));
+            format!("{before}_{after}")
+        } else if app.fragment_custom_json.is_empty() {
+            "<empty — Enter to paste JSON>".to_string()
+        } else {
+            app.fragment_custom_json.clone()
+        };
+        rows.push(Line::from(vec![
+            Span::styled(
+                if selected_row {
+                    widgets::focus_marker()
+                } else {
+                    " "
+                },
+                style,
+            ),
+            Span::styled(
+                if enabled {
+                    widgets::checkbox_checked_symbol()
+                } else {
+                    widgets::checkbox_unchecked_symbol()
+                },
+                style,
+            ),
+            Span::styled(" Custom (paste JSON) ", style),
+            Span::styled(spec_text, theme::hint_style()),
+        ]));
+    }
+
+    // Scroll window by physical lines so wrapped rows (whose JSON wraps to
+    // multiple lines at narrow widths) don't push the cursor off screen.
+    let heights: Vec<usize> = rows
         .iter()
-        .skip(app.scroll)
-        .take(visible)
-        .cloned()
+        .map(|row| wrapped_row_height(row, inner.width))
         .collect();
+    let total_lines: usize = heights.iter().sum();
+    let max_scroll = total_lines.saturating_sub(visible);
+    let cursor_start = cursor_line_offset(&heights, app.fragment_cursor);
+    let cursor_height = heights
+        .get(app.fragment_cursor)
+        .copied()
+        .unwrap_or(1)
+        .max(1);
+    // Keep the whole cursor row inside the visible window: scroll down
+    // until its last line fits, or up to its first line when above.
+    let mut scroll = app.scroll.min(max_scroll);
+    if cursor_start < scroll {
+        scroll = cursor_start;
+    }
+    if cursor_start + cursor_height > scroll + visible {
+        scroll = cursor_start + cursor_height - visible;
+    }
+    app.scroll = scroll.min(max_scroll);
+    let row_lines: Vec<Line> = {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        for (row, height) in rows.iter().zip(heights.iter()) {
+            let next = at + height;
+            if next > app.scroll && at < app.scroll + visible {
+                out.push(row.clone());
+            }
+            at = next;
+        }
+        out
+    };
     frame.render_widget(
         Paragraph::new(row_lines).wrap(Wrap { trim: false }),
         Rect {
@@ -172,12 +263,16 @@ fn render_select(app: &mut App, frame: &mut Frame, area: Rect) {
     render_select_buttons(app, frame, area);
 }
 
+/// Side context panel for profile selection: target host/port/path/timeout,
+/// the enabled-profile count, and how a profile is judged working.
 fn render_select_panel(app: &App, frame: &mut Frame, area: Rect) {
     let selected = app
         .fragment_enabled
         .iter()
         .filter(|enabled| **enabled)
-        .count();
+        .count()
+        + usize::from(app.fragment_custom_enabled);
+    let total = TLS_FRAGMENT_PRESETS.len() + 1;
     let port = app.fragment_port;
     let info = vec![
         Line::from(Span::styled(" TARGET & PROBES ", theme::header_style())),
@@ -204,19 +299,20 @@ fn render_select_panel(app: &App, frame: &mut Frame, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("Profiles   : ", theme::title_style()),
-            Span::raw(format!(
-                "{selected} / {} enabled",
-                TLS_FRAGMENT_PRESETS.len()
-            )),
+            Span::raw(format!("{selected} / {total} enabled")),
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            " Each profile performs a full TCP connect, a TLS handshake with the SNI above, and a GET request. A profile 'works' only when all three succeed — fragmenting the ClientHello past the DPI but leaving a dead edge is not enough.",
+            " Each profile is probed three times (10-60 ms apart). A profile 'works' when a majority of attempts pass TCP + TLS + an HTTP 2xx response and the connection survives the idle hold — fragmenting the ClientHello past the DPI but leaving a dead edge is not enough.",
             theme::hint_style(),
         )),
         Line::from(""),
         Line::from(Span::styled(
             " Profiles are xray freedom `fragment` settings; the winning profile is copied as ready-to-paste JSON.",
+            theme::hint_style(),
+        )),
+        Line::from(Span::styled(
+            " Note: the 0/104/1 PattNG recipe re-wraps the ClientHello with a zero-length TLS record, which only Cloudflare-style edges tolerate.",
             theme::hint_style(),
         )),
         Line::from(Span::styled(
@@ -263,12 +359,15 @@ fn render_select_buttons(app: &mut App, frame: &mut Frame, body: Rect) {
     );
 }
 
+/// Live progress view while profiles are being probed: spinner, gauge,
+/// elapsed time, and the majority-of-three verdicts note.
 fn render_testing(app: &App, frame: &mut Frame, area: Rect) {
     let total = app
         .fragment_enabled
         .iter()
         .filter(|enabled| **enabled)
-        .count();
+        .count()
+        + usize::from(app.fragment_custom_enabled);
     let done = app.fragment_results.len();
     let percent = done
         .saturating_mul(100)
@@ -322,13 +421,15 @@ fn render_testing(app: &App, frame: &mut Frame, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(Span::styled(
-            "Each profile opens a fresh TCP+TLS connection and issues an HTTP request.",
+            "Each profile is probed three times; verdicts are majority-of-attempts.",
             theme::hint_style(),
         )),
         rows[3],
     );
 }
 
+/// Results table highlighting the working profiles, with the first working
+/// recipe surfaced in the summary line for one-key copying.
 fn render_results(app: &mut App, frame: &mut Frame, area: Rect) {
     let block = widgets::panel_block(
         "Fragment profiles — working results are green",
@@ -383,6 +484,8 @@ fn render_results(app: &mut App, frame: &mut Frame, area: Rect) {
         Cell::from("TCP"),
         Cell::from("TLS"),
         Cell::from("HTTP"),
+        Cell::from("Stable"),
+        Cell::from("Pass"),
         Cell::from("Colo"),
         Cell::from("ms"),
         Cell::from("Error"),
@@ -406,6 +509,12 @@ fn render_results(app: &mut App, frame: &mut Frame, area: Rect) {
                     Some(true) => "yes",
                     Some(false) => "no",
                     None => "-",
+                }),
+                Cell::from(if result.long_tls_ok { "yes" } else { "no" }),
+                Cell::from(if result.attempts == 0 {
+                    "-".to_string()
+                } else {
+                    format!("{}/{}", result.passed, result.attempts)
                 }),
                 Cell::from(result.colo.as_deref().unwrap_or("-")),
                 Cell::from(format!("{:.0}", result.elapsed_ms)),
@@ -432,6 +541,8 @@ fn render_results(app: &mut App, frame: &mut Frame, area: Rect) {
             Constraint::Length(34),
             Constraint::Length(4),
             Constraint::Length(4),
+            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Length(5),
             Constraint::Length(6),
             Constraint::Length(8),

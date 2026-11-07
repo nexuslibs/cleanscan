@@ -228,7 +228,10 @@ pub(crate) fn send_progress(
 /// given ports. An address is "reachable" when any port accepts the
 /// connection; reachable addresses are returned deduplicated and sorted.
 /// `concurrency` bounds in-flight connects; `cancel` stops the walk between
-/// addresses (in-flight connects are allowed to drain).
+/// addresses (in-flight connects are allowed to drain). Socket-mark setup
+/// failures fail the sweep with an error instead of counting as unreachable
+/// hosts, so `--mark` problems (no CAP_NET_ADMIN, unsupported platform)
+/// surface instead of silently finding nothing.
 #[allow(clippy::too_many_arguments)]
 pub async fn connect_sweep(
     sources: &[SourceEntry],
@@ -236,9 +239,10 @@ pub async fn connect_sweep(
     connect_timeout_ms: u64,
     concurrency: usize,
     interface: Option<crate::iface::InterfaceAddrs>,
+    mark: Option<u32>,
     cancel: Arc<AtomicBool>,
     progress: Option<ProgressSender>,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     let total = enumerated_address_count(sources);
     let connect_timeout = Duration::from_millis(connect_timeout_ms.max(1));
     let mut open: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -266,25 +270,38 @@ pub async fn connect_sweep(
                     for port in ports {
                         let result = timeout(
                             connect_timeout,
-                            crate::iface::bind_connect(SocketAddr::new(addr, *port), interface),
+                            crate::iface::bind_connect(
+                                SocketAddr::new(addr, *port),
+                                interface,
+                                mark,
+                            ),
                         )
                         .await;
-                        // Only a completed TCP handshake counts as reachable:
-                        // a fast connect error (e.g. an immediate RST from a
-                        // closed port) means the host is up but the port is
-                        // not open, so it must not enter the sweep results.
-                        if matches!(result, Ok(Ok(_))) {
-                            reachable = true;
-                            break;
+                        match result {
+                            Ok(Ok(_)) => {
+                                reachable = true;
+                                break;
+                            }
+                            // Only a completed TCP handshake counts as reachable:
+                            // a fast connect error (e.g. an immediate RST from a
+                            // closed port) means the host is up but the port is
+                            // not open, so it must not enter the sweep results.
+                            // SO_MARK setup failures are different: every
+                            // connect would fail the same way, so surface them.
+                            Ok(Err(e)) if e.to_string().contains("SO_MARK") => {
+                                return Err(e.to_string());
+                            }
+                            _ => {}
                         }
                     }
                 }
-                (addr, reachable)
+                Ok((addr, reachable))
             }
         })
         .buffer_unordered(concurrency.max(1));
 
-    while let Some((addr, reachable)) = stream.next().await {
+    while let Some(entry) = stream.next().await {
+        let (addr, reachable) = entry?;
         attempted = attempted.saturating_add(1);
         if reachable {
             open.insert(addr.to_string());
@@ -303,7 +320,7 @@ pub async fn connect_sweep(
             open.len()
         )),
     );
-    open.into_iter().collect()
+    Ok(open.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -390,6 +407,7 @@ mod tests {
         }
     }
 
+    /// Sweep finds a loopback listener and skips TEST-NET when routable.
     #[tokio::test]
     async fn connect_sweep_finds_reachable_addresses() {
         if test_net_is_routable() {
@@ -409,10 +427,12 @@ mod tests {
             300,
             4,
             None,
+            None,
             Arc::new(AtomicBool::new(false)),
             None,
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(open, vec!["127.0.0.1".to_string()]);
     }
 
@@ -420,7 +440,9 @@ mod tests {
     async fn connect_sweep_respects_cancellation() {
         let sources = vec![entry("192.0.2.0/24")];
         let cancel = Arc::new(AtomicBool::new(true));
-        let open = connect_sweep(&sources, &[443], 100, 4, None, cancel, None).await;
+        let open = connect_sweep(&sources, &[443], 100, 4, None, None, cancel, None)
+            .await
+            .unwrap();
         assert!(open.is_empty());
     }
 }

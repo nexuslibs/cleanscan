@@ -2,12 +2,14 @@ mod adaptive;
 mod colo;
 mod config;
 mod discovery;
+mod ech;
 mod iface;
 mod proxy;
 mod scanner;
 mod speed;
 #[cfg(feature = "syn")]
 mod syn;
+mod sysprofile;
 mod system_info;
 mod tui;
 mod updater;
@@ -107,6 +109,25 @@ pub struct Args {
     /// the TUI fragment tester (e.g. '{"packets":"tlshello","length":"100-200","interval":"10-20"}')
     #[arg(long = "tls-fragment")]
     pub tls_fragment: Option<String>,
+
+    /// Linux socket mark (SO_MARK) for connections made by cleanscan itself
+    /// (connect sweep, --proxy-url checks, fragment tester), e.g. "106" or
+    /// "0x106". Required on Linux/Android and needs CAP_NET_ADMIN; routes
+    /// egress through the fwmark-selected table (e.g. around a TUN).
+    #[arg(long)]
+    pub mark: Option<String>,
+
+    /// TLS ClientHello fingerprint: "default" (rustls defaults) or "chrome"
+    /// (Chrome-like ALPN/cipher/KX order).
+    #[arg(long = "tls-fingerprint", value_parser = ["default", "chrome"])]
+    pub tls_fingerprint: Option<String>,
+
+    /// Use ECH (Encrypted Client Hello) for TLS checks, fail-closed: if no
+    /// ECH config can be fetched (or this build lacks `--features ech`),
+    /// refuse cleartext SNI instead of connecting. Applies to --proxy-url
+    /// protocol checks and the TUI fragment tester.
+    #[arg(long, default_value_t = false)]
+    pub ech: bool,
 
     /// List network interfaces with their IP addresses, then exit.
     #[arg(long)]
@@ -321,6 +342,9 @@ pub enum Command {
     },
 }
 
+/// Binary entry point: install the rustls crypto provider, parse CLI args,
+/// and dispatch to the update self-update, interface listing, and CLI scan
+/// paths (the TUI is launched from `cli_mode` when interactive).
 fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let args = Args::parse();
@@ -421,6 +445,25 @@ fn main() -> Result<()> {
         config.discovery_driver = driver.parse().map_err(anyhow::Error::msg)?;
     }
     config.interface = crate::iface::normalize_interface(args.interface.clone());
+    if let Some(raw) = args.mark.as_deref() {
+        config.mark = Some(
+            crate::iface::parse_mark_value(raw)
+                .map_err(|e| anyhow::anyhow!("--mark: {e}; expected e.g. \"106\" or \"0x106\""))?,
+        );
+        if !crate::iface::mark_supported() {
+            anyhow::bail!(
+                "--mark (SO_MARK) is only supported on Linux and Android; on this platform it would have no effect"
+            );
+        }
+    }
+    if let Some(raw) = args.tls_fingerprint.as_deref() {
+        config.tls_fingerprint = raw
+            .parse()
+            .map_err(|e| anyhow::anyhow!("--tls-fingerprint: {e}"))?;
+    }
+    if args.ech {
+        config.ech = true;
+    }
     if let Some(raw) = args.tls_fragment.as_deref() {
         config.tls_fragment = if raw.trim().is_empty() {
             None
@@ -456,6 +499,12 @@ fn main() -> Result<()> {
     }
     if let Some(concurrency) = args.concurrency {
         config.concurrency = concurrency;
+    } else if !config.concurrency_persisted {
+        // Tiered default: low-end hosts default to 4/10 workers instead of
+        // 120 so full-subnet sweeps don't OOM them. An explicit
+        // --concurrency or a persisted value (even 120) always wins.
+        config.concurrency =
+            crate::sysprofile::default_concurrency(crate::sysprofile::detect_tier());
     }
     if let Some(timeout_ms) = args.timeout_ms {
         config.timeout_ms = timeout_ms;
@@ -976,6 +1025,8 @@ fn warn_if_colo_filter_uninformative(path: &str, colo: &Option<String>, country:
     }
 }
 
+/// Non-interactive CLI scan and watch orchestration: collect targets,
+/// run the discovery/probe pipeline, and emit formatted output.
 #[allow(clippy::too_many_arguments)]
 fn cli_mode(
     config: AppConfig,
@@ -1204,6 +1255,9 @@ fn cli_mode(
                     &result.ip,
                     config.timeout_ms,
                     interface,
+                    config.mark,
+                    config.tls_fingerprint,
+                    config.ech,
                     config.tls_fragment.as_ref(),
                 )
             })

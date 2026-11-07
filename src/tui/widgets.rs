@@ -209,6 +209,16 @@ impl HeaderSegment {
     }
 }
 
+/// Rendered width of one header segment including its divider and spaces.
+fn segment_width(seg: &HeaderSegment) -> usize {
+    if seg.label.is_empty() {
+        seg.value.chars().count() + 3 // │ + spaces
+    } else {
+        // │ + leading space + label + ": " + value + trailing space
+        seg.label.chars().count() + seg.value.chars().count() + 5
+    }
+}
+
 /// Render the shared application header: a brand+version badge, an optional
 /// status chip, then a series of `key: value` segments separated by dividers.
 /// Unifies the top bar across every screen.
@@ -218,17 +228,54 @@ pub fn app_header(
     status: Option<(&str, Style)>,
     segments: &[HeaderSegment],
 ) {
-    let mut spans = vec![Span::styled(
+    // Fit the header to the available width: segments are kept left-to-right
+    // until the next one would exceed the panel, then the strip closes with a
+    // dim ellipsis instead of clipping a segment mid-token. The final segment
+    // (the "Last export" receipt on the dashboard) is reserved first, so a
+    // long Host/Path elides earlier segments instead of starving it.
+    let budget = (area.width as usize).saturating_sub(2); // one column per border
+    let mut used = 0usize;
+    let mut spans: Vec<Span> = Vec::new();
+
+    let badge = Span::styled(
         format!(" CLEANSCAN v{} ", env!("CARGO_PKG_VERSION")),
         theme::header_style(),
-    )];
+    );
+    used += badge.content.chars().count();
+    spans.push(badge);
 
     if let Some((text, style)) = status {
-        spans.push(Span::styled("│", theme::hint_style()));
-        spans.push(Span::styled(format!(" {text} "), style));
+        let w = text.chars().count() + 3; // │ + spaces
+        if used + w <= budget {
+            spans.push(Span::styled("│", theme::hint_style()));
+            spans.push(Span::styled(format!(" {text} "), style));
+            used += w;
+        }
     }
 
-    for seg in segments {
+    let last_width = segments.last().map(segment_width).unwrap_or(0);
+    let mut dropped_earlier = false;
+    for (index, seg) in segments.iter().enumerate() {
+        let seg_w = segment_width(seg);
+        let is_last = index + 1 == segments.len();
+        // Keep room for the final segment when placing anything before it.
+        let reserve = if is_last { 0 } else { last_width };
+        if used + seg_w + reserve > budget {
+            if is_last {
+                // Place the receipt if it fits on its own; else elide.
+                if used + seg_w > budget {
+                    spans.push(Span::styled("…", theme::hint_style()));
+                    break;
+                }
+            } else {
+                dropped_earlier = true;
+                continue;
+            }
+        }
+        if is_last && dropped_earlier {
+            spans.push(Span::styled("…", theme::hint_style()));
+            used += 1;
+        }
         spans.push(Span::styled("│", theme::hint_style()));
         if seg.label.is_empty() {
             spans.push(Span::styled(format!(" {} ", seg.value), seg.style));
@@ -239,6 +286,7 @@ pub fn app_header(
             ));
             spans.push(Span::styled(format!("{} ", seg.value), seg.style));
         }
+        used += seg_w;
     }
 
     let para = Paragraph::new(Line::from(spans)).block(panel_block("", false));

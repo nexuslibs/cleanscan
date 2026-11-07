@@ -37,6 +37,8 @@ struct UpdateInfo {
     tag: String,
 }
 
+/// HTTP client for release metadata and asset downloads, with the cleanscan
+/// user-agent, no proxy, and the fingerprint-aware TLS backend.
 fn client(timeout: Duration) -> Result<Client> {
     Ok(crate::proxy::apply_rustls_backend(
         Client::builder()
@@ -44,6 +46,7 @@ fn client(timeout: Duration) -> Result<Client> {
             .connect_timeout(Duration::from_secs(2))
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::limited(10)),
+        crate::proxy::TlsFingerprint::Default,
     )
     .build()?)
 }
@@ -102,6 +105,9 @@ fn fixed_asset_url(tag: &str, name: &str, url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Parse the `checksums.txt` asset into the 32-byte SHA-256 digest it names.
+/// The asset must hold a single 64-char hex token; anything else is rejected
+/// so a malformed manifest can never silently verify.
 fn checksum(value: &[u8]) -> Result<[u8; 32]> {
     let token = std::str::from_utf8(value)?
         .split_whitespace()
@@ -111,7 +117,7 @@ fn checksum(value: &[u8]) -> Result<[u8; 32]> {
         anyhow::bail!("checksum asset does not contain a 64-character hexadecimal digest");
     }
     let mut digest = [0_u8; 32];
-    for (index, pair) in token.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in token.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         digest[index] = (hex(pair[0])? << 4) | hex(pair[1])?;
     }
     Ok(digest)

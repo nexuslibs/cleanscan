@@ -193,6 +193,10 @@ pub struct App {
     pub message: Option<String>,
     pub message_kind: ToastKind,
     pub message_time: Option<Instant>,
+    /// Last successful export file name, shown as a persistent receipt in
+    /// the dashboard header so the deliverable never confirms via a
+    /// transient toast alone.
+    pub last_export: Option<String>,
     /// Scroll offset into the results table.
     pub scroll: usize,
     pub result_cursor: usize,
@@ -213,6 +217,9 @@ pub struct App {
     pub result_column_visibility: [bool; 14],
     pub column_picker_cursor: usize,
     pub start_time: Instant,
+    /// When the scan reached a terminal lifecycle (completed/failed/cancelled);
+    /// freezes the header's Elapsed clock. `None` while a scan is active.
+    pub finished_at: Option<Instant>,
     /// Help overlay visibility.
     pub show_help: bool,
     /// Vertical scroll offset for contextual help on short terminals.
@@ -288,6 +295,12 @@ pub struct App {
     pub fragment_cancel: Arc<AtomicBool>,
     pub fragment_start_time: Instant,
     pub pending_fragment_start: bool,
+    /// Custom JSON profile for the tester (PattNG `FinalMaskField` analog):
+    /// raw text pasted by the user, parsed only when enabled
+    /// (`parse_custom_when_active`).
+    pub fragment_custom_json: String,
+    pub fragment_custom_enabled: bool,
+    pub fragment_custom_editing: bool,
     confirm_scan_action: Option<PendingScanAction>,
     /// Active semantic focus target and its position in the current screen's
     /// focus map. Focus is intentionally independent from list cursors.
@@ -402,6 +415,9 @@ impl App {
         self.focus_target = self.focus_target_for(self.focus_index);
     }
 
+    /// Map a focus index to the focusable target kind for accessibility and
+    /// Tab ordering, returning `Dialog` for any open modal and clamping stale
+    /// indices after screen transitions shrink the focus count.
     pub fn focus_target_for(&self, index: usize) -> FocusTarget {
         if self.confirm_quit
             || self.show_command_palette
@@ -410,6 +426,11 @@ impl App {
         {
             return FocusTarget::Dialog;
         }
+        // Clamp stale indices (e.g. after focus_count shrinks on scan
+        // transitions) so Tab never reports a generic target for an
+        // out-of-range position.
+        let count = self.focus_count().max(1);
+        let index = index.min(count - 1);
         match self.screen {
             Screen::Wizard => match (self.wizard_step, index) {
                 (WizardStep::Ranges, 0) => FocusTarget::List,
@@ -549,6 +570,8 @@ impl App {
         self.command_cursor = 0;
     }
 
+    /// Build the TUI application state from the CLI config, preserving
+    /// CLI-supplied targets and wiring the shared pause flag.
     pub fn new(config: AppConfig, has_cli_targets: bool, paused: Arc<AtomicBool>) -> Self {
         let scan_seed = config.seed;
         let two_phase_before_sweep = config.two_phase;
@@ -659,6 +682,7 @@ impl App {
             message: None,
             message_kind: ToastKind::Info,
             message_time: None,
+            last_export: None,
             scroll: 0,
             result_cursor: 0,
             ranges_scroll: 0,
@@ -674,6 +698,7 @@ impl App {
             result_column_visibility: [true; 14],
             column_picker_cursor: 0,
             start_time: Instant::now(),
+            finished_at: None,
             show_help: false,
             help_scroll: 0,
             tick: 0,
@@ -708,7 +733,7 @@ impl App {
             speed_search_mode: false,
             speed_sort_col: 2,
             speed_sort_asc: true,
-            speed_direction: SpeedDirection::Both,
+            speed_direction: SpeedDirection::Download,
             speed_results: Vec::new(),
             speed_result_cursor: 0,
             speed_complete: false,
@@ -726,6 +751,9 @@ impl App {
             fragment_cancel: Arc::new(AtomicBool::new(false)),
             fragment_start_time: Instant::now(),
             pending_fragment_start: false,
+            fragment_custom_json: String::new(),
+            fragment_custom_enabled: false,
+            fragment_custom_editing: false,
             confirm_scan_action: None,
             focus_target: FocusTarget::List,
             focus_index: 0,
@@ -894,6 +922,7 @@ impl App {
         self.message = None;
         self.message_time = None;
         self.start_time = Instant::now();
+        self.finished_at = None;
         self.throughput.clear();
         self.last_tp_instant = Instant::now();
         self.last_tp_count = 0;
@@ -904,13 +933,19 @@ impl App {
         if self.active_targets.is_empty() || (self.results.is_empty() && !self.scan_complete) {
             return;
         }
+        // Exclude inspection time: a completed run's duration ends at
+        // `finished_at`, not at archive time. Active runs keep elapsed-so-far.
+        let elapsed = self
+            .finished_at
+            .map(|finished| finished.duration_since(self.start_time))
+            .unwrap_or_else(|| self.start_time.elapsed());
         let record = RunRecord {
             id: self.current_run_id,
             source_run_id: self.current_source_run_id,
             kind: self.active_run_kind,
             targets: self.active_targets.clone(),
             results: self.results.clone(),
-            elapsed: self.start_time.elapsed(),
+            elapsed,
             lifecycle: self.scan_lifecycle,
         };
         self.run_history.push_front(record);
@@ -1421,12 +1456,15 @@ impl App {
         self.toast_kind(msg, ToastKind::Error);
     }
 
-    /// Whether the current toast should still be visible (auto-fade after 4s).
+    /// Whether the current toast should still be visible. Warn/Error/Success
+    /// persist until replaced (Success is the export deliverable
+    /// confirmation); Info auto-fades after 4s.
     pub fn visible_message(&self) -> Option<(&str, ToastKind)> {
         match (self.message.as_deref(), self.message_time) {
             (Some(m), Some(t))
                 if (self.message_kind == ToastKind::Warn
                     || self.message_kind == ToastKind::Error
+                    || self.message_kind == ToastKind::Success
                     || t.elapsed() < Duration::from_secs(4)) =>
             {
                 Some((m, self.message_kind))
@@ -1441,6 +1479,7 @@ impl App {
         if let (Some(_), Some(t)) = (self.message.as_deref(), self.message_time) {
             if self.message_kind != ToastKind::Warn
                 && self.message_kind != ToastKind::Error
+                && self.message_kind != ToastKind::Success
                 && t.elapsed() >= Duration::from_secs(4)
             {
                 self.message = None;
@@ -1692,13 +1731,18 @@ impl App {
         Ok(filename)
     }
 
+    /// Export the completed scan as a comparison snapshot, warning when the
+    /// scan has not finished yet and toasting the saved filename on success.
     pub fn export_comparison(&mut self) {
         if !self.scan_complete {
             self.toast_warn("Scan still running — wait for it to finish before exporting");
             return;
         }
         match self.save_comparison_to_file() {
-            Ok(name) => self.toast_success(format!("Comparison saved to {name}")),
+            Ok(name) => {
+                self.last_export = Some(name.clone());
+                self.toast_success(format!("Comparison saved to {name}"));
+            }
             Err(e) => self.toast_error(format!("Comparison export failed: {e}")),
         }
     }
@@ -1710,7 +1754,10 @@ impl App {
             return;
         }
         match self.save_to_file() {
-            Ok(name) => self.toast_success(format!("Results saved to {name}")),
+            Ok(name) => {
+                self.last_export = Some(name.clone());
+                self.toast_success(format!("Results saved to {name}"));
+            }
             Err(e) => self.toast_error(format!("Save failed: {e}")),
         }
     }
@@ -1759,7 +1806,7 @@ impl App {
         if self.scan_lifecycle == ScanLifecycle::Cancelling {
             return;
         }
-        if self.fragment_ip_editing {
+        if self.fragment_ip_editing || self.fragment_custom_editing {
             self.handle_fragment_select_key(code);
             return;
         }
@@ -2197,6 +2244,10 @@ impl App {
     /// Draw the current screen. Resets mouse hit regions first, then delegates
     /// to the active screen renderer (and the help overlay if open).
     pub fn render(&mut self, frame: &mut Frame) {
+        // Keep the focused control inside the current focus map across
+        // resizes and screen transitions where focus_count changes.
+        self.focus_index = self.focus_index.min(self.focus_count().saturating_sub(1));
+        self.focus_target = self.focus_target_for(self.focus_index);
         self.buttons.clear();
         self.ranges_inner = None;
         self.settings_inner = None;
@@ -2364,8 +2415,27 @@ impl App {
         );
     }
 
+    /// Overlay command palette sized to its filtered actions, with the
+    /// highlighted entry and its description.
     fn render_command_palette(&mut self, frame: &mut Frame, area: Rect, elapsed: Duration) {
-        let overlay = modal_overlay(" Command palette ", 72, 70);
+        // Size the overlay to its content: a few entries must not sit in a
+        // mostly-empty 70%-height panel, and the fixed 2-line description
+        // must not duplicate the label line (description() falls back to
+        // label() for most actions).
+        let actions = self.filtered_actions();
+        let item_lines = |action: &Action| 1 + usize::from(action.description() != action.label());
+        let rows_needed = actions
+            .iter()
+            .map(&item_lines)
+            .sum::<usize>()
+            .saturating_add(5)
+            .max(8);
+        let height_pct = rows_needed
+            .saturating_mul(100)
+            .checked_div(area.height as usize)
+            .unwrap_or(70)
+            .clamp(18, 70) as u16;
+        let overlay = modal_overlay(" Command palette ", 72, height_pct);
         if self.show_command_palette {
             self.command_palette_overlay.open();
         } else {
@@ -2376,12 +2446,23 @@ impl App {
         let Some(inner) = self.command_palette_overlay.inner_area() else {
             return;
         };
-        let actions = self.filtered_actions();
-        let visible = inner.height.saturating_sub(3).saturating_div(2) as usize;
+        let list_height = inner.height.saturating_sub(3) as usize; // query row + hint row
         self.command_cursor = self.command_cursor.min(actions.len().saturating_sub(1));
-        let start = self
-            .command_cursor
-            .saturating_sub(visible.saturating_sub(1));
+        // Walk backwards from the cursor so every item that fits the list
+        // area renders — descriptions make some items two lines tall.
+        let mut start = 0usize;
+        if !actions.is_empty() {
+            let mut used_lines = item_lines(&actions[self.command_cursor]);
+            start = self.command_cursor;
+            while start > 0 {
+                let prev = item_lines(&actions[start - 1]);
+                if used_lines + prev > list_height.max(1) {
+                    break;
+                }
+                used_lines += prev;
+                start -= 1;
+            }
+        }
         let items = actions
             .iter()
             .enumerate()
@@ -2391,17 +2472,19 @@ impl App {
                 } else {
                     ratatui::style::Style::default()
                 };
-                ratatui::widgets::ListItem::new(vec![
-                    Line::from(vec![
-                        Span::styled(format!(" {:<24}", action.label()), style),
-                        Span::styled(
-                            format!(" {:<6}", action.shortcut()),
-                            theme::highlight_style(),
-                        ),
-                    ])
-                    .style(style),
-                    Line::from(format!("   {}", action.description())).style(theme::hint_style()),
+                let mut rows = vec![Line::from(vec![
+                    Span::styled(format!(" {:<24}", action.label()), style),
+                    Span::styled(
+                        format!(" {:<6}", action.shortcut()),
+                        theme::highlight_style(),
+                    ),
                 ])
+                .style(style)];
+                let description = action.description();
+                if description != action.label() {
+                    rows.push(Line::from(format!("   {description}")).style(theme::hint_style()));
+                }
+                ratatui::widgets::ListItem::new(rows)
             })
             .collect::<Vec<_>>();
         let chunks = Layout::default()
@@ -2412,15 +2495,23 @@ impl App {
                 Constraint::Length(1),
             ])
             .split(inner);
-        frame.render_widget(
-            Paragraph::new(format!(" /{}", self.command_query)).style(theme::title_style()),
-            chunks[0],
-        );
+        if self.command_query.is_empty() {
+            frame.render_widget(
+                Paragraph::new(" / action, colo:FRA, country:Germany, target:1.2.x")
+                    .style(theme::hint_style()),
+                chunks[0],
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(format!(" /{}", self.command_query)).style(theme::title_style()),
+                chunks[0],
+            );
+        }
         if actions.is_empty() {
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::from("No matching commands"),
-                    Line::from("Try: country:germany  or  colo:FRA"),
+                    Line::from("Try: country:germany, colo:FRA, or target:<text>"),
                 ])
                 .style(theme::hint_style()),
                 chunks[1],
@@ -2554,6 +2645,8 @@ impl App {
         );
     }
 
+    /// Dispatch a key press on the scanning dashboard to its action: view
+    /// cycling, target marking/isolation, worker overrides, and navigation.
     fn handle_scan_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('o') => self.activate_action(Action::CycleScanView),
@@ -2577,10 +2670,10 @@ impl App {
             KeyCode::Char('m') if self.scan_complete => {
                 self.activate_action(Action::ExportComparison)
             }
-            KeyCode::Char('f') if self.dashboard_view == ScanDashboardView::LiveTargets => {
+            KeyCode::Char('F') if self.dashboard_view == ScanDashboardView::LiveTargets => {
                 self.cycle_target_filter()
             }
-            KeyCode::Char('s') if self.dashboard_view == ScanDashboardView::LiveTargets => {
+            KeyCode::Char('S') if self.dashboard_view == ScanDashboardView::LiveTargets => {
                 self.cycle_target_sort()
             }
             KeyCode::Char('f') => self.activate_action(Action::ToggleFailures),
@@ -2927,6 +3020,8 @@ impl App {
         self.toast_info("Worker count returned to automatic control");
     }
 
+    /// Toggle showing only failures, resetting the cursor and jumping to the
+    /// first failing result's diagnostics when the filter is enabled.
     fn toggle_failure_filter(&mut self) {
         self.show_failures = !self.show_failures;
         self.result_cursor = 0;
@@ -2939,10 +3034,10 @@ impl App {
             if let Some(index) = first_failure {
                 self.result_cursor = index;
                 self.show_result_details = true;
-                self.detail_tab = 1;
+                self.detail_tab = 2; // Diagnostics
             } else if self.scan_error.is_some() {
                 self.show_result_details = true;
-                self.detail_tab = 1;
+                self.detail_tab = 2; // Diagnostics
             }
         }
         self.toast_kind(
@@ -3032,7 +3127,7 @@ impl App {
         self.speed_search_mode = false;
         self.speed_sort_col = 2;
         self.speed_sort_asc = true;
-        self.speed_direction = SpeedDirection::Both;
+        self.speed_direction = SpeedDirection::Download;
         self.speed_results.clear();
         self.speed_complete = false;
         self.confirm_speed_start = false;
@@ -3270,6 +3365,8 @@ impl App {
         self.fragment_port = result.port;
         self.fragment_enabled = vec![true; crate::proxy::TLS_FRAGMENT_PRESETS.len()];
         self.fragment_ip_editing = false;
+        self.fragment_custom_editing = false;
+        self.fragment_custom_enabled = false;
         self.fragment_results.clear();
         self.fragment_result_cursor = 0;
         self.fragment_complete = false;
@@ -3300,6 +3397,7 @@ impl App {
         self.fragment_ip = ip;
         self.fragment_port = port;
         self.fragment_ip_editing = false;
+        self.fragment_custom_editing = false;
         self.fragment_cursor = 0;
         self.fragment_results.clear();
         self.fragment_result_cursor = 0;
@@ -3312,13 +3410,85 @@ impl App {
         self.screen = Screen::FragmentSelect;
     }
 
+    /// Dispatch a key press on the fragment-profile selection screen,
+    /// including the custom-JSON editor commit/cancel path.
     fn handle_fragment_select_key(&mut self, code: KeyCode) {
+        // Custom-JSON editor shares the IP editor's key handling but commits
+        // via FragmentProfile::parse_json; empty commits disable custom.
+        if self.fragment_custom_editing {
+            match code {
+                KeyCode::Enter => {
+                    let raw = self.edit_buffer.trim().to_string();
+                    if raw.is_empty() {
+                        self.fragment_custom_json.clear();
+                        self.fragment_custom_enabled = false;
+                        self.fragment_custom_editing = false;
+                        self.edit_buffer.clear();
+                        self.edit_caret = 0;
+                    } else if let Err(e) = crate::proxy::FragmentProfile::parse_json(&raw) {
+                        self.toast_error(format!("Invalid custom fragment JSON: {e}"));
+                        return;
+                    } else {
+                        self.fragment_custom_json = raw;
+                        self.fragment_custom_enabled = true;
+                        self.fragment_custom_editing = false;
+                        self.edit_buffer.clear();
+                        self.edit_caret = 0;
+                    }
+                }
+                KeyCode::Esc => {
+                    self.fragment_custom_editing = false;
+                    self.edit_buffer.clear();
+                    self.edit_caret = 0;
+                }
+                KeyCode::Backspace if self.edit_caret > 0 => {
+                    let previous = self.edit_buffer[..self.edit_caret]
+                        .char_indices()
+                        .next_back()
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                    self.edit_buffer.drain(previous..self.edit_caret);
+                    self.edit_caret = previous;
+                }
+                KeyCode::Left if self.edit_caret > 0 => {
+                    self.edit_caret = self.edit_buffer[..self.edit_caret]
+                        .char_indices()
+                        .next_back()
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                }
+                KeyCode::Right if self.edit_caret < self.edit_buffer.len() => {
+                    self.edit_caret = self.edit_buffer[self.edit_caret..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(index, _)| self.edit_caret + index)
+                        .unwrap_or(self.edit_buffer.len());
+                }
+                KeyCode::Home => self.edit_caret = 0,
+                KeyCode::End => self.edit_caret = self.edit_buffer.len(),
+                KeyCode::Char(c) => {
+                    self.edit_buffer.insert(self.edit_caret, c);
+                    self.edit_caret += c.len_utf8();
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.fragment_ip_editing {
             match code {
                 KeyCode::Enter => {
                     let ip = self.edit_buffer.trim().to_string();
-                    if ip.parse::<std::net::IpAddr>().is_err() {
-                        self.toast_error("Target IP must be a valid IPv4 or IPv6 address");
+                    // IP literal or hostname (hostnames get Happy Eyeballs
+                    // racing in `iface::dial`): letters/digits/dot/hyphen only.
+                    let valid = ip.parse::<std::net::IpAddr>().is_ok()
+                        || (!ip.is_empty()
+                            && !ip.starts_with('-')
+                            && !ip.starts_with('.')
+                            && ip
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.'));
+                    if !valid {
+                        self.toast_error("Target must be a valid IPv4, IPv6, or hostname");
                         return;
                     }
                     self.fragment_ip = ip;
@@ -3364,7 +3534,8 @@ impl App {
             }
             return;
         }
-        let total = crate::proxy::TLS_FRAGMENT_PRESETS.len() + 1;
+        let total = crate::proxy::TLS_FRAGMENT_PRESETS.len() + 2;
+        let custom_row = crate::proxy::TLS_FRAGMENT_PRESETS.len() + 1;
         match code {
             KeyCode::Up | KeyCode::Char('k') if self.fragment_cursor > 0 => {
                 self.fragment_cursor -= 1;
@@ -3373,15 +3544,30 @@ impl App {
                 self.fragment_cursor += 1;
             }
             KeyCode::Char(' ') if self.fragment_cursor > 0 => {
-                let index = self.fragment_cursor - 1;
-                if let Some(enabled) = self.fragment_enabled.get_mut(index) {
-                    *enabled = !*enabled;
+                if self.fragment_cursor == custom_row {
+                    if self.fragment_custom_json.is_empty() {
+                        self.fragment_custom_editing = true;
+                        self.edit_buffer = self.fragment_custom_json.clone();
+                        self.edit_caret = self.edit_buffer.len();
+                    } else {
+                        self.fragment_custom_enabled = !self.fragment_custom_enabled;
+                    }
+                } else {
+                    let index = self.fragment_cursor - 1;
+                    if let Some(enabled) = self.fragment_enabled.get_mut(index) {
+                        *enabled = !*enabled;
+                    }
                 }
             }
             KeyCode::Enter => match self.focus_index {
                 0 if self.fragment_cursor == 0 => {
                     self.fragment_ip_editing = true;
                     self.edit_buffer = self.fragment_ip.clone();
+                    self.edit_caret = self.edit_buffer.len();
+                }
+                0 if self.fragment_cursor == custom_row => {
+                    self.fragment_custom_editing = true;
+                    self.edit_buffer = self.fragment_custom_json.clone();
                     self.edit_caret = self.edit_buffer.len();
                 }
                 0 => {
@@ -3505,7 +3691,8 @@ impl App {
                     && self.edit_field.is_none()
                     && self.cursor > 0
                 {
-                    self.cursor -= 1;
+                    self.cursor =
+                        wizard::previous_visible_setting(self.cursor, self.show_advanced_settings);
                 }
             }
             MouseEventKind::ScrollDown => {
@@ -3524,10 +3711,8 @@ impl App {
                         self.cursor += 1;
                     }
                 } else if self.wizard_step == WizardStep::Settings && self.edit_field.is_none() {
-                    let last = SettingField::ALL.len().saturating_sub(1);
-                    if self.cursor < last {
-                        self.cursor += 1;
-                    }
+                    self.cursor =
+                        wizard::next_visible_setting(self.cursor, self.show_advanced_settings);
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -3722,6 +3907,8 @@ impl App {
         }
     }
 
+    /// Activate a footer button on any screen: wizard navigation, scan
+    /// controls, speed/fragment entry points, and return-to-results.
     fn activate_button(&mut self, action: ButtonAction) {
         match action {
             ButtonAction::Back => {
@@ -3748,11 +3935,17 @@ impl App {
             }
             ButtonAction::Start => {
                 if self.screen == Screen::Wizard && self.wizard_step == WizardStep::Review {
-                    // Re-run start via the spawn closure is not accessible here;
-                    // instead set a flag handled by the run loop.
-                    self.pending_run_kind = RunKind::Full;
-                    self.pending_source_run_id = None;
-                    self.pending_start = true;
+                    if self.config.host.is_empty() {
+                        self.wizard_step = WizardStep::Settings;
+                        self.cursor = 0;
+                        self.toast_warn("Set a Host before starting the scan");
+                    } else {
+                        // Re-run start via the spawn closure is not accessible here;
+                        // instead set a flag handled by the run loop.
+                        self.pending_run_kind = RunKind::Full;
+                        self.pending_source_run_id = None;
+                        self.pending_start = true;
+                    }
                 }
             }
             ButtonAction::Quit => {
@@ -3785,17 +3978,38 @@ impl App {
             ButtonAction::SpeedTest => self.open_speed_selection(),
             ButtonAction::FragmentTest => self.open_fragment_test_auto(),
             ButtonAction::FragmentStart => {
+                // Leaving profile selection: resolve any active editor first
+                // so its key capture can't leak into the next screen.
+                self.fragment_ip_editing = false;
+                self.fragment_custom_editing = false;
                 if self.fragment_ip.is_empty() {
                     self.toast_warn("Enter a target IP first (Enter on the IP row)");
                 } else if self.config.host.is_empty() {
                     self.toast_warn("Set a Host before testing fragments");
-                } else if !self.fragment_enabled.iter().any(|enabled| *enabled) {
+                } else if !self.fragment_enabled.iter().any(|enabled| *enabled)
+                    && !self.fragment_custom_enabled
+                {
                     self.toast_warn("Enable at least one profile (Space)");
+                } else if self.fragment_custom_enabled {
+                    match crate::proxy::FragmentProfile::parse_custom_when_active(
+                        true,
+                        &self.fragment_custom_json,
+                    ) {
+                        Ok(Some(_)) => self.pending_fragment_start = true,
+                        Ok(None) => self.toast_warn("Enable at least one profile (Space)"),
+                        Err(e) => self.toast_error(format!("Invalid custom fragment JSON: {e}")),
+                    }
                 } else {
                     self.pending_fragment_start = true;
                 }
             }
-            ButtonAction::FragmentBack => self.screen = Screen::Scanning,
+            ButtonAction::FragmentBack => {
+                // Leaving profile selection: resolve any active editor first
+                // so its key capture can't leak into the scan dashboard.
+                self.fragment_ip_editing = false;
+                self.fragment_custom_editing = false;
+                self.screen = Screen::Scanning
+            }
             ButtonAction::FragmentCopy => {
                 let Some(result) = self
                     .fragment_results

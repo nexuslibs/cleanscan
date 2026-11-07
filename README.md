@@ -254,7 +254,7 @@ scan starts directly with those targets.
 | `Space` | Toggle the focused CIDR |
 | `a` | Add a custom CIDR range |
 | `A` | Select all ranges |
-| `N` / `n` / `d` | Deselect all ranges |
+| `N` / `n` | Deselect all ranges |
 | `Enter` | Activate or edit the focused control |
 | `Esc` | Cancel or go back |
 | `/` | Open the command palette |
@@ -303,7 +303,7 @@ the TUI and are not edited in this screen.
 | `q`       | Quit                            |
 | `o`       | Cycle Results, Live Targets, and Run Log views |
 | `Space`   | Select or deselect the highlighted target |
-| `f` / `s` | In Live Targets, cycle the filter / sort order |
+| `F` / `S` | In Live Targets, cycle the filter / sort order |
 | `p`       | Pause scheduling / resume; active probes drain |
 | `i`       | Isolate the highlighted target after active probes drain |
 | `x`       | Stop the scan and keep completed results |
@@ -368,19 +368,29 @@ When your ISP's DPI blocks the TLS handshake for the probe host (the scan
 find the xray-style TLS fragment setting that defeats it. The tester runs each
 profile — an xray `freedom` `fragment` config — against the selected target IP
 (editable; prefilled from your selection or best result, on that result's
-port): a full TCP connect, a
+port): a full TCP connect (Happy Eyeballs: dual-stack hosts race IPv6 first
+with a 250 ms stagger when the target is a hostname), a
 TLS handshake with the scan host as SNI, and a plain HTTP request. A profile
 *works* only when all three succeed.
 
-Every profile is byte-faithful to xray's `FragmentWriter`: `tlshello` splits
+Many profiles are byte-faithful to xray's `FragmentWriter`: `tlshello` splits
 the first ClientHello record into random-length fragments re-wrapped as
 complete TLS records, `interval: 0` concatenates them into a single packet
 (xray PR #3660 "single TLS hello fragmenting"), and `maxSplit` caps the number
 of fragments. The default sweep covers `1-1` through `256-256` (interval 0),
-the classic `1-3`, and the xray docs default `10-20 / 10-20ms`. Press `c` on a
-working row to copy its fragment JSON — paste it straight into your xray
-freedom outbound, and optionally into the wizard's *TLS fragment (xray)*
-setting (or `--tls-fragment`) so `--proxy-url` protocol checks reuse it. Note
+the classic `1-3`, and the xray docs default `10-20 / 10-20ms`, plus the
+v2rayNG-style `5/94/1`, `0/104/1`, `6/98/1` staged recipes and Aether-style raw
+8–16 byte chunking (with optional SNI-midpoint first split) for DPIs that parse
+multi-record hellos but trigger on one-packet SNI. A `Custom (paste JSON)` row
+accepts any freedom `{"packets":...}`, finalmask `{"tcp":[...]}`, or
+`{"aether":{...}}` block (invalid JSON only errors when the row is enabled).
+Press `c` on a
+working row to copy its fragment JSON — paste freedom `{"packets":...}` JSON
+straight into your xray freedom outbound, and optionally into the wizard's
+*TLS fragment (xray)* setting (or `--tls-fragment`) so `--proxy-url`
+protocol checks reuse it. (The staged finalmask `{"tcp":[...]}` and Aether
+`{"aether":{...}}` shapes are tester-only JSON formats — they cannot be pasted
+into the wizard fragment setting or `--tls-fragment`.) Note
 that the latency-scan probes themselves run unfragmented; the tester tells you
 which value to configure in your proxy client.
 
@@ -403,8 +413,11 @@ which value to configure in your proxy client.
 | `--interface`          | auto             | Network interface for probes, discovery sweeps, and speed tests (e.g. `en0`, `utun6`); binds connections to its address (`auto` restores OS routing). Also selects the capture device for `--discover syn` |
 | `--list-interfaces`    | —                | List network interfaces with their IP addresses, then exit |
 | `--tls-fragment`       | off              | Xray-style TLS fragment JSON applied to `--proxy-url` protocol checks, e.g. `'{"packets":"tlshello","length":"100-200","interval":"10-20"}'` |
+| `--mark`               | off              | Linux socket mark (`SO_MARK`), e.g. `--mark 106` or `--mark 0x106`; set on connections cleanscan makes itself (connect sweep, `--proxy-url` checks, fragment tester) so egress goes through the fwmark-selected routing table (e.g. around a TUN). Linux/Android only, needs `CAP_NET_ADMIN`. The reqwest-based latency probes do not carry a mark |
+| `--tls-fingerprint`    | default          | TLS ClientHello fingerprint: `default` (rustls defaults) or `chrome` (Chrome-like: ALPN `h2`/`http/1.1`, AES-128-GCM first, Chrome cipher/KX order) |
 | `--probes`             | `8`              | Repeated probes per IP                           |
-| `--concurrency`        | `120`            | Max concurrent HTTP probes                       |
+| `--concurrency`        | `120`            | Max concurrent HTTP probes (default is tier-clamped: 4 on low-end, 10 on mid, 120 on high-end hosts; explicit values win) |
+| `--ech`                | off              | Use ECH (Encrypted Client Hello) for TLS checks, fail-closed: no ECH config or no HPKE build refuses cleartext SNI. Requires a `--features ech` build |
 | `--adaptive-concurrency` | off             | Adapt worker concurrency from recent probe health |
 | `--min-concurrency`    | `1`              | Minimum workers in adaptive mode                 |
 | `--max-concurrency`    | `240`            | Maximum workers in adaptive mode                 |
@@ -565,3 +578,14 @@ cargo test
 ## License
 
 MIT
+
+Third-party notices:
+
+- The `0/104/1 + 114/1` fragment profile (`PATTNG_STAGES` in `src/proxy.rs`) carries
+  values derived from patterniha/PattNG's `final_mask_preset_values`
+  ("tlshello-0-len", GPL-3.0). Credit to patterniha for the recipe selection.
+- Fragment staging semantics follow Xray's `transport/internet/finalmask/fragment`
+  (MPL-2.0) and the v2rayNG-style stream `fragment` JSON shape; no Xray-core
+  source files are vendored.
+- The SenPaiScanner project (MIT) popularized the single `0/104/1` recipe as an
+  Anti-DPI default; no SenPaiScanner source code is used.

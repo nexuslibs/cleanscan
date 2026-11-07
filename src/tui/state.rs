@@ -517,7 +517,10 @@ pub enum ButtonAction {
 }
 
 /// One probe result in the TLS fragment tester: a profile (or the unfragmented
-/// control) checked against the target IP.
+/// control) checked against the target IP. Each enabled profile is probed
+/// three times; the boolean fields are majority verdicts across those attempts,
+/// and `passed`/`attempts` count how many attempts saw a full TCP + TLS +
+/// 2xx HTTP + stable (idle-hold survived) connection.
 #[derive(Debug, Clone)]
 pub struct FragmentTestResult {
     /// Preset label, e.g. "1-3 classic".
@@ -526,17 +529,27 @@ pub struct FragmentTestResult {
     pub spec: Option<String>,
     pub tcp_ok: bool,
     pub tls_ok: bool,
+    /// Whether the TLS connection survived the post-handshake idle hold
+    /// (majority of attempts). Fails when DPI resets the connection shortly
+    /// after the handshake even though the probe itself succeeded.
+    pub long_tls_ok: bool,
     pub http_ok: Option<bool>,
     pub colo: Option<String>,
     pub elapsed_ms: f64,
     pub error: Option<String>,
+    /// Attempts whose full verdict passed (TCP + TLS + 2xx + stable).
+    pub passed: u8,
+    /// Attempts actually made (fewer than the configured number only when the
+    /// test was cancelled mid-profile).
+    pub attempts: u8,
 }
 
 impl FragmentTestResult {
     /// Whether this profile established a fully working connection
-    /// (TCP + TLS + a 2xx HTTP response).
+    /// (TCP + TLS + a 2xx HTTP response + surviving the idle hold), as a
+    /// majority of its attempts.
     pub fn works(&self) -> bool {
-        self.tcp_ok && self.tls_ok && self.http_ok == Some(true)
+        self.tcp_ok && self.tls_ok && self.http_ok == Some(true) && self.long_tls_ok
     }
 }
 

@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Cell, Gauge, Paragraph, Row, Table},
     Frame,
@@ -29,6 +29,8 @@ pub fn render(app: &mut App, frame: &mut Frame, area: Rect) {
     render_footer(app, frame, chunks[2]);
 }
 
+/// Header for the speed-test screens with the current stage title (or a
+/// cancelling state) and the required host segment.
 fn render_header(app: &App, frame: &mut Frame, area: Rect) {
     let title = if app.scan_lifecycle == ScanLifecycle::Cancelling {
         "CANCELLING SPEED TESTS"
@@ -40,12 +42,21 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
             _ => "SPEED TEST",
         }
     };
+    let host_segment = if app.config.host.is_empty() {
+        widgets::HeaderSegment {
+            label: "Host".to_string(),
+            value: "— REQUIRED".to_string(),
+            style: theme::warn_style().add_modifier(Modifier::BOLD),
+        }
+    } else {
+        widgets::HeaderSegment::new("Host", app.config.host.clone())
+    };
     widgets::app_header(
         frame,
         area,
         Some((title, theme::highlight_style())),
         &[
-            widgets::HeaderSegment::new("Host", app.config.host.clone()),
+            host_segment,
             widgets::HeaderSegment::new("IP", app.system_network.public_ip_display()),
             widgets::HeaderSegment::new("ASN", app.system_network.asn_display()),
             widgets::HeaderSegment::new("ISP", app.system_network.isp_display()),

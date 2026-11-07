@@ -7,34 +7,38 @@ edition = "2021"
 # Raw SYN discovery driver (masscan-style). Opt-in so Android/Termux and CI
 # builds stay free of libpcap; needs libpcap headers on the build host.
 syn = ["dep:pcap", "dep:libc"]
+# ECH (Encrypted Client Hello) support: pulls the aws-lc-rs provider (needed
+# for HPKE) into rustls. Kept opt-in so the default build stays ring-only;
+# --ech requires a binary built with this feature and fails closed without it.
+ech = ["rustls/aws-lc-rs"]
 
 [dependencies]
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-futures = "0.3"
-ipnet = "2"
-rand = "0.8"
-reqwest = { version = "0.13.4", default-features = false, features = ["http2", "json", "rustls-no-provider", "stream"] }
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+futures = "0.3.34"
+ipnet = "2.12.2"
+rand = "0.10.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["http2", "json", "rustls-no-provider", "stream"] }
 semver = "1"
-sha2 = "0.10"
-flate2 = "1"
+sha2 = "0.11.1"
+flate2 = "1.1.11"
 tar = "0.4"
-rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
 url = "2"
-rustls-platform-verifier = "0.7.0"
-tokio = { version = "1", features = ["full"] }
+rustls-platform-verifier = "0.7.1"
+tokio = { version = "1.54.1", features = ["full"] }
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-dirs = "6.0.0"
-if-addrs = "0.14"
-tui-slider = "0.3.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+dirs = "7.0.0"
+if-addrs = "0.15.0"
+tui-slider = "0.4.7"
 tui-overlay = "0.1.2"
-tui-checkbox = "0.4.6"
-pcap = { version = "2", optional = true }
-libc = { version = "0.2", optional = true }
+tui-checkbox = "0.5.3"
+pcap = { version = "2.5.0", optional = true }
+libc = { version = "0.2.191", optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
-webpki-root-certs = "1.0.9"
+webpki-root-certs = "1.0.11"

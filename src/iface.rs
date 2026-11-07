@@ -236,21 +236,285 @@ pub fn validate_interface(name: &str) -> Result<()> {
     }
 }
 
+/// Parse a `--mark` value: decimal (`106`) or hex (`0x106`, as the marks
+/// are conventionally written). `0` is rejected because it means "no mark";
+/// the valid range is `1..=u32::MAX`.
+pub fn parse_mark_value(raw: &str) -> Result<u32, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("mark value is empty".to_string());
+    }
+    let value = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16).map_err(|_| format!("invalid mark value {raw:?}"))?
+    } else {
+        let parsed = trimmed
+            .parse::<u64>()
+            .map_err(|e| format!("invalid mark value {raw:?}: {e}"))?;
+        u32::try_from(parsed).map_err(|_| format!("mark value {raw:?} is out of range"))?
+    };
+    if value == 0 {
+        return Err("mark value 0 means no mark; use 1 or above".to_string());
+    }
+    Ok(value)
+}
+
+/// Whether this platform supports `SO_MARK` (Linux and Android do).
+pub fn mark_supported() -> bool {
+    cfg!(any(target_os = "linux", target_os = "android"))
+}
+
+/// Set the `SO_MARK` socket option on `socket` (before `connect`) so the
+/// kernel routes the connection through the fwmark-selected table. Linux
+/// and Android only; other targets return a clear `Unsupported` error, and
+/// insufficient privilege (no `CAP_NET_ADMIN`) surfaces as the setsockopt
+/// error instead of a silent fallback.
+fn set_socket_mark(socket: &tokio::net::TcpSocket, mark: u32) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::raw::{c_int, c_void};
+        const SOL_SOCKET: c_int = 1;
+        const SO_MARK: c_int = 36;
+        unsafe extern "C" {
+            fn setsockopt(
+                fd: c_int,
+                level: c_int,
+                optname: c_int,
+                optval: *const c_void,
+                optlen: u32,
+            ) -> c_int;
+        }
+        let fd = socket.as_raw_fd();
+        let ret = unsafe {
+            setsockopt(
+                fd,
+                SOL_SOCKET,
+                SO_MARK,
+                &mark as *const u32 as *const c_void,
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+        if ret != 0 {
+            // Tagged so callers (e.g. the discovery sweep) can tell a
+            // mark-setup failure apart from an ordinary connect refusal.
+            return Err(std::io::Error::new(
+                std::io::Error::last_os_error().kind(),
+                format!("SO_MARK setup failed: {}", std::io::Error::last_os_error()),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = socket;
+        let _ = mark;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "SO_MARK (--mark) is only supported on Linux and Android",
+        ))
+    }
+}
+
+/// Happy Eyeballs (RFC 8305) stagger: the second address family is
+/// attempted 250 ms after the first if it hasn't connected yet.
+pub const HAPPY_EYEBALLS_DELAY_MS: u64 = 250;
+
+/// Order candidate addresses Happy-Eyeballs style (RFC 8305): IPv6 first,
+/// then IPv4, alternating so each family gets a turn at the stagger
+/// cadence. Exact duplicates are dropped.
+pub fn eyeball_order(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let mut v6: Vec<SocketAddr> = Vec::new();
+    let mut v4: Vec<SocketAddr> = Vec::new();
+    for addr in addrs {
+        let bucket = if addr.is_ipv6() { &mut v6 } else { &mut v4 };
+        if !bucket.contains(&addr) {
+            bucket.push(addr);
+        }
+    }
+    let mut ordered = Vec::with_capacity(v6.len() + v4.len());
+    let mut i = 0;
+    while i < v6.len() || i < v4.len() {
+        if let Some(addr) = v6.get(i) {
+            ordered.push(*addr);
+        }
+        if let Some(addr) = v4.get(i) {
+            ordered.push(*addr);
+        }
+        i += 1;
+    }
+    ordered
+}
+
+/// Connect to the first candidate address that answers, racing with the
+/// Happy Eyeballs stagger: attempt 0 starts immediately; attempt *n* starts
+/// `HAPPY_EYEBALLS_DELAY_MS` after attempt *n-1* if nothing has succeeded —
+/// or immediately if attempt *n-1* failed fast. Interface binding and
+/// `SO_MARK` are applied per attempt via [`bind_connect`].
+pub async fn dial_raced(
+    addrs: Vec<SocketAddr>,
+    interface: Option<InterfaceAddrs>,
+    mark: Option<u32>,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let ordered = eyeball_order(addrs);
+    if ordered.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no addresses to dial",
+        ));
+    }
+    use futures::StreamExt;
+    /// Abort-on-drop owner for the dial attempts: dropping the raced dial
+    /// (e.g. on a timeout/cancel outside) aborts every pending task and
+    /// releases its sockets instead of letting detached tasks run on.
+    struct DialTasks {
+        abort_handles: Vec<tokio::task::AbortHandle>,
+    }
+    impl Drop for DialTasks {
+        fn drop(&mut self) {
+            for abort in &self.abort_handles {
+                abort.abort();
+            }
+        }
+    }
+    let mut guard = DialTasks {
+        abort_handles: Vec::new(),
+    };
+    let mut pending = futures::stream::FuturesUnordered::new();
+    macro_rules! spawn_next {
+        ($idx:expr) => {{
+            let handle = tokio::spawn(bind_connect(ordered[$idx], interface, mark));
+            guard.abort_handles.push(handle.abort_handle());
+            pending.push(handle);
+        }};
+    }
+    let mut next_idx;
+    let mut last_error: Option<std::io::Error> = None;
+    spawn_next!(0);
+    next_idx = 1;
+    loop {
+        let stagger: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+            if next_idx < ordered.len() {
+                Box::pin(tokio::time::sleep(std::time::Duration::from_millis(
+                    HAPPY_EYEBALLS_DELAY_MS,
+                )))
+            } else {
+                Box::pin(futures::future::pending::<()>())
+            };
+        tokio::select! {
+            result = pending.next() => {
+                match result {
+                    Some(Ok(Ok(stream))) => {
+                        return Ok(stream);
+                    }
+                    Some(Ok(Err(e))) => {
+                        last_error = Some(e);
+                        // Fail fast: start the next attempt immediately
+                        // instead of waiting out the stagger.
+                        if next_idx < ordered.len() {
+                            spawn_next!(next_idx);
+                            next_idx += 1;
+                        } else if pending.is_empty() {
+                            return Err(last_error.unwrap_or_else(|| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::ConnectionRefused,
+                                    "all addresses failed",
+                                )
+                            }));
+                        }
+                    }
+                    Some(Err(_)) => {
+                        // Task panicked/cancelled: treat like a failure.
+                        last_error = Some(std::io::Error::other("dial task failed"));
+                        if next_idx < ordered.len() {
+                            spawn_next!(next_idx);
+                            next_idx += 1;
+                        } else if pending.is_empty() {
+                            return Err(last_error.unwrap());
+                        }
+                    }
+                    None => {
+                        return Err(last_error.unwrap_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::ConnectionRefused,
+                                "all addresses failed",
+                            )
+                        }));
+                    }
+                }
+            }
+            _ = stagger => {
+                if next_idx < ordered.len() {
+                    spawn_next!(next_idx);
+                    next_idx += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Keep only the candidate addresses whose family the pinned interface can
+/// reach (it has an address of that family). Hostname lookups resolve both
+/// families even when the pinned interface only carries one.
+fn filter_to_interface_families(
+    candidates: Vec<SocketAddr>,
+    interface: Option<InterfaceAddrs>,
+) -> Vec<SocketAddr> {
+    let Some(iface_addrs) = interface else {
+        return candidates;
+    };
+    candidates
+        .into_iter()
+        .filter(|addr| iface_addrs.pick(addr.is_ipv4()).is_some())
+        .collect()
+}
+
+/// Dial `host_or_ip` on `port`: an IP literal goes straight to
+/// [`bind_connect`]; a hostname is resolved and raced Happy-Eyeballs style
+/// via [`dial_raced`], filtered to the pinned interface's families. Used by
+/// the proxy checks so domain targets get dual-stack racing instead of the
+/// OS's single-address answer.
+pub async fn dial(
+    host_or_ip: &str,
+    port: u16,
+    interface: Option<InterfaceAddrs>,
+    mark: Option<u32>,
+) -> std::io::Result<tokio::net::TcpStream> {
+    if let Ok(ip) = host_or_ip.parse::<IpAddr>() {
+        return bind_connect(SocketAddr::new(ip, port), interface, mark).await;
+    }
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host_or_ip, port)).await?.collect();
+    let addrs = filter_to_interface_families(addrs, interface);
+    dial_raced(addrs, interface, mark).await
+}
+
 /// Connect to `addr`, optionally binding the local address of the pinned
 /// interface first so the connection egresses through that interface.
+/// When `mark` is `Some`, `SO_MARK` is applied to the socket before
+/// `connect` so the connection egresses through the fwmark-selected
+/// routing table (e.g. to keep probes out of a TUN: Linux/Android only).
 pub async fn bind_connect(
     addr: SocketAddr,
     interface: Option<InterfaceAddrs>,
+    mark: Option<u32>,
 ) -> std::io::Result<tokio::net::TcpStream> {
-    let Some(local) = interface.and_then(|addrs| addrs.pick(addr.is_ipv4())) else {
+    let local = interface.and_then(|addrs| addrs.pick(addr.is_ipv4()));
+    if local.is_none() && mark.is_none() {
         return tokio::net::TcpStream::connect(addr).await;
-    };
-    let socket = if local.is_ipv4() {
+    }
+    let socket = if addr.is_ipv4() {
         tokio::net::TcpSocket::new_v4()?
     } else {
         tokio::net::TcpSocket::new_v6()?
     };
-    socket.bind(SocketAddr::new(local, 0))?;
+    if let Some(local) = local {
+        socket.bind(SocketAddr::new(local, 0))?;
+    }
+    if let Some(mark) = mark {
+        set_socket_mark(&socket, mark)?;
+    }
     socket.connect(addr).await
 }
 
@@ -450,5 +714,133 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("not found"));
         assert!(message.contains(&loopback_name()));
+    }
+
+    // --- RED: item 5 — SO_MARK parsing + bind_connect marks ---
+    #[test]
+    fn parse_mark_value_accepts_decimal_and_hex() {
+        use super::parse_mark_value;
+        assert_eq!(parse_mark_value("106").unwrap(), 106);
+        assert_eq!(parse_mark_value("0x106").unwrap(), 262);
+        assert_eq!(parse_mark_value("0X1f").unwrap(), 31);
+        assert_eq!(parse_mark_value(" 262 ").unwrap(), 262);
+    }
+
+    #[test]
+    fn parse_mark_value_rejects_zero_garbage_and_overflow() {
+        use super::parse_mark_value;
+        assert!(parse_mark_value("0").is_err());
+        assert!(parse_mark_value("0x0").is_err());
+        assert!(parse_mark_value("").is_err());
+        assert!(parse_mark_value("not-a-mark").is_err());
+        assert!(parse_mark_value("-1").is_err());
+        assert!(parse_mark_value("4294967296").is_err());
+        assert!(parse_mark_value("0x100000000").is_err());
+    }
+
+    /// `bind_connect` with a mark degrades gracefully where `SO_MARK` is
+    /// unsupported or unprivileged instead of panicking.
+    #[tokio::test]
+    async fn bind_connect_with_mark_fails_cleanly_on_unsupported_platform() {
+        let addr: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+        if cfg!(target_os = "linux") || cfg!(target_os = "android") {
+            // Linux: setting SO_MARK needs CAP_NET_ADMIN in some kernels;
+            // only assert the call returns (either path is acceptable if the
+            // mark is really applied — the important bit is it doesn't panic).
+            let _ = super::bind_connect(addr, None, Some(106)).await;
+        } else {
+            let err = super::bind_connect(addr, None, Some(106))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("SO_MARK"),
+                "unsupported platform must name SO_MARK: {err}"
+            );
+        }
+    }
+
+    // --- RED: item 7 — Happy Eyeballs raced dial ---
+    #[test]
+    fn filter_to_interface_families_drops_unreachable_family() {
+        use super::filter_to_interface_families;
+        let v4a: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let v6a: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let v4_only = InterfaceAddrs {
+            ipv4: Some("192.168.1.5".parse().unwrap()),
+            ipv6: None,
+        };
+        assert_eq!(
+            filter_to_interface_families(vec![v4a, v6a], Some(v4_only)),
+            vec![v4a]
+        );
+        assert_eq!(
+            filter_to_interface_families(vec![v4a, v6a], None),
+            vec![v4a, v6a]
+        );
+    }
+
+    #[test]
+    fn eyeball_order_prefers_ipv6_first_and_interleaves_families() {
+        use super::eyeball_order;
+        let v4a: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let v4b: SocketAddr = "198.51.100.1:443".parse().unwrap();
+        let v6a: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let v6b: SocketAddr = "[2001:db8::2]:443".parse().unwrap();
+        // Dual-stack input: v6 first, then v4, then next v6, then next v4.
+        assert_eq!(
+            eyeball_order(vec![v4a, v6a, v4b, v6b]),
+            vec![v6a, v4a, v6b, v4b]
+        );
+        // Single family keeps its order.
+        assert_eq!(eyeball_order(vec![v4a, v4b]), vec![v4a, v4b]);
+        assert_eq!(eyeball_order(vec![v6b, v6a]), vec![v6b, v6a]);
+        assert_eq!(eyeball_order(vec![]), Vec::<SocketAddr>::new());
+    }
+
+    #[tokio::test]
+    async fn dial_raced_reaches_a_listener_and_fails_closed_on_no_addrs() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let addrs = vec![
+            // Closed port first: fast failure must fall through to the listener.
+            SocketAddr::new("127.0.0.2".parse().unwrap(), 9),
+            SocketAddr::new("127.0.0.1".parse().unwrap(), port),
+        ];
+        let stream = super::dial_raced(addrs.clone(), None, None)
+            .await
+            .expect("dial must fail over to the loopback listener");
+        assert_eq!(stream.peer_addr().unwrap().port(), port);
+        drop(stream);
+        drop(listener);
+
+        assert!(super::dial_raced(vec![], None, None).await.is_err());
+    }
+
+    /// `dial` reaches a loopback listener via both IP literals and hostnames.
+    #[tokio::test]
+    async fn dial_accepts_hostnames_and_ip_literals() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let by_ip = super::dial("127.0.0.1", port, None, None)
+            .await
+            .expect("IP-literal dial");
+        assert_eq!(by_ip.peer_addr().unwrap().port(), port);
+        drop(by_ip);
+        // Hostname path: resolve independently and, when IPv4 loopback is
+        // present, require the raced dial to reach our v4-only listener.
+        let resolved: Vec<std::net::IpAddr> = tokio::net::lookup_host(("localhost", port))
+            .await
+            .expect("localhost must resolve")
+            .map(|addr| addr.ip())
+            .collect();
+        let v4_loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        if resolved.contains(&v4_loopback) {
+            let by_name = super::dial("localhost", port, None, None)
+                .await
+                .expect("hostname dial must reach the v4 listener");
+            assert_eq!(by_name.peer_addr().unwrap().port(), port);
+            drop(by_name);
+        }
+        drop(listener);
     }
 }
