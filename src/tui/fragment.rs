@@ -67,11 +67,15 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
 
 /// Profile selection screen: the editable target IP, the toggleable preset
 /// list plus custom-JSON row, the context panel, and start/back buttons.
-/// Physical height of a wrapped row at `width` columns (minimum 1).
+/// Physical height of a wrapped row at `width` columns (minimum 1). Uses
+/// `Paragraph`'s own wrapping so the estimate matches what the selector
+/// actually renders (word boundaries can make lines shorter than a plain
+/// character-ceiling estimate).
 fn wrapped_row_height(row: &Line, width: u16) -> usize {
-    let row_width = row.width().max(1);
-    let width = usize::from(width.max(1));
-    row_width.div_ceil(width)
+    Paragraph::new(row.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width.max(1))
+        .max(1)
 }
 
 /// Line offset where row `row_index` starts (sum of heights of all rows
@@ -93,7 +97,11 @@ fn render_select(app: &mut App, frame: &mut Frame, area: Rect) {
     let inner = block.inner(chunks[0]);
     frame.render_widget(block, chunks[0]);
 
-    let visible = inner.height.saturating_sub(1) as usize;
+    // Effective visible window: the Paragraph is `inner.height - 1` lines
+    // tall (one line of offset), but the Start/Back buttons are drawn over
+    // the bottom two interior lines of the panel, so only that many minus
+    // two lines can actually be seen by the user.
+    let visible = inner.height.saturating_sub(3) as usize;
     // +1 for the IP row, +1 for the custom-JSON row.
     let total = TLS_FRAGMENT_PRESETS.len() + 2;
     app.fragment_cursor = app.fragment_cursor.min(total.saturating_sub(1));
@@ -227,14 +235,47 @@ fn render_select(app: &mut App, frame: &mut Frame, area: Rect) {
         .copied()
         .unwrap_or(1)
         .max(1);
-    // Keep the whole cursor row inside the visible window: scroll down
-    // until its last line fits, or up to its first line when above.
+    let custom_row = TLS_FRAGMENT_PRESETS.len() + 1;
+    let editing_cursor = (app.fragment_cursor == 0 && app.fragment_ip_editing)
+        || (app.fragment_cursor == custom_row && app.fragment_custom_editing);
     let mut scroll = app.scroll.min(max_scroll);
-    if cursor_start < scroll {
-        scroll = cursor_start;
-    }
-    if cursor_start + cursor_height > scroll + visible {
-        scroll = cursor_start + cursor_height - visible;
+    if cursor_height > visible {
+        // The cursor row is taller than the viewport, so the whole row
+        // cannot fit. Showing its end would drop the selection marker and
+        // a caret near the start. Instead show the row start when browsing,
+        // or the caret when editing (keeping the start too when the caret
+        // is near it, so marker and caret stay together).
+        if visible == 0 {
+            scroll = cursor_start;
+        } else if editing_cursor {
+            // Prefix widths mirror the row spans above: marker + label
+            // (IP row) or marker + checkbox + label (custom row).
+            let prefix_width = if app.fragment_cursor == 0 { 13 } else { 25 };
+            let (before, _) = app
+                .edit_buffer
+                .split_at(app.edit_caret.min(app.edit_buffer.len()));
+            let width = usize::from(inner.width.max(1));
+            let caret_column = prefix_width + before.chars().count();
+            let caret_line = cursor_start + caret_column / width.max(1);
+            if caret_line < scroll || caret_line >= scroll + visible {
+                if caret_line < cursor_start + visible {
+                    scroll = cursor_start;
+                } else {
+                    scroll = caret_line + 1 - visible;
+                }
+            }
+        } else if cursor_start < scroll || cursor_start >= scroll + visible {
+            scroll = cursor_start;
+        }
+    } else {
+        // Keep the whole cursor row inside the visible window: scroll down
+        // until its last line fits, or up to its first line when above.
+        if cursor_start < scroll {
+            scroll = cursor_start;
+        }
+        if cursor_start + cursor_height > scroll + visible {
+            scroll = cursor_start + cursor_height - visible;
+        }
     }
     app.scroll = scroll.min(max_scroll);
     // Pass every row to Paragraph and scroll by physical lines so partially

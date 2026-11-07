@@ -2481,6 +2481,57 @@ fn fragment_select_keeps_custom_row_visible_at_narrow_height() {
 }
 
 #[test]
+fn fragment_select_tall_custom_row_shows_marker_when_caret_near_start() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.screen = Screen::FragmentSelect;
+    app.fragment_ip = "104.16.124.96".to_string();
+    app.config.host = "www.cloudflare.com".to_string();
+    // A JSON value far taller than the 60x16 viewport: the row cannot fit
+    // whole, so scrolling to its end would push the selection marker and a
+    // caret near the start off screen.
+    app.edit_buffer = "x".repeat(500);
+    app.edit_caret = 0;
+    app.fragment_custom_editing = true;
+    app.fragment_cursor = crate::proxy::TLS_FRAGMENT_PRESETS.len() + 1;
+    let rendered = rendered(&mut app, 60, 16);
+    assert!(
+        lines_containing(&rendered, 60, "Custom (paste JSON)") >= 1,
+        "Tall custom row marker must stay visible while editing, buffer:\n{rendered}"
+    );
+    assert!(
+        lines_containing(&rendered, 60, "_") >= 1,
+        "Caret near the start of a tall custom row must stay visible, buffer:\n{rendered}"
+    );
+}
+
+#[test]
+fn fragment_select_tall_custom_row_shows_caret_when_caret_at_end() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.screen = Screen::FragmentSelect;
+    app.fragment_ip = "104.16.124.96".to_string();
+    app.config.host = "www.cloudflare.com".to_string();
+    // Caret at the very end of a tall value: scrolling to the row start
+    // would leave the caret off screen, so editing must follow the caret.
+    app.edit_buffer = format!("{}ENDMARK", "x".repeat(500));
+    app.edit_caret = app.edit_buffer.len();
+    app.fragment_custom_editing = true;
+    app.fragment_cursor = crate::proxy::TLS_FRAGMENT_PRESETS.len() + 1;
+    let rendered = rendered(&mut app, 60, 16);
+    assert!(
+        lines_containing(&rendered, 60, "_") >= 1,
+        "Caret at the end of a tall custom row must stay visible, buffer:\n{rendered}"
+    );
+}
+
+#[test]
 fn header_keeps_last_export_visible_at_narrow_width() {
     let mut app = App::new(
         AppConfig::default(),
