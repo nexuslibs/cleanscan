@@ -1024,9 +1024,18 @@ pub(crate) fn parse_colo(body: &str) -> Option<String> {
 /// The header value is `<ray-id>-<IATA code>` (e.g. `8a1f2b3c4d5e-FRA`); the
 /// code after the last dash is the colo. Scanning every line is harmless: the
 /// header appears once, before the blank line, and a body line would only
-/// exist in a response that happens to echo the header back.
+/// exist in a response that happens to echo the header back. Only a
+/// newline-terminated line counts: incremental reads can split the header
+/// (e.g. `...-fra` followed by `1`), so a trailing fragment without its
+/// line ending must not be reported (or cached) as a colo.
 pub(crate) fn parse_cf_ray_colo(response: &str) -> Option<String> {
-    for line in response.lines() {
+    // `str::lines()` treats an unterminated trailing fragment as a full
+    // line; use newline-inclusive chunks to require a complete header line.
+    for chunk in response.split_inclusive('\n') {
+        if !chunk.ends_with('\n') {
+            break;
+        }
+        let line = chunk.trim_end_matches(['\r', '\n']);
         let mut parts = line.splitn(2, ':');
         let Some(name) = parts.next() else { continue };
         if !name.trim().eq_ignore_ascii_case("cf-ray") {
@@ -3857,6 +3866,32 @@ mod tests {
         assert_eq!(parse_cf_ray_colo("CF-Ray: noDash\r\n\r\n"), None);
         assert_eq!(parse_cf_ray_colo("no cf-ray header\r\n\r\n"), None);
         assert_eq!(parse_cf_ray_colo("CF-Ray:\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn parse_cf_ray_colo_requires_complete_header_line() {
+        // Split reads: a header fragment without its line ending is incomplete
+        // and must not be reported (or cached) even when it looks valid.
+        assert_eq!(
+            parse_cf_ray_colo("HTTP/1.1 200 OK\r\nCF-Ray: abc-fra"),
+            None
+        );
+        // CRLF split before the LF is also incomplete.
+        assert_eq!(
+            parse_cf_ray_colo("HTTP/1.1 200 OK\r\nCF-Ray: abc-fra\r"),
+            None
+        );
+        // The complete line is reported.
+        assert_eq!(
+            parse_cf_ray_colo("HTTP/1.1 200 OK\r\nCF-Ray: abc-fra\r\n"),
+            Some("FRA".to_string())
+        );
+        // A later byte that invalidates the prefix wins: caching the valid
+        // prefix `abc-fra` must not survive it growing to `abc-fra1`.
+        assert_eq!(
+            parse_cf_ray_colo("HTTP/1.1 200 OK\r\nCF-Ray: abc-fra1\r\n"),
+            None
+        );
     }
 
     #[test]
