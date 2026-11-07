@@ -239,7 +239,7 @@ fn f_opens_diagnostics_for_the_first_failed_target() {
 
     assert!(app.show_failures);
     assert!(app.show_result_details);
-    assert_eq!(app.detail_tab, 1);
+    assert_eq!(app.detail_tab, 2);
     assert_eq!(app.result_cursor, 1);
 }
 
@@ -263,7 +263,7 @@ fn f_opens_a_failed_target_outside_the_normal_top_limit() {
     app.handle_key(KeyCode::Char('f'), KeyModifiers::NONE);
 
     assert!(app.show_result_details);
-    assert_eq!(app.detail_tab, 1);
+    assert_eq!(app.detail_tab, 2);
     assert_eq!(app.sorted_results()[app.result_cursor].ip, "192.0.2.1");
 }
 
@@ -337,7 +337,7 @@ fn worker_failure_remains_available_from_f() {
     app.handle_key(KeyCode::Char('f'), KeyModifiers::NONE);
 
     assert!(app.show_result_details);
-    assert_eq!(app.detail_tab, 1);
+    assert_eq!(app.detail_tab, 2);
 }
 
 #[test]
@@ -966,6 +966,16 @@ fn wizard_review_enter_uses_the_focused_control() {
     app.wizard_step = WizardStep::Review;
     app.focus_index = 3;
     app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        !app.pending_start,
+        "empty host must go to settings instead of starting a scan"
+    );
+
+    // With a host set, Enter starts the scan as before.
+    app.config.host = "www.cloudflare.com".to_string();
+    app.wizard_step = WizardStep::Review;
+    app.focus_index = 3;
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
     assert!(app.pending_start);
 
     app.pending_start = false;
@@ -1382,26 +1392,26 @@ fn live_targets_attention_filter_sort_search_and_navigation_are_independent() {
     app.handle_key(KeyCode::Home, KeyModifiers::NONE);
     assert_eq!(app.target_cursor, 0);
 
-    app.handle_key(KeyCode::Char('f'), KeyModifiers::NONE);
+    app.handle_key(KeyCode::Char('F'), KeyModifiers::NONE);
     assert_eq!(app.target_filter, TargetFilter::Active);
     assert_eq!(app.visible_target_ips().len(), 2);
-    app.handle_key(KeyCode::Char('s'), KeyModifiers::NONE);
+    app.handle_key(KeyCode::Char('S'), KeyModifiers::NONE);
     assert_eq!(app.target_sort, TargetSort::ActivityAge);
-    app.handle_key(KeyCode::Char('s'), KeyModifiers::NONE);
+    app.handle_key(KeyCode::Char('S'), KeyModifiers::NONE);
     assert_eq!(app.target_sort, TargetSort::Stage);
-    app.handle_key(KeyCode::Char('s'), KeyModifiers::NONE);
+    app.handle_key(KeyCode::Char('S'), KeyModifiers::NONE);
     assert_eq!(app.target_sort, TargetSort::Ip);
-    app.handle_key(KeyCode::Char('s'), KeyModifiers::NONE);
+    app.handle_key(KeyCode::Char('S'), KeyModifiers::NONE);
     assert_eq!(app.target_sort, TargetSort::Attention);
 
-    app.handle_key(KeyCode::Char('f'), KeyModifiers::NONE);
+    app.handle_key(KeyCode::Char('F'), KeyModifiers::NONE);
     assert_eq!(app.target_filter, TargetFilter::Problems);
     assert_eq!(app.visible_target_ips(), vec!["192.0.2.3"]);
     app.selected_targets.insert("192.0.2.4".to_string());
-    app.handle_key(KeyCode::Char('f'), KeyModifiers::NONE);
+    app.handle_key(KeyCode::Char('F'), KeyModifiers::NONE);
     assert_eq!(app.target_filter, TargetFilter::Selected);
     assert_eq!(app.visible_target_ips(), vec!["192.0.2.4"]);
-    app.handle_key(KeyCode::Char('f'), KeyModifiers::NONE);
+    app.handle_key(KeyCode::Char('F'), KeyModifiers::NONE);
     assert_eq!(app.target_filter, TargetFilter::All);
 
     app.open_command_palette();
@@ -1714,6 +1724,31 @@ fn micro_dashboard_keeps_scrolling_and_details_available() {
     draw(&mut app, 40, 12);
     assert!(app.scroll > 0);
     assert!(app.result_details_overlay.inner_area().is_some());
+}
+
+/// An 80x24 terminal still keeps footer controls reachable.
+#[test]
+fn smallest_terminal_80x24_keeps_footer_controls() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(5);
+    for index in 0..5 {
+        app.add_result(result(&format!("192.0.2.{}", index + 1), 0, 0.04));
+    }
+    // 80x24 is the smallest dashboard size in the suite before 60x20;
+    // the micro/compact footer must keep the safety controls visible.
+    // Buttons render "Quit (q)" / "Stop + keep (x)" while hint chips are
+    // truncated under width pressure, so match case-insensitively.
+    let output = rendered(&mut app, 80, 24).to_lowercase();
+    for needle in ["quit", "view", "stop"] {
+        assert!(
+            output.contains(needle),
+            "footer safety hint {needle:?} missing at 80x24"
+        );
+    }
 }
 
 #[test]
@@ -2157,15 +2192,16 @@ fn fragment_tester_prefills_ip_and_validates_manual_entry() {
         crate::proxy::TLS_FRAGMENT_PRESETS.len()
     );
 
-    // Enter on the IP row starts editing; an invalid IP is rejected.
+    // Enter on the IP row starts editing; a value that is neither a valid
+    // IP nor a plausible hostname is rejected.
     app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
     assert!(app.fragment_ip_editing);
-    app.edit_buffer = "not-an-ip".to_string();
+    app.edit_buffer = "not an ip".to_string();
     app.edit_caret = app.edit_buffer.len();
     app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
     assert!(
         app.fragment_ip_editing,
-        "invalid IP must keep the editor open"
+        "invalid target must keep the editor open"
     );
 
     app.edit_buffer = "104.16.124.96".to_string();
@@ -2360,6 +2396,232 @@ fn capital_g_opens_manual_fragment_selection() {
 }
 
 #[test]
+fn fragment_tester_custom_json_edits_and_validates_only_when_used() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.screen = Screen::FragmentSelect;
+    app.fragment_ip = "104.16.124.96".to_string();
+    app.config.host = "www.cloudflare.com".to_string();
+    app.fragment_enabled = vec![false; crate::proxy::TLS_FRAGMENT_PRESETS.len()];
+    // Custom row is last: IP row 0 + presets + custom.
+    let custom_row = crate::proxy::TLS_FRAGMENT_PRESETS.len() + 1;
+    app.fragment_cursor = custom_row;
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        app.fragment_custom_editing,
+        "Enter on custom row must open editor"
+    );
+    // Invalid JSON keeps editor open (validate on use).
+    app.edit_buffer = "not json".to_string();
+    app.edit_caret = app.edit_buffer.len();
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        app.fragment_custom_editing,
+        "invalid JSON must keep editor open"
+    );
+    // Valid freedom JSON commits and enables custom.
+    let json = r#"{"packets":"tlshello","length":"50-80","interval":"2-5"}"#;
+    app.edit_buffer = json.to_string();
+    app.edit_caret = app.edit_buffer.len();
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(!app.fragment_custom_editing);
+    assert!(app.fragment_custom_enabled);
+    assert_eq!(app.fragment_custom_json, json);
+    // Start must be allowed with only custom enabled.
+    app.activate_button(super::ButtonAction::FragmentStart);
+    assert!(app.pending_fragment_start);
+}
+
+#[test]
+fn fragment_tester_custom_finalmask_json_commits() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.screen = Screen::FragmentSelect;
+    let custom_row = crate::proxy::TLS_FRAGMENT_PRESETS.len() + 1;
+    app.fragment_cursor = custom_row;
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+    let json = r#"{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":["0","104","1"],"delays":["0"],"maxSplit":"0"}}]}"#;
+    app.edit_buffer = json.to_string();
+    app.edit_caret = app.edit_buffer.len();
+    app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(!app.fragment_custom_editing);
+    assert!(app.fragment_custom_enabled);
+    assert_eq!(app.fragment_custom_json, json);
+}
+
+#[test]
+fn fragment_select_keeps_custom_row_visible_at_narrow_height() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.screen = Screen::FragmentSelect;
+    app.fragment_ip = "104.16.124.96".to_string();
+    app.config.host = "www.cloudflare.com".to_string();
+    app.fragment_custom_json =
+        r#"{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":["0","104","1"],"delays":["0"],"maxSplit":"0"}}]}"#
+            .to_string();
+    app.fragment_custom_enabled = true;
+    // Cursor on the Custom row; at narrow widths preset rows wrap to
+    // multiple physical lines, so line-based scrolling must keep the row
+    // (with its selection marker) on screen.
+    app.fragment_cursor = crate::proxy::TLS_FRAGMENT_PRESETS.len() + 1;
+    let rendered = rendered(&mut app, 60, 16);
+    assert!(
+        lines_containing(&rendered, 60, "Custom (paste JSON)") >= 1,
+        "Custom row must be visible at 60x16, buffer:\n{rendered}"
+    );
+}
+
+#[test]
+fn fragment_select_tall_custom_row_shows_marker_when_caret_near_start() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.screen = Screen::FragmentSelect;
+    app.fragment_ip = "104.16.124.96".to_string();
+    app.config.host = "www.cloudflare.com".to_string();
+    // A JSON value far taller than the 60x16 viewport: the row cannot fit
+    // whole, so scrolling to its end would push the selection marker and a
+    // caret near the start off screen.
+    app.edit_buffer = "x".repeat(500);
+    app.edit_caret = 0;
+    app.fragment_custom_editing = true;
+    app.fragment_cursor = crate::proxy::TLS_FRAGMENT_PRESETS.len() + 1;
+    let rendered = rendered(&mut app, 60, 16);
+    assert!(
+        lines_containing(&rendered, 60, "Custom (paste JSON)") >= 1,
+        "Tall custom row marker must stay visible while editing, buffer:\n{rendered}"
+    );
+    assert!(
+        lines_containing(&rendered, 60, "_") >= 1,
+        "Caret near the start of a tall custom row must stay visible, buffer:\n{rendered}"
+    );
+}
+
+#[test]
+fn fragment_select_tall_custom_row_shows_caret_when_caret_at_end() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.screen = Screen::FragmentSelect;
+    app.fragment_ip = "104.16.124.96".to_string();
+    app.config.host = "www.cloudflare.com".to_string();
+    // Caret at the very end of a tall value: scrolling to the row start
+    // would leave the caret off screen, so editing must follow the caret.
+    app.edit_buffer = format!("{}ENDMARK", "x".repeat(500));
+    app.edit_caret = app.edit_buffer.len();
+    app.fragment_custom_editing = true;
+    app.fragment_cursor = crate::proxy::TLS_FRAGMENT_PRESETS.len() + 1;
+    let rendered = rendered(&mut app, 60, 16);
+    assert!(
+        lines_containing(&rendered, 60, "_") >= 1,
+        "Caret at the end of a tall custom row must stay visible, buffer:\n{rendered}"
+    );
+}
+
+#[test]
+fn header_keeps_last_export_visible_at_narrow_width() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(1);
+    app.config.host = "a.very.long.cdn-edge.example-very-long-name.com".to_string();
+    app.config.path = "/a/very/long/probe/path/cdn-cgi/trace".to_string();
+    app.last_export = Some("results.tsv".to_string());
+    let rendered = rendered(&mut app, 72, 20);
+    assert!(
+        lines_containing(&rendered, 72, "Last export") >= 1,
+        "Last export receipt must stay visible at 72 wide, buffer:\n{rendered}"
+    );
+}
+
+#[test]
+fn header_keeps_last_export_visible_at_status_boundary() {
+    // At 74 wide, a DONE status (7 cols) would push a comparison receipt
+    // (50 cols) just over budget with the badge; the receipt must win.
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(1);
+    app.scan_complete = true;
+    app.scan_lifecycle = ScanLifecycle::Completed;
+    app.config.host = "a.very.long.cdn-edge.example-very-long-name.com".to_string();
+    app.config.path = "/a/very/long/probe/path/cdn-cgi/trace".to_string();
+    app.last_export = Some("cleanscan_comparison_1234567890.json".to_string());
+    let rendered = rendered(&mut app, 74, 20);
+    assert!(
+        lines_containing(&rendered, 74, "Last export") >= 1,
+        "Last export receipt must stay visible at 74 wide with DONE status, buffer:\n{rendered}"
+    );
+}
+
+#[test]
+fn header_without_receipt_keeps_segment_that_fits_alone() {
+    // Without a Last export receipt, earlier segments are no longer
+    // dropped just to reserve space for the final segment: a Host that
+    // fits on its own must stay, even if the final Elapsed segment
+    // then has to elide.
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(1);
+    app.scan_complete = true;
+    app.scan_lifecycle = ScanLifecycle::Completed;
+    app.config.host = "example.test".to_string();
+    app.last_export = None;
+    let rendered = rendered(&mut app, 60, 20);
+    assert!(
+        lines_containing(&rendered, 60, "example.test") >= 1,
+        "Host segment that fits alone must stay without a receipt, buffer:\n{rendered}"
+    );
+}
+
+#[test]
+fn dashboard_below_80_uses_micro_footer_without_clipped_labels() {
+    // The compact footer's fixed widths sum to 80, so below that the
+    // micro footer must be used rather than clipping button labels.
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(1);
+    app.scan_complete = true;
+    app.scan_lifecycle = ScanLifecycle::Completed;
+    let rendered = rendered(&mut app, 75, 20);
+    for label in [
+        "Export (e)",
+        "Speed test (t)",
+        "Fragments (g)",
+        "Customize (w)",
+    ] {
+        assert_eq!(
+            lines_containing(&rendered, 75, &label.chars().take(8).collect::<String>()),
+            lines_containing(&rendered, 75, label),
+            "compact label {label} must not appear clipped at 75 wide, buffer:\n{rendered}"
+        );
+    }
+}
+
+#[test]
 fn d_retest_collects_degraded_and_failed_targets() {
     let mut app = App::new(
         AppConfig::default(),
@@ -2483,7 +2745,9 @@ fn tls_fragment_editor_renders_preset_checklist() {
     assert_eq!(app.fragment_preset_draft, 0);
     assert_eq!(app.fragment_preset_cursor, 0);
 
-    let output = rendered(&mut app, 160, 40);
+    // Taller terminal: every fragment preset row plus the custom-JSON entry
+    // must fit the settings viewport without scrolling.
+    let output = rendered(&mut app, 160, 52);
     assert!(
         output.contains("Off (control)"),
         "the off row must be listed"
@@ -2694,5 +2958,80 @@ fn mouse_tap_selects_or_commits_the_clicked_fragment_row() {
         app.fragment_preset_draft,
         crate::proxy::TLS_FRAGMENT_PRESETS.len(),
         "tap on the custom row should open the raw-JSON editor"
+    );
+}
+
+/// Collapsing settings shows only core fields plus the host warning.
+#[test]
+fn settings_collapse_shows_only_core_fields_and_host_warning() {
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.wizard_step = WizardStep::Settings;
+    // Default: advanced hidden, Host empty -> core 5 + inline warning.
+    assert!(!app.show_advanced_settings);
+    assert!(app.config.host.is_empty());
+
+    let output = rendered(&mut app, 120, 40);
+    for core in [
+        "Host",
+        "HTTPS ports",
+        "Sample per CIDR",
+        "Probes",
+        "Starting workers",
+    ] {
+        assert!(
+            output.contains(core),
+            "core field {core} missing when collapsed"
+        );
+    }
+    assert!(
+        output.contains("Host required"),
+        "inline Host warning must render under Host when empty"
+    );
+    assert!(
+        output.contains("ADVANCED SETTINGS"),
+        "collapsed placeholder must render"
+    );
+    for advanced in [
+        "Expected statuses",
+        "Warmup probe",
+        "TLS fragment (xray)",
+        "Stability weight",
+        "Download path",
+    ] {
+        assert!(
+            !output.contains(advanced),
+            "advanced field {advanced} visible while collapsed"
+        );
+    }
+
+    // Expanded: every field visible, warning still present while empty.
+    // Tall terminal so the 39-field list fits without scrolling.
+    app.show_advanced_settings = true;
+    let output = rendered(&mut app, 160, 80);
+    for advanced in [
+        "Expected statuses",
+        "Warmup probe",
+        "TLS fragment (xray)",
+        "Stability weight",
+        "Download path",
+    ] {
+        assert!(
+            output.contains(advanced),
+            "advanced {advanced} missing when expanded"
+        );
+    }
+    assert!(!output.contains("ADVANCED SETTINGS  (press x to show)"));
+    assert!(output.contains("Host required"));
+
+    // Once Host is set, the warning disappears in both modes.
+    app.config.host = "app.example.com".to_string();
+    let output = rendered(&mut app, 120, 40);
+    assert!(
+        !output.contains("Host required"),
+        "Host warning must clear once a host is set"
     );
 }

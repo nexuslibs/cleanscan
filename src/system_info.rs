@@ -33,11 +33,14 @@ pub fn lookup_sync(enabled: bool) -> SystemNetworkInfo {
     runtime.block_on(lookup())
 }
 
+/// Query ipwho.is for the egress IP/ASN/ISP; any failure degrades to
+/// [`SystemNetworkInfo::default`] so scan startup never blocks on metadata.
 async fn lookup() -> SystemNetworkInfo {
     let client = match crate::proxy::apply_rustls_backend(
         reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(3)),
+        crate::proxy::TlsFingerprint::Default,
     )
     .build()
     {

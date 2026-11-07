@@ -252,15 +252,67 @@ pub fn no_color() -> bool {
 }
 
 /// Color a latency value (in milliseconds) so good/ok/bad are visually distinct.
+/// Under NO_COLOR the fg collapses to Reset, so warn/bad add BOLD/REVERSED
+/// to keep the three bands distinguishable by weight alone.
 pub fn latency_style(ms: f64) -> Style {
     if ms < LATENCY_GOOD_MS {
         good_style()
     } else if ms < LATENCY_WARN_MS {
-        warn_style()
+        let style = warn_style();
+        if no_color() {
+            style.add_modifier(Modifier::BOLD)
+        } else {
+            style
+        }
     } else {
-        bad_style()
+        let style = bad_style();
+        if no_color() {
+            style.add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            style
+        }
     }
 }
 
 pub const LATENCY_GOOD_MS: f64 = 80.0;
 pub const LATENCY_WARN_MS: f64 = 200.0;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Latency thresholds are 80/200 ms and ordered good < warn.
+    #[test]
+    fn latency_thresholds_are_named_and_ordered() {
+        const { assert!(LATENCY_GOOD_MS == 80.0 && LATENCY_WARN_MS == 200.0) };
+        const { assert!(LATENCY_GOOD_MS < LATENCY_WARN_MS) };
+    }
+
+    #[test]
+    fn palettes_are_internally_distinct() {
+        let truecolor = Palette::truecolor();
+        assert_ne!(truecolor.success, truecolor.warn);
+        assert_ne!(truecolor.warn, truecolor.danger);
+        assert_ne!(truecolor.success, truecolor.danger);
+        let ansi16 = Palette::ansi16();
+        assert_ne!(ansi16.success, ansi16.warn);
+        assert_ne!(ansi16.warn, ansi16.danger);
+        // NO_COLOR palette collapses to Reset; distinction must come from
+        // modifiers/glyphs (REVERSED selection, BOLD best, BOLD/REVERSED
+        // latency bands), never from colour alone.
+        let none = Palette::none();
+        assert_eq!(none.success, Color::Reset);
+        assert_eq!(none.warn, Color::Reset);
+        assert_eq!(none.danger, Color::Reset);
+    }
+
+    #[test]
+    fn latency_styles_use_three_distinct_tokens() {
+        let good = latency_style(10.0);
+        let warn = latency_style(100.0);
+        let bad = latency_style(500.0);
+        assert_ne!(good, warn);
+        assert_ne!(warn, bad);
+        assert_ne!(good, bad);
+    }
+}

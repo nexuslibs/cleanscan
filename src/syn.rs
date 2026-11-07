@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Result};
 use ipnet::IpNet;
 use pcap::{Active, Capture, Device, Error, Linktype};
-use rand::Rng;
+use rand::RngExt;
 
 use crate::discovery::{
     enumerated_address_count, send_progress, AddressEnumerator, ProgressSender, SourceEntry,
@@ -375,11 +375,11 @@ fn prepare_capture(interface: Option<&str>) -> Result<(Capture<Active>, LinkInfo
 /// RFC 1071 one's-complement Internet checksum.
 fn ip_checksum(data: &[u8]) -> u16 {
     let mut sum = 0u32;
-    let mut pairs = data.chunks_exact(2);
-    for pair in pairs.by_ref() {
-        sum += u16::from_be_bytes([pair[0], pair[1]]) as u32;
+    let (chunks, remainder) = data.as_chunks::<2>();
+    for pair in chunks {
+        sum += u16::from_be_bytes(*pair) as u32;
     }
-    if let Some(byte) = pairs.remainder().first() {
+    if let Some(byte) = remainder.first() {
         sum += (*byte as u32) << 8;
     }
     while sum >> 16 != 0 {
@@ -559,7 +559,7 @@ pub fn syn_sweep(
     let reply_wait = Duration::from_millis(params.reply_wait_ms.max(100));
     let retransmits = params.retransmits.min(MAX_RETRANSMITS);
     let window_ips = (WINDOW_PAIRS / ports.len()).max(1);
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut open: BTreeSet<String> = BTreeSet::new();
     let mut attempted: u64 = 0;
 
@@ -582,12 +582,12 @@ pub fn syn_sweep(
             break;
         }
         let pairs_total = window.len() * ports.len();
-        let base: u16 = rng.gen_range(1024..=(65536 - pairs_total) as u16);
+        let base: u16 = rng.random_range(1024..=(65536 - pairs_total) as u16);
         let pairs: Vec<(Ipv4Addr, u16, u16, u32)> = window
             .iter()
             .enumerate()
             .flat_map(|(index, ip)| {
-                let seq = rng.gen::<u32>();
+                let seq = rng.random();
                 ports.iter().enumerate().map(move |(port_index, port)| {
                     (
                         *ip,
@@ -608,7 +608,7 @@ pub fn syn_sweep(
                 true,
             )
             .map_err(pcap_err);
-        let mut ip_id = rng.gen::<u16>();
+        let mut ip_id = rng.random();
         for _pass in 0..=retransmits {
             if cancel.load(Ordering::Relaxed) {
                 break;

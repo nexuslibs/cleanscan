@@ -8,7 +8,7 @@ use crate::tui::{
 };
 use ratatui::{
     layout::{Constraint, Direction, Flex, Layout, Rect},
-    style::Style,
+    style::{Modifier, Style},
     symbols::Marker,
     text::{Line, Span},
     widgets::{
@@ -114,7 +114,9 @@ fn render_dashboard(app: &mut App, frame: &mut Frame, area: Rect, compact: bool)
         render_scan_tabs(app, frame, chunks[2]);
     }
     render_scan_view(app, frame, chunks[3], compact);
-    if area.width < 72 {
+    // The compact footer's fixed widths sum to 80; below that it clips
+    // labels, so use the micro footer until the compact layout can fit.
+    if area.width < 80 {
         render_micro_footer(app, frame, chunks[4]);
     } else if compact {
         render_compact_footer(app, frame, chunks[4]);
@@ -366,6 +368,8 @@ fn failure_summary_line(
     Line::from(spans)
 }
 
+/// Compact results table for short terminals: only rank/IP/P95/status columns,
+/// with the cursor clamped so the selected row stays visible while scrolling.
 fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
     const COMPACT_COLUMNS: [(Option<usize>, &str, Constraint); 4] = [
         (Some(0), "#", Constraint::Length(5)),
@@ -387,7 +391,16 @@ fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
         .iter()
         .map(|(_, _, width)| *width)
         .collect::<Vec<_>>();
-    let block = widgets::panel_block("Results — Enter details", app.focus_index == 0);
+    let compact_base = "Results — Enter details";
+    let compact_title = if app.show_failures || !app.scan_complete {
+        compact_base.to_string()
+    } else {
+        match hidden_failure_count(app) {
+            0 => compact_base.to_string(),
+            hidden => format!("Results — {hidden} failed (f)"),
+        }
+    };
+    let block = widgets::panel_block(&compact_title, app.focus_index == 0);
     let inner = block.inner(area);
     let column_rects = Layout::horizontal(widths.clone())
         .flex(Flex::Start)
@@ -455,6 +468,7 @@ fn render_compact_table(app: &mut App, frame: &mut Frame, area: Rect) {
     frame.render_widget(table, area);
 }
 
+/// Compact footer buttons and status hints for the small-terminal layout.
 fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -463,12 +477,12 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     let buttons = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(15),
-            Constraint::Length(14),
-            Constraint::Length(14),
+            Constraint::Length(17),
+            Constraint::Length(17),
+            Constraint::Length(17),
             Constraint::Min(0),
-            Constraint::Length(15),
-            Constraint::Length(10),
+            Constraint::Length(17),
+            Constraint::Length(12),
         ])
         .split(layout[0]);
     let isolated_work = app.investigation.is_some() || app.pending_isolation.is_some();
@@ -644,13 +658,15 @@ fn render_compact_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     widgets::status_bar(frame, layout[1], hints, app.visible_message());
 }
 
+/// Overlay detail view for the selected result, cycling its detail tabs
+/// (latency map/overview, diagnostics, distribution, speed).
 fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect, elapsed: Duration) {
     let tabs = [
+        "Latency Map",
         "Overview",
         "Diagnostics",
         "Distribution",
         "Speed",
-        "Latency Map",
     ];
     app.detail_tab = app.detail_tab.min(tabs.len().saturating_sub(1));
 
@@ -707,7 +723,8 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect, elapsed: 
     );
 
     match app.detail_tab {
-        0 => {
+        0 => render_latency_map(frame, chunks[2], app),
+        1 => {
             let mut lines = vec![
                 Line::from(format!("Status      : {}", result_status(result))),
                 Line::from(format!(
@@ -777,7 +794,7 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect, elapsed: 
             ]);
             render_detail_text(frame, chunks[2], lines);
         }
-        1 => {
+        2 => {
             let mut lines = Vec::new();
             lines.push(Line::from(Span::styled(
                 "Failure breakdown",
@@ -808,8 +825,8 @@ fn render_result_details(app: &mut App, frame: &mut Frame, area: Rect, elapsed: 
             }
             render_detail_text(frame, chunks[2], lines);
         }
-        2 => render_latency_chart(frame, chunks[2], result),
-        3 => {
+        3 => render_latency_chart(frame, chunks[2], result),
+        4 => {
             let Some(speed_result) = app.speed_results.iter().find(|speed| speed.ip == result.ip)
             else {
                 render_detail_text(
@@ -974,8 +991,15 @@ fn format_speed_measurement(value: Option<&crate::speed::SpeedMeasurement>) -> S
         .unwrap_or_else(|| "—".to_string())
 }
 
+/// Dashboard header with the frozen-or-live elapsed clock, lifecycle status
+/// (with spinner while scanning), and egress IP/ASN/ISP segments.
 fn render_header(app: &App, frame: &mut Frame, area: Rect) {
-    let elapsed = app.start_time.elapsed();
+    // Freeze the clock once the scan reaches a terminal lifecycle; a ticking
+    // timer on a finished dashboard misreads as "still running".
+    let elapsed = app
+        .finished_at
+        .map(|t| t.saturating_duration_since(app.start_time))
+        .unwrap_or_else(|| app.start_time.elapsed());
     let elapsed_str = format!(
         "{:02}:{:02}",
         elapsed.as_secs() / 60,
@@ -1008,18 +1032,31 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
         status.to_string()
     };
 
+    let host_segment = if app.config.host.is_empty() {
+        widgets::HeaderSegment {
+            label: "Host".to_string(),
+            value: "— REQUIRED".to_string(),
+            style: theme::warn_style().add_modifier(Modifier::BOLD),
+        }
+    } else {
+        widgets::HeaderSegment::new("Host", app.config.host.clone())
+    };
+    let mut segments = vec![
+        host_segment,
+        widgets::HeaderSegment::new("Path", app.config.path.clone()),
+        widgets::HeaderSegment::new("IP", app.system_network.public_ip_display()),
+        widgets::HeaderSegment::new("ASN", app.system_network.asn_display()),
+        widgets::HeaderSegment::new("ISP", app.system_network.isp_display()),
+        widgets::HeaderSegment::new("Elapsed", elapsed_str),
+    ];
+    if let Some(name) = app.last_export.as_deref() {
+        segments.push(widgets::HeaderSegment::new("Last export", name.to_string()));
+    }
     widgets::app_header(
         frame,
         area,
         Some((&status_text, theme::status_style(status))),
-        &[
-            widgets::HeaderSegment::new("Host", app.config.host.clone()),
-            widgets::HeaderSegment::new("Path", app.config.path.clone()),
-            widgets::HeaderSegment::new("IP", app.system_network.public_ip_display()),
-            widgets::HeaderSegment::new("ASN", app.system_network.asn_display()),
-            widgets::HeaderSegment::new("ISP", app.system_network.isp_display()),
-            widgets::HeaderSegment::new("Elapsed", elapsed_str),
-        ],
+        &segments,
     );
 }
 
@@ -1064,6 +1101,8 @@ fn unique_ip_counts(app: &App) -> (usize, usize, usize, usize) {
     (app.scan_started_ips.len(), succeeded, failed, waiting)
 }
 
+/// Statistics panel for an in-flight scan: probe/latency/loss aggregates,
+/// delegating to the decision panel once the scan has completed.
 fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
     if app.scan_complete && app.scan_lifecycle == ScanLifecycle::Completed {
         render_decision_panel(app, frame, area);
@@ -1247,36 +1286,10 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
             Span::raw(format!("{:.1}ms", median_latency * 1000.0)),
         ]),
     ];
-    let block_p2 = widgets::subtle_panel_block("Latency & Throughput");
+    let block_p2 = widgets::subtle_panel_block("Latency");
     let p2_inner = block_p2.inner(col_chunks[1]);
     frame.render_widget(block_p2, col_chunks[1]);
-    let p2_rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(p2_inner);
-    frame.render_widget(Paragraph::new(latency_lines), p2_rows[0]);
-
-    // Throughput sparkline (probes/sec), most recent samples fill the width.
-    let spark_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(9), Constraint::Min(1)])
-        .split(p2_rows[1]);
-    frame.render_widget(
-        Paragraph::new(Span::styled("Thrput/s:", theme::title_style())),
-        spark_cols[0],
-    );
-    let spark_width = spark_cols[1].width as usize;
-    let samples: &[u64] = if app.throughput.len() > spark_width {
-        &app.throughput[app.throughput.len() - spark_width..]
-    } else {
-        &app.throughput
-    };
-    frame.render_widget(
-        Sparkline::default()
-            .data(samples)
-            .style(theme::status_style("SCANNING")),
-        spark_cols[1],
-    );
+    frame.render_widget(Paragraph::new(latency_lines), p2_inner);
 
     // Panel 3: live outcome distribution and factual activity timing.
     if !app.scan_complete {
@@ -1405,6 +1418,8 @@ fn render_stats_panel(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(chart, col_chunks[2]);
 }
 
+/// Summary panel counting ready/degraded/failed results, the success rate,
+/// and the top candidate by score for a quick verdict at a glance.
 fn render_decision_panel(app: &App, frame: &mut Frame, area: Rect) {
     let ready = app
         .results
@@ -1434,22 +1449,32 @@ fn render_decision_panel(app: &App, frame: &mut Frame, area: Rect) {
         .filter(|result| result.ok > 0)
         .collect::<Vec<_>>();
     candidates.sort_by(|a, b| App::natural_cmp(a, b));
-    let mut lines = vec![Line::from(vec![
-        Span::styled(format!("READY {ready}  "), theme::good_style()),
-        Span::styled(format!("DEGRADED {degraded}  "), theme::warn_style()),
-        Span::styled(format!("FAILED {failed}  "), theme::bad_style()),
-        Span::raw(format!("{rate:.1}% probe success")),
-    ])];
+    let empty_engine = ready + degraded + failed == 0;
+    let mut lines = vec![if empty_engine {
+        Line::from(Span::styled(
+            "No probe results — no target completed any probe yet.",
+            theme::warn_style(),
+        ))
+    } else {
+        Line::from(vec![
+            Span::styled(format!("READY {ready}  "), theme::good_style()),
+            Span::styled(format!("DEGRADED {degraded}  "), theme::warn_style()),
+            Span::styled(format!("FAILED {failed}  "), theme::bad_style()),
+            Span::raw(format!("{rate:.1}% probe success")),
+        ])
+    }];
     if let Some(result) = candidates.first() {
-        lines.push(Line::from(format!(
-            "Recommended: {} • {} • p95 {} • jitter {} • loss {:.1}% • confidence {}",
-            result.ip,
-            result_status(result),
-            fmt_ms(result.p95),
-            fmt_ms(result.jitter),
-            result.packet_loss * 100.0,
-            result_confidence(result)
-        )));
+        lines.push(Line::from(vec![
+            Span::styled(format!("★ RECOMMENDED {} ", result.ip), theme::best_style()),
+            Span::raw(format!(
+                "{} • p95 {} • jitter {} • loss {:.1}% • confidence {}",
+                result_status(result),
+                fmt_ms(result.p95),
+                fmt_ms(result.jitter),
+                result.packet_loss * 100.0,
+                result_confidence(result)
+            )),
+        ]));
         let backups = candidates
             .iter()
             .skip(1)
@@ -1459,6 +1484,11 @@ fn render_decision_panel(app: &App, frame: &mut Frame, area: Rect) {
         if !backups.is_empty() {
             lines.push(Line::from(format!("Backups: {}", backups.join(" • "))));
         }
+    } else if app.results.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No results — see Run Log (o) for the failure diagnostics, or retry with more probes.",
+            theme::warn_style(),
+        )));
     } else {
         lines.push(Line::from(Span::styled(
             "No successful targets — press f to inspect failures",
@@ -1528,11 +1558,43 @@ fn port_detail_text(r: &ProbeResult) -> String {
     parts.join(" · ")
 }
 
+/// Full results table for the scanning dashboard, with focus highlighting,
+/// the failure filter, and the post-completion scan recap band on tall
+/// terminals.
 fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
     // The table border reads as "focused" only when keyboard focus is actually
     // on the table (index 0); Tab-ing to a footer button releases it.
     let focused = app.focus_index == 0;
-    let block = widgets::panel_block("Results", focused);
+
+    // Completed scan + sparse table: cap the panel to its content and spend
+    // the freed rows on a quiet "Scan recap" band instead of padding the box
+    // with dead lines. Compact layouts skip this entirely. (Counts are usize:
+    // narrowing to u16 before comparing would wrap large result counts.)
+    const EXTRA_HEIGHT: usize = 5; // title row + spread + aggregates + invocation + bottom rule
+    let content_rows = app.sorted_results().len().min(app.config.top).max(1);
+    let needed = 2 + 1 + content_rows; // borders + header row + body
+    let spare = usize::from(area.height).saturating_sub(needed);
+    let mut area = area;
+    let extras_area = if app.scan_complete && spare >= EXTRA_HEIGHT && area.width >= 96 {
+        // `needed` and `spare` fit the terminal height here because
+        // `spare >= EXTRA_HEIGHT` bounds `needed` by `area.height`.
+        let needed = u16::try_from(needed).unwrap_or(u16::MAX);
+        let extras = Rect {
+            x: area.x,
+            y: area.y + needed,
+            width: area.width,
+            height: u16::try_from(spare.min(EXTRA_HEIGHT)).unwrap_or(EXTRA_HEIGHT as u16),
+        };
+        area = Rect {
+            height: needed,
+            ..area
+        };
+        Some(extras)
+    } else {
+        None
+    };
+
+    let block = widgets::panel_block(&results_block_title(app), focused);
     let inner = block.inner(area);
     let visible_columns = app.visible_result_columns();
     let visible_widths: Vec<Constraint> = visible_columns
@@ -1717,8 +1779,10 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
 
     // Empty state: no successful results to show yet.
     if display.is_empty() {
-        let msg = if app.scan_complete {
-            "No successful IPs found — try widening the CIDR selection or raising timeouts."
+        let msg = if app.scan_complete && app.results.is_empty() {
+            "No probe results — see the decision view and Run Log for failure diagnostics."
+        } else if app.scan_complete {
+            "No successful IPs found — press f to view failed targets, or raise timeouts."
         } else if app.results.is_empty() {
             "Preparing probes… no target has completed yet."
         } else {
@@ -1753,8 +1817,112 @@ fn render_table(app: &mut App, frame: &mut Frame, area: Rect) {
             &mut state,
         );
     }
+
+    if let Some(extras_area) = extras_area {
+        render_scan_recap(app, frame, extras_area);
+    }
 }
 
+/// Title of the results panel. When failed targets are hidden by default,
+/// append the count so the hidden work is announced instead of silently
+/// waiting for `f` to be discovered.
+/// Hidden (failed-but-filtered) count for the results title, honoring the
+/// active colo/country location filters the same way display rows do.
+fn hidden_failure_count(app: &App) -> usize {
+    app.results
+        .iter()
+        .filter(|r| r.ok == 0 && r.completed > 0)
+        .filter(|r| match &app.colo_filter {
+            Some(want) => r
+                .colo
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case(want)),
+            None => true,
+        })
+        .filter(|r| match &app.country_filter {
+            Some(want) => r
+                .country
+                .as_deref()
+                .is_some_and(|c| c.to_lowercase().contains(&want.to_lowercase())),
+            None => true,
+        })
+        .count()
+}
+
+/// Results block title, suffixing the hidden-failure count when failures are
+/// filtered out of a completed scan.
+fn results_block_title(app: &App) -> String {
+    if app.show_failures || !app.scan_complete {
+        return "Results".to_string();
+    }
+    let hidden = hidden_failure_count(app);
+    if hidden == 0 {
+        "Results".to_string()
+    } else {
+        format!("Results — {hidden} failed (f)")
+    }
+}
+
+/// Quiet post-completion summary rendered below the capped results table on
+/// tall, wide terminals: the latency spread of successful targets plus the
+/// exact invocation (probes / concurrency / seed) so the run is reproducible
+/// without opening the CLI-command overlay.
+fn render_scan_recap(app: &App, frame: &mut Frame, area: Rect) {
+    let block = widgets::subtle_panel_block("Scan recap");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let ok_results: Vec<&ProbeResult> = app.results.iter().filter(|r| r.ok > 0).collect();
+    let spread = if ok_results.is_empty() {
+        "spread: no successful targets — Run Log (o) has the diagnostics".to_string()
+    } else {
+        let mut buckets = [0usize; 4];
+        for result in &ok_results {
+            buckets[latency_bucket(result.avg * 1000.0).min(3)] += 1;
+        }
+        format!(
+            "spread: <80ms ×{}   80–200ms ×{}   200–250ms ×{}   ≥250ms ×{}",
+            buckets[0], buckets[1], buckets[2], buckets[3]
+        )
+    };
+    let elapsed = app
+        .finished_at
+        .map(|t| t.saturating_duration_since(app.start_time))
+        .unwrap_or_else(|| app.start_time.elapsed());
+    let recap = format!(
+        "{} probes • concurrency {} • seed {} • {}/{} targets responsive • finished in {}",
+        app.config.probes,
+        app.config.concurrency,
+        app.scan_seed,
+        ok_results.len(),
+        app.results.len(),
+        format_duration(elapsed),
+    );
+    let mut lines = vec![Line::from(Span::styled(spread, theme::title_style()))];
+    if !ok_results.is_empty() {
+        let mut avgs: Vec<f64> = ok_results.iter().map(|r| r.avg * 1000.0).collect();
+        avgs.sort_by(f64::total_cmp);
+        let median = if avgs.len() % 2 == 1 {
+            avgs[avgs.len() / 2]
+        } else {
+            f64::midpoint(avgs[avgs.len() / 2 - 1], avgs[avgs.len() / 2])
+        };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "fastest {:.1}ms • median {:.1}ms • slowest {:.1}ms",
+                avgs[0],
+                median,
+                avgs[avgs.len() - 1]
+            ),
+            theme::hint_style(),
+        )));
+    }
+    lines.push(Line::from(Span::styled(recap, theme::hint_style())));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Live-targets view listing in-flight targets with stage, age, and
+/// attention state, adapting columns to micro/compact/wide widths.
 fn render_live_targets(app: &mut App, frame: &mut Frame, area: Rect, compact: bool) {
     let micro = area.width < 72;
     let columns = if micro {
@@ -1967,11 +2135,30 @@ fn render_live_targets(app: &mut App, frame: &mut Frame, area: Rect, compact: bo
         } else {
             lines.push(Line::from("No target activity yet."));
         }
+        let inspector_rows =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(panes[1]);
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
                 .block(widgets::subtle_panel_block("Target inspector")),
-            panes[1],
+            inspector_rows[0],
+        );
+        // Throughput sparkline lives here as context for live work; it was
+        // demoted from the wide stats panel so the winning edge stays first.
+        let throughput_block = widgets::subtle_panel_block("Throughput/s");
+        let throughput_inner = throughput_block.inner(inspector_rows[1]);
+        frame.render_widget(throughput_block, inspector_rows[1]);
+        let spark_width = throughput_inner.width as usize;
+        let samples: &[u64] = if app.throughput.len() > spark_width.max(1) {
+            &app.throughput[app.throughput.len() - spark_width.max(1)..]
+        } else {
+            &app.throughput
+        };
+        frame.render_widget(
+            Sparkline::default()
+                .data(samples)
+                .style(theme::status_style("SCANNING")),
+            throughput_inner,
         );
     }
 }
@@ -2548,9 +2735,9 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_results_by_ip, failure_summary_line, latency_bucket, latency_summary, median,
-        port_cell_text, port_detail_text, recommendation_ip, selected_latency_index,
-        unique_ip_counts, FailureSummaryMode,
+        canonical_results_by_ip, failure_summary_line, hidden_failure_count, latency_bucket,
+        latency_summary, median, port_cell_text, port_detail_text, recommendation_ip,
+        results_block_title, selected_latency_index, unique_ip_counts, FailureSummaryMode,
     };
     use crate::config::AppConfig;
     use crate::scanner::{ProbeFailureCounts, ProbeResult};
@@ -2630,6 +2817,56 @@ mod tests {
             health_ok: true,
             port_results: Vec::new(),
         }
+    }
+
+    #[test]
+    fn hidden_failure_count_ignores_waiting_and_successful_targets() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut failed = result("192.0.2.2", 1.0, &[]);
+        failed.ok = 0;
+        failed.completed = 4;
+        failed.fail = 4;
+        let mut waiting = result("192.0.2.3", 1.0, &[]);
+        waiting.ok = 0;
+        waiting.completed = 0; // not probed yet — not a failure
+        let succeeded = result("1.1.1.1", 1.0, &[0.1, 0.2]);
+        app.results = vec![failed, waiting, succeeded];
+        assert_eq!(hidden_failure_count(&app), 1);
+    }
+
+    #[test]
+    fn results_block_title_announces_hidden_failures() {
+        let mut app = App::new(
+            AppConfig::default(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut failed = result("192.0.2.2", 1.0, &[]);
+        failed.ok = 0;
+        failed.completed = 2;
+        failed.fail = 2;
+
+        // Not complete → no badge (the scan may still produce results).
+        app.scan_complete = false;
+        app.results = vec![failed.clone()];
+        assert_eq!(results_block_title(&app), "Results");
+
+        // Complete with hidden failures → badge (wide mode).
+        app.scan_complete = true;
+        assert_eq!(results_block_title(&app), "Results — 1 failed (f)");
+
+        // Once failures are shown, the badge disappears.
+        app.show_failures = true;
+        assert_eq!(results_block_title(&app), "Results");
+
+        // Complete with no hidden failures → plain title.
+        app.show_failures = false;
+        app.results = vec![result("1.1.1.1", 1.0, &[0.1])];
+        assert_eq!(results_block_title(&app), "Results");
     }
 
     #[test]

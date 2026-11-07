@@ -912,13 +912,22 @@ impl SettingField {
         Ok(())
     }
 
-    /// Ranking-quality tuning remains advanced; adaptive scan controls are
-    /// intentionally visible because they change core scan behavior.
-    pub fn is_advanced(self) -> bool {
+    /// Only the scan skeleton (Host, Ports, Sample, Probes, Concurrency)
+    /// remains on the first paint; every other parameter stays behind the
+    /// `x` advanced toggle so the first-run screen carries ≤ 5 fields.
+    pub fn is_core(self) -> bool {
         matches!(
             self,
-            SettingField::StabilityWeight | SettingField::LossWeight
+            SettingField::Host
+                | SettingField::Ports
+                | SettingField::SamplePerCidr
+                | SettingField::Probes
+                | SettingField::Concurrency
         )
+    }
+
+    pub fn is_advanced(self) -> bool {
+        !self.is_core()
     }
 
     pub fn is_toggle(self) -> bool {
@@ -1059,6 +1068,8 @@ fn selected_cidrs_and_workload(app: &App) -> (Vec<String>, crate::scanner::CidrW
     (selected_cidrs, workload)
 }
 
+/// Wizard step 1: the selectable CIDR range list with custom-range editing,
+/// the full-range sweep toggle, and the scan-parameters shortcut.
 fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
     // On tall terminals, lead with a compact brand banner.
     let body = if area.height >= 16 {
@@ -1068,8 +1079,8 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
             .split(area);
         let banner = Paragraph::new(vec![
             Line::from(Span::styled(
-                "C L E A N S C A N",
-                theme::header_style().add_modifier(Modifier::BOLD),
+                format!(" CLEANSCAN v{} ", env!("CARGO_PKG_VERSION")),
+                theme::header_style(),
             )),
             Line::from(Span::styled(
                 "Cloudflare edge latency & speed scanner",
@@ -1327,6 +1338,8 @@ fn render_ranges(app: &mut App, frame: &mut Frame, area: Rect) {
     frame.render_widget(input, chunks[1]);
 }
 
+/// Wizard step 2: the scan-parameter editor with the preset bar, the core
+/// plus (when expanded) advanced fields, and the interface picker.
 fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1484,18 +1497,19 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
     .collect();
     let mut field_idx = 0usize;
     for (header, count) in SettingField::GROUPS {
-        let group_start = field_idx;
-        let group_is_advanced = SettingField::ALL[group_start].is_advanced();
-        if group_is_advanced && !app.show_advanced_settings {
-            lines.push(Line::from(Span::styled(
-                " ADVANCED SETTINGS  (press x to show)",
-                theme::hint_style().add_modifier(Modifier::BOLD),
-            )));
-            row_map.push(None);
-            ports_row_map.push(None);
-            interface_row_map.push(None);
-            fragment_row_map.push(None);
-            field_idx += count;
+        let group_end = field_idx + count;
+        // A field is visible when advanced is shown, when it belongs to the
+        // core skeleton, or when it is the field under edit (so `start_edit`
+        // on a hidden field still renders its editor). Fully-hidden groups
+        // produce no header; the collapsed affordance is a single line after
+        // all groups (see below).
+        let has_visible = (field_idx..group_end).any(|i| {
+            app.show_advanced_settings
+                || !SettingField::ALL[i].is_advanced()
+                || app.edit_field == Some(i)
+        });
+        if !has_visible {
+            field_idx = group_end;
             continue;
         }
         lines.push(Line::from(Span::styled(
@@ -1509,6 +1523,10 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
         for _ in 0..count {
             let i = field_idx;
             let f = SettingField::ALL[i];
+            if !app.show_advanced_settings && f.is_advanced() && app.edit_field != Some(i) {
+                field_idx += 1;
+                continue;
+            }
             if editing_ports && i == ports_field_index {
                 // One row per port keeps the full list visible and tappable
                 // even on narrow (phone) terminals, where the inline form
@@ -1692,8 +1710,30 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
             ports_row_map.push(None);
             interface_row_map.push(None);
             fragment_row_map.push(None);
+            if f == SettingField::Host && app.config.host.is_empty() {
+                let warn_style = theme::warn_style().add_modifier(Modifier::BOLD);
+                lines.push(Line::from(Span::styled(
+                    "  ! Host required — set a host",
+                    warn_style,
+                )));
+                row_map.push(None);
+                ports_row_map.push(None);
+                interface_row_map.push(None);
+                fragment_row_map.push(None);
+            }
             field_idx += 1;
         }
+    }
+
+    if !app.show_advanced_settings {
+        lines.push(Line::from(Span::styled(
+            " ADVANCED SETTINGS  (press x to show)",
+            theme::hint_style().add_modifier(Modifier::BOLD),
+        )));
+        row_map.push(None);
+        ports_row_map.push(None);
+        interface_row_map.push(None);
+        fragment_row_map.push(None);
     }
 
     let items = lines.into_iter().map(ListItem::new).collect::<Vec<_>>();
@@ -1755,6 +1795,13 @@ fn render_settings(app: &mut App, frame: &mut Frame, area: Rect) {
 
     let mut desc_para_lines = desc_text;
     desc_para_lines.push(Line::from(current_field.description()));
+    if current_field == SettingField::Host && app.config.host.is_empty() {
+        desc_para_lines.push(Line::from(""));
+        desc_para_lines.push(Line::from(Span::styled(
+            "  ! Host required: no host configured — pass --host <domain> or set a host here",
+            theme::warn_style().add_modifier(Modifier::BOLD),
+        )));
+    }
     desc_para_lines.push(Line::from(""));
     desc_para_lines.push(Line::from(Span::styled(
         "Keyboard Shortcut:",
@@ -1856,6 +1903,8 @@ fn numeric_slider_bounds(field: SettingField) -> (f64, f64) {
     }
 }
 
+/// Wizard step 3: review of the selected ranges, workload estimate, target
+/// preview, and the launch/cancel actions.
 fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
     let (selected, workload) = selected_cidrs_and_workload(app);
     let sweep_mode = review_sweep_mode(app.config.discovery_driver);
@@ -1874,8 +1923,13 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
         &app.config,
         workload.total_ips,
     );
-    let (readiness_text, readiness_warn) =
-        review_readiness(sweep_mode, preview_ready, app.config.concurrency, total_ips);
+    let (readiness_text, readiness_warn) = review_readiness(
+        sweep_mode,
+        preview_ready,
+        app.config.concurrency,
+        total_ips,
+        app.config.host.is_empty(),
+    );
 
     // Ideal scan duration estimate
     let ideal_seconds =
@@ -1907,7 +1961,11 @@ fn render_review(app: &mut App, frame: &mut Frame, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::styled("Hostname  : ", theme::title_style()),
-            Span::raw(app.config.host.clone()),
+            if app.config.host.is_empty() {
+                Span::styled("— REQUIRED".to_string(), theme::warn_style())
+            } else {
+                Span::raw(app.config.host.clone())
+            },
         ]),
         Line::from(vec![
             Span::styled("Probe Path: ", theme::title_style()),
@@ -2115,8 +2173,11 @@ fn review_readiness(
     preview_ready: bool,
     concurrency: usize,
     total_ips: u128,
+    host_empty: bool,
 ) -> (&'static str, bool) {
-    if sweep_mode {
+    if host_empty {
+        ("Blocked: set a Host in Settings before starting", true)
+    } else if sweep_mode {
         (
             "Ready: sweep will find reachable ports, then probe them",
             concurrency > 500 || total_ips > 10_000,
@@ -2142,6 +2203,8 @@ fn ideal_scan_seconds(total_probes: u128, concurrency: usize, timeout_ms: u64) -
     (total_probes as f64 / concurrency.max(1) as f64) * (timeout_ms as f64 / 2000.0)
 }
 
+/// Footer buttons and hints for the wizard step, including the review-step
+/// CLI-command shortcut.
 fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -2194,7 +2257,9 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         WizardStep::Review => ButtonAction::Start,
         _ => ButtonAction::Next,
     };
+    let host_missing = app.wizard_step == WizardStep::Review && app.config.host.is_empty();
     let right_label = match app.wizard_step {
+        WizardStep::Review if host_missing => "Set Host in Settings",
         WizardStep::Review => "Start scan",
         _ => "Next",
     };
@@ -2204,7 +2269,9 @@ fn render_footer(app: &mut App, frame: &mut Frame, area: Rect) {
         } else {
             2
         };
-    let right_kind = if right_focused {
+    let right_kind = if host_missing {
+        ButtonKind::Secondary
+    } else if right_focused {
         ButtonKind::Primary
     } else {
         ButtonKind::Secondary
@@ -2849,7 +2916,17 @@ fn handle_review_key(app: &mut App, code: KeyCode) {
                 app.cursor = 0;
             }
             2 => app.copy_cli_command(),
+            // Start only when a host is set; an empty host follows the
+            // "Set Host in Settings" label into the Settings step.
+            3 if app.config.host.is_empty() => {
+                app.wizard_step = WizardStep::Settings;
+                app.cursor = 0;
+            }
             3 => app.pending_start = true,
+            _ if app.config.host.is_empty() => {
+                app.wizard_step = WizardStep::Settings;
+                app.cursor = 0;
+            }
             _ => app.pending_start = true,
         },
         KeyCode::Left | KeyCode::Esc => {
@@ -2921,7 +2998,11 @@ impl App {
         if visible == 0 {
             return;
         }
-        let row = settings_display_row(self.cursor);
+        let row = settings_display_row(
+            self.cursor,
+            self.show_advanced_settings,
+            self.config.host.is_empty(),
+        );
         if row < self.settings_scroll {
             self.settings_scroll = row;
         } else if row >= self.settings_scroll + visible {
@@ -2971,9 +3052,9 @@ impl App {
                 Some(FragmentProfile::Xray(spec)) => {
                     self.config.tls_fragment = Some(spec.clone());
                 }
-                Some(FragmentProfile::V2rayNg { .. }) => {
+                Some(FragmentProfile::V2rayNg { .. }) | Some(FragmentProfile::Aether(_)) => {
                     self.toast_warn(
-                        "Double-fragment profiles are tester-only; leaving TLS fragment unchanged",
+                        "Multi-stage/aether profiles are tester-only; leaving TLS fragment unchanged",
                     );
                     return;
                 }
@@ -3032,28 +3113,55 @@ impl App {
     }
 }
 
-fn settings_display_row(field_idx: usize) -> usize {
+/// Visible display row for a settings field, accounting for the group
+/// headers, the hidden advanced fields (when collapsed), and the optional
+/// host-warning row.
+fn settings_display_row(field_idx: usize, show_advanced: bool, host_warning: bool) -> usize {
     let mut row = 0;
     let mut first_field = 0;
     for (_, count) in SettingField::GROUPS {
-        row += 1;
-        if field_idx < first_field + count {
-            return row + field_idx - first_field;
+        let group_end = first_field + count;
+        let visible_in_group: usize = (first_field..group_end)
+            .filter(|&i| show_advanced || !SettingField::ALL[i].is_advanced())
+            .count();
+        if visible_in_group == 0 {
+            first_field = group_end;
+            continue;
         }
-        row += count;
-        first_field += count;
+        row += 1; // group header
+        if field_idx < group_end {
+            let visible_before: usize = (first_field..group_end)
+                .filter(|&i| {
+                    i < field_idx && (show_advanced || !SettingField::ALL[i].is_advanced())
+                })
+                .count();
+            let mut display = row + visible_before;
+            // The Host warning row sits immediately after Host (the first
+            // field of the first group). Fields in the same group after
+            // Host shift by one; later groups already count the warning
+            // row in the accumulated `row` below.
+            if host_warning && first_field == 0 && field_idx > 0 {
+                display += 1;
+            }
+            return display;
+        }
+        row += visible_in_group;
+        if host_warning && first_field == 0 {
+            row += 1; // Host warning row
+        }
+        first_field = group_end;
     }
     row.saturating_sub(1)
 }
 
-fn previous_visible_setting(index: usize, show_advanced: bool) -> usize {
+pub(crate) fn previous_visible_setting(index: usize, show_advanced: bool) -> usize {
     (0..index)
         .rev()
         .find(|candidate| show_advanced || !SettingField::ALL[*candidate].is_advanced())
         .unwrap_or(index)
 }
 
-fn next_visible_setting(index: usize, show_advanced: bool) -> usize {
+pub(crate) fn next_visible_setting(index: usize, show_advanced: bool) -> usize {
     ((index + 1)..SettingField::ALL.len())
         .find(|candidate| show_advanced || !SettingField::ALL[*candidate].is_advanced())
         .unwrap_or(index)
@@ -3169,15 +3277,31 @@ mod tests {
     #[test]
     fn advanced_settings_are_collapsed_but_navigation_stays_on_visible_fields() {
         let mut app = settings_app();
-        app.cursor = field_position(SettingField::Top); // last regular latency field
+        // Collapsed: only the 5-field core (Host, Ports, Sample, Probes,
+        // Concurrency) is reachable. Down from the last core field stays.
+        app.cursor = field_position(SettingField::Concurrency);
         handle_settings_key(&mut app, crossterm::event::KeyCode::Down);
-        assert_eq!(app.cursor, field_position(SettingField::EarlyStop)); // adaptive controls remain visible
+        assert_eq!(app.cursor, field_position(SettingField::Concurrency));
 
+        handle_settings_key(&mut app, crossterm::event::KeyCode::Up);
+        assert_eq!(app.cursor, field_position(SettingField::Probes));
+
+        // Ports -> Sample skips Path plus the whole Validation/Network run.
+        app.cursor = field_position(SettingField::Ports);
+        handle_settings_key(&mut app, crossterm::event::KeyCode::Down);
+        assert_eq!(app.cursor, field_position(SettingField::SamplePerCidr));
+
+        // Expanded: every field is reachable in ALL order.
         handle_settings_key(&mut app, crossterm::event::KeyCode::Char('x'));
+        app.cursor = field_position(SettingField::Concurrency);
+        handle_settings_key(&mut app, crossterm::event::KeyCode::Down);
+        assert_eq!(app.cursor, field_position(SettingField::TimeoutMs));
+
         app.cursor = field_position(SettingField::StabilityWeight);
         handle_settings_key(&mut app, crossterm::event::KeyCode::Down);
         assert_eq!(app.cursor, field_position(SettingField::LossWeight));
 
+        // Collapsing while on an advanced field resets the cursor to Host.
         handle_settings_key(&mut app, crossterm::event::KeyCode::Char('x'));
         assert_eq!(app.cursor, 0);
     }
@@ -3724,14 +3848,14 @@ mod tests {
             "syn enumerates the full range, not the sample cap"
         );
         assert_eq!(probes, ips * app.config.ports.len().max(1) as u128);
-        let (text, warn) = review_readiness(true, false, app.config.concurrency, ips);
+        let (text, warn) = review_readiness(true, false, app.config.concurrency, ips, false);
         assert_eq!(
             text,
             "Ready: sweep will find reachable ports, then probe them"
         );
         assert!(!warn);
 
-        let (text, warn) = review_readiness(true, false, app.config.concurrency, 65_534);
+        let (text, warn) = review_readiness(true, false, app.config.concurrency, 65_534, false);
         assert_eq!(
             text,
             "Ready: sweep will find reachable ports, then probe them"
@@ -3755,7 +3879,7 @@ mod tests {
             probes,
             ips * app.config.probes as u128 * app.config.ports.len().max(1) as u128
         );
-        let (text, warn) = review_readiness(false, true, app.config.concurrency, ips);
+        let (text, warn) = review_readiness(false, true, app.config.concurrency, ips, false);
         assert_eq!(text, "Ready: sampled targets are stable for this review");
         assert!(!warn);
     }
@@ -3806,6 +3930,9 @@ mod tests {
     fn arrows_traverse_numeric_settings_when_not_editing() {
         let mut app = settings_app();
         app.wizard_step = crate::tui::WizardStep::Settings;
+        // Advanced fields are hidden by default (the wizard now shows only
+        // the core skeleton); show them so Up/Down traverse Path as before.
+        app.show_advanced_settings = true;
         app.cursor = 1;
 
         handle_settings_key(&mut app, crossterm::event::KeyCode::Down);

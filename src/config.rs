@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::{fs, io::Write};
 
-use crate::proxy::FragmentSpec;
+use crate::proxy::{FragmentSpec, TlsFingerprint};
 
 pub const CLOUDFLARE_HTTPS_PORTS: &[u16] = &[443, 2053, 2083, 2087, 2096, 8443];
 
@@ -138,6 +138,26 @@ pub struct AppConfig {
     /// Interface for the raw SYN sweep; `None` picks the default device.
     #[serde(default)]
     pub interface: Option<String>,
+    /// Linux socket mark (`SO_MARK`) applied to outgoing TCP connections made
+    /// by cleanscan itself (connect sweep, `--proxy-url` protocol checks,
+    /// fragment tester) so they egress through the fwmark-selected routing
+    /// table — e.g. to keep probes out of a TUN. The reqwest-based latency
+    /// scanner probes cannot carry a mark (no connector hook); `--mark`
+    /// is Linux/Android only and needs `CAP_NET_ADMIN` there. `None`
+    /// disables it; a persisted `0` (or invalid value) resolves to `None`.
+    #[serde(default, deserialize_with = "deserialize_optional_mark")]
+    pub mark: Option<u32>,
+    /// TLS ClientHello fingerprint preset applied to TLS connections:
+    /// `Default` (rustls defaults) or `Chrome` (Chrome-like ALPN, cipher-suite
+    /// and key-exchange ordering). An invalid persisted value falls back to
+    /// `Default`.
+    #[serde(default, deserialize_with = "deserialize_optional_fingerprint")]
+    pub tls_fingerprint: TlsFingerprint,
+    /// ECH (Encrypted Client Hello) for the TLS-check path, fail-closed:
+    /// when on, connections refuse cleartext SNI if no ECH config can be
+    /// fetched or the build lacks an HPKE provider (`--features ech`).
+    #[serde(default)]
+    pub ech: bool,
     /// Xray-style TLS fragmentation (xray `freedom` fragment settings) applied
     /// to protocol checks (`--proxy-url`) and the TUI fragment tester.
     /// `None` disables fragmentation. An invalid persisted fragment falls back
@@ -241,6 +261,11 @@ pub struct AppConfig {
     pub selected_cidrs: Vec<String>,
     #[serde(skip)]
     pub selected_cidrs_persisted: bool,
+    /// Whether `concurrency` was present in the persisted config file (as
+    /// opposed to arriving via serde defaults). Runtime-only: the tiered
+    /// default in `main.rs` clamps only the *unconfigured* default.
+    #[serde(skip)]
+    pub concurrency_persisted: bool,
 }
 
 fn default_download_path() -> String {
@@ -349,6 +374,40 @@ where
     }
 }
 
+/// Tolerant deserializer for the persisted socket mark: missing, `0`, or
+/// invalid values resolve to `None` (no mark). The value is consumed fully
+/// (via `serde_json::Value`) before interpreting it, so a wrong-typed entry
+/// can never abort deserialization of the rest of the config.
+fn deserialize_optional_mark<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::Number(number) => match number.as_u64() {
+            Some(mark) if mark != 0 => u32::try_from(mark).ok(),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// Tolerant deserializer for the persisted TLS fingerprint: any unrecognized
+/// or wrong-typed value falls back to `TlsFingerprint::Default`. The value
+/// is consumed fully before interpreting it, so a wrong-typed entry can
+/// never abort deserialization of the rest of the config.
+fn deserialize_optional_fingerprint<'de, D>(deserializer: D) -> Result<TlsFingerprint, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use std::str::FromStr;
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::String(ref s) => TlsFingerprint::from_str(s).unwrap_or_default(),
+        _ => TlsFingerprint::Default,
+    })
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -365,6 +424,9 @@ impl Default for AppConfig {
             syn_rate: default_syn_rate(),
             syn_retransmits: default_syn_retransmits(),
             interface: None,
+            mark: None,
+            tls_fingerprint: TlsFingerprint::Default,
+            ech: false,
             tls_fragment: None,
             probes: 8,
             concurrency: 120,
@@ -404,6 +466,7 @@ impl Default for AppConfig {
                 .map(|s| s.to_string())
                 .collect(),
             selected_cidrs_persisted: false,
+            concurrency_persisted: false,
         }
     }
 }
@@ -457,9 +520,14 @@ pub fn load_config() -> AppConfig {
 fn parse_config(content: &str) -> Option<AppConfig> {
     let mut config = serde_json::from_str::<AppConfig>(content).ok()?;
     config.ports = validate_ports(&config.ports).unwrap_or_else(|_| default_ports());
-    config.selected_cidrs_persisted = serde_json::from_str::<serde_json::Value>(content)
-        .ok()
+    let persisted = serde_json::from_str::<serde_json::Value>(content).ok();
+    config.selected_cidrs_persisted = persisted
+        .as_ref()
         .and_then(|value| value.get("selected_cidrs").cloned())
+        .is_some();
+    config.concurrency_persisted = persisted
+        .as_ref()
+        .and_then(|value| value.get("concurrency").cloned())
         .is_some();
     Some(config)
 }
@@ -609,5 +677,87 @@ mod tests {
         )
         .unwrap();
         assert!(valid.tls_fragment.is_some());
+    }
+
+    // --- RED: items 5+6 — persisted mark + tls fingerprint ---
+    #[test]
+    fn persisted_mark_loads_and_bad_values_fall_back_to_none() {
+        let valid: AppConfig = parse_config(
+            r#"{"host":"example.test","path":"/","sample_per_cidr":1,"probes":1,"concurrency":1,"timeout_ms":1,"connect_timeout_ms":1,"top":1,"custom_cidrs":[],"mark":106}"#,
+        )
+        .unwrap();
+        assert_eq!(valid.mark, Some(106));
+
+        let missing: AppConfig = parse_config(
+            r#"{"host":"example.test","path":"/","sample_per_cidr":1,"probes":1,"concurrency":1,"timeout_ms":1,"connect_timeout_ms":1,"top":1,"custom_cidrs":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(missing.mark, None);
+
+        let zero: AppConfig = parse_config(
+            r#"{"host":"example.test","path":"/","sample_per_cidr":1,"probes":1,"concurrency":1,"timeout_ms":1,"connect_timeout_ms":1,"top":1,"custom_cidrs":[],"mark":0}"#,
+        )
+        .unwrap();
+        assert_eq!(zero.mark, None, "mark 0 means no mark");
+
+        let big: AppConfig = parse_config(
+            r#"{"host":"example.test","path":"/","sample_per_cidr":1,"probes":1,"concurrency":1,"timeout_ms":1,"connect_timeout_ms":1,"top":1,"custom_cidrs":[],"mark":-5}"#,
+        )
+        .unwrap();
+        assert_eq!(big.mark, None);
+    }
+
+    // --- Review: tolerant deserialize must not discard the whole config ---
+    #[test]
+    fn wrong_typed_mark_and_fingerprint_fall_back_without_losing_host() {
+        let config: AppConfig = parse_config(
+            r#"{"host":"example.test","path":"/","sample_per_cidr":1,"probes":1,"concurrency":1,"timeout_ms":1,"connect_timeout_ms":1,"top":1,"custom_cidrs":[],"mark":{"x":1},"tls_fingerprint":42,"selected_cidrs":["10.0.0.0/24"]}"#,
+        )
+        .unwrap();
+        assert_eq!(config.host, "example.test");
+        assert_eq!(config.mark, None);
+        assert_eq!(
+            config.tls_fingerprint,
+            crate::proxy::TlsFingerprint::Default
+        );
+        assert_eq!(config.selected_cidrs, vec!["10.0.0.0/24".to_string()]);
+    }
+
+    #[test]
+    fn persisted_tls_fingerprint_loads_chrome_and_defaults_on_garbage() {
+        use std::str::FromStr;
+        let chrome: AppConfig = parse_config(
+            r#"{"host":"example.test","path":"/","sample_per_cidr":1,"probes":1,"concurrency":1,"timeout_ms":1,"connect_timeout_ms":1,"top":1,"custom_cidrs":[],"tls_fingerprint":"chrome"}"#,
+        )
+        .unwrap();
+        assert_eq!(chrome.tls_fingerprint, crate::proxy::TlsFingerprint::Chrome);
+
+        let garbage: AppConfig = parse_config(
+            r#"{"host":"example.test","path":"/","sample_per_cidr":1,"probes":1,"concurrency":1,"timeout_ms":1,"connect_timeout_ms":1,"top":1,"custom_cidrs":[],"tls_fingerprint":"bogus"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            garbage.tls_fingerprint,
+            crate::proxy::TlsFingerprint::Default
+        );
+
+        let missing: AppConfig = parse_config(
+            r#"{"host":"example.test","path":"/","sample_per_cidr":1,"probes":1,"concurrency":1,"timeout_ms":1,"connect_timeout_ms":1,"top":1,"custom_cidrs":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            missing.tls_fingerprint,
+            crate::proxy::TlsFingerprint::Default
+        );
+
+        assert_eq!(
+            crate::proxy::TlsFingerprint::from_str("chrome").unwrap(),
+            crate::proxy::TlsFingerprint::Chrome
+        );
+        assert_eq!(
+            crate::proxy::TlsFingerprint::from_str("default").unwrap(),
+            crate::proxy::TlsFingerprint::Default
+        );
+        assert!(crate::proxy::TlsFingerprint::from_str("bogus").is_err());
     }
 }

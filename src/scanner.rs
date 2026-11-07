@@ -13,7 +13,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
 use ipnet::IpNet;
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, Rng, RngExt, SeedableRng};
 use reqwest::Client;
 use tokio::sync::Semaphore;
 
@@ -519,6 +519,9 @@ fn wilson_interval(successes: usize, total: usize, confidence: f64) -> (f64, f64
     ((centre - spread).max(0.0), (centre + spread).min(1.0))
 }
 
+/// Bootstrap confidence interval for a target's score: resample its latency
+/// observations (seeded deterministically by IP) and return the percentile
+/// bounds at the requested confidence.
 fn bootstrap_score_interval(state: &TargetState, confidence: f64) -> (f64, f64) {
     if state.samples.is_empty() {
         return (0.0, 0.0);
@@ -532,7 +535,7 @@ fn bootstrap_score_interval(state: &TargetState, confidence: f64) -> (f64, f64) 
     let mut scores = Vec::with_capacity(iterations);
     for _ in 0..iterations {
         let sample: Vec<f64> = (0..state.samples.len())
-            .map(|_| state.samples[rng.gen_range(0..state.samples.len())])
+            .map(|_| state.samples[rng.random_range(0..state.samples.len())])
             .collect();
         scores.push(score_from_samples(
             &sample,
@@ -549,6 +552,9 @@ fn bootstrap_score_interval(state: &TargetState, confidence: f64) -> (f64, f64) 
     (percentile(&scores, alpha), percentile(&scores, 1.0 - alpha))
 }
 
+/// Uniformly sample one host address inside `net`, excluding the network
+/// and broadcast addresses for IPv4 prefixes below /31 (which are never
+/// yielded by enumeration); returns `None` when the range is empty.
 fn random_ip_from_net(net: IpNet, rng: &mut impl Rng) -> Option<IpAddr> {
     match net {
         IpNet::V4(v4) => {
@@ -572,7 +578,7 @@ fn random_ip_from_net(net: IpNet, rng: &mut impl Rng) -> Option<IpAddr> {
                 return None;
             }
 
-            let n = rng.gen_range(start..=end);
+            let n = rng.random_range(start..=end);
             Some(IpAddr::V4(Ipv4Addr::from(n)))
         }
         IpNet::V6(v6) => {
@@ -587,9 +593,9 @@ fn random_ip_from_net(net: IpNet, rng: &mut impl Rng) -> Option<IpAddr> {
             };
 
             let offset = if size <= 2 {
-                rng.gen_range(0..size)
+                rng.random_range(0..size)
             } else {
-                rng.gen_range(1..(size - 1))
+                rng.random_range(1..(size - 1))
             };
 
             Some(IpAddr::V6(Ipv6Addr::from(network.saturating_add(offset))))
@@ -809,6 +815,9 @@ pub(crate) fn https_authority(host: &str, port: u16) -> String {
     }
 }
 
+/// Build the per-target reqwest client pinned to `ip` for `host`/`port`,
+/// honouring redirects, timeouts, the TLS fingerprint backend, and the
+/// pinned interface's source address when provided.
 fn client_for_ip(
     host: &str,
     ip: &str,
@@ -834,7 +843,7 @@ fn client_for_ip(
             builder = builder.local_address(local);
         }
     }
-    let client = crate::proxy::apply_rustls_backend(builder).build()?;
+    let client = crate::proxy::apply_rustls_backend(builder, args.tls_fingerprint).build()?;
 
     Ok(client)
 }
@@ -1007,6 +1016,42 @@ pub(crate) fn parse_colo(body: &str) -> Option<String> {
                 return Some(value.to_ascii_uppercase());
             }
         }
+    }
+    None
+}
+
+/// Extract the Cloudflare datacenter code from a `CF-Ray` response header.
+/// The header value is `<ray-id>-<IATA code>` (e.g. `8a1f2b3c4d5e-FRA`); the
+/// code after the last dash is the colo. Scanning every line is harmless: the
+/// header appears once, before the blank line, and a body line would only
+/// exist in a response that happens to echo the header back. Only a
+/// newline-terminated line counts: incremental reads can split the header
+/// (e.g. `...-fra` followed by `1`), so a trailing fragment without its
+/// line ending must not be reported (or cached) as a colo.
+pub(crate) fn parse_cf_ray_colo(response: &str) -> Option<String> {
+    // `str::lines()` treats an unterminated trailing fragment as a full
+    // line; use newline-inclusive chunks to require a complete header line.
+    for chunk in response.split_inclusive('\n') {
+        if !chunk.ends_with('\n') {
+            break;
+        }
+        let line = chunk.trim_end_matches(['\r', '\n']);
+        let mut parts = line.splitn(2, ':');
+        let Some(name) = parts.next() else { continue };
+        if !name.trim().eq_ignore_ascii_case("cf-ray") {
+            continue;
+        }
+        let value = parts.next()?;
+        // A real CF-Ray value is `<ray-id>-<IATA code>`; anything without a
+        // dash (e.g. a partial "abc") is not a colo.
+        if !value.contains('-') {
+            return None;
+        }
+        let code = value.rsplit('-').next().map(str::trim)?;
+        if code.len() == 3 && code.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+            return Some(code.to_ascii_uppercase());
+        }
+        return None;
     }
     None
 }
@@ -2119,6 +2164,14 @@ async fn run_scan_port(
                                 if state.colo.is_none() {
                                     state.colo = colo;
                                 }
+                                // Publish the now-warm target for measured
+                                // probes: the initial heap entries are consumed
+                                // and discarded while warmups are pending (a
+                                // target is not eligible until warmup_done), so
+                                // without this push a successful warmup leaves
+                                // the scheduler with no measured work and the
+                                // scan ends with zero probes executed.
+                                ready.push(index, state);
                             }
                             Err(diagnostic) => {
                                 failure_counts.record(&diagnostic);
@@ -3181,10 +3234,12 @@ pub async fn run_connect_discovery(
         args.connect_timeout_ms,
         args.concurrency,
         interface,
+        args.mark,
         cancel,
         progress,
     )
-    .await;
+    .await
+    .map_err(anyhow::Error::msg)?;
     Ok(discovered)
 }
 
@@ -3279,12 +3334,13 @@ mod tests {
     use super::{
         adaptive_progress_reason, bootstrap_score_interval, cidr_valid,
         collect_from_cidrs_with_seed, dedupe_port_results, https_authority, merge_port_results,
-        merge_profile_results, parse_colo, port_result, reconcile_worker_permits, record_best,
-        remaining_measured_work, resolve_host_for_ip, result_confidence, result_status,
-        scheduler_can_launch, score_from_samples, select_focus_cidrs, select_next_scan_index,
-        select_next_target, select_next_warmup, should_stop_early, validate_response,
-        wilson_interval, working_port_results, DiagnosticCategory, DiagnosticPhase,
-        ProbeDiagnostic, ProbeFailureCounts, ProbeResult, ReadyQueue, TargetState,
+        merge_profile_results, parse_cf_ray_colo, parse_colo, port_result,
+        reconcile_worker_permits, record_best, remaining_measured_work, resolve_host_for_ip,
+        result_confidence, result_status, scheduler_can_launch, score_from_samples,
+        select_focus_cidrs, select_next_scan_index, select_next_target, select_next_warmup,
+        should_stop_early, validate_response, wilson_interval, working_port_results,
+        DiagnosticCategory, DiagnosticPhase, ProbeDiagnostic, ProbeFailureCounts, ProbeResult,
+        ReadyQueue, TargetState,
     };
     use crate::adaptive::{Action, ApplyResult, Decision, SignalDirection};
     use crate::config::{AppConfig, HealthCheck};
@@ -3796,6 +3852,49 @@ mod tests {
     }
 
     #[test]
+    fn parse_cf_ray_colo_extracts_datacenter_code() {
+        let response =
+            "HTTP/1.1 200 OK\r\nServer: cloudflare\r\nCF-Ray: 8a1f2b3c4d5e-fra\r\n\r\nok";
+        assert_eq!(parse_cf_ray_colo(response), Some("FRA".to_string()));
+        // Case-insensitive header name.
+        let lower = "cf-ray: 8a1f2b3c4d5e-sjc\r\n\r\nok";
+        assert_eq!(parse_cf_ray_colo(lower), Some("SJC".to_string()));
+        // IATA codes are exactly three ASCII letters.
+        assert_eq!(parse_cf_ray_colo("CF-Ray: 8a1f2b3c4d5e-fra1\r\n\r\n"), None);
+        // No dash means no colo suffix (e.g. a partial "abc" value).
+        assert_eq!(parse_cf_ray_colo("CF-Ray: abc\r\n\r\n"), None);
+        assert_eq!(parse_cf_ray_colo("CF-Ray: noDash\r\n\r\n"), None);
+        assert_eq!(parse_cf_ray_colo("no cf-ray header\r\n\r\n"), None);
+        assert_eq!(parse_cf_ray_colo("CF-Ray:\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn parse_cf_ray_colo_requires_complete_header_line() {
+        // Split reads: a header fragment without its line ending is incomplete
+        // and must not be reported (or cached) even when it looks valid.
+        assert_eq!(
+            parse_cf_ray_colo("HTTP/1.1 200 OK\r\nCF-Ray: abc-fra"),
+            None
+        );
+        // CRLF split before the LF is also incomplete.
+        assert_eq!(
+            parse_cf_ray_colo("HTTP/1.1 200 OK\r\nCF-Ray: abc-fra\r"),
+            None
+        );
+        // The complete line is reported.
+        assert_eq!(
+            parse_cf_ray_colo("HTTP/1.1 200 OK\r\nCF-Ray: abc-fra\r\n"),
+            Some("FRA".to_string())
+        );
+        // A later byte that invalidates the prefix wins: caching the valid
+        // prefix `abc-fra` must not survive it growing to `abc-fra1`.
+        assert_eq!(
+            parse_cf_ray_colo("HTTP/1.1 200 OK\r\nCF-Ray: abc-fra1\r\n"),
+            None
+        );
+    }
+
+    #[test]
     fn warmup_done_reflects_config() {
         let enabled = AppConfig {
             warmup: true,
@@ -3811,6 +3910,45 @@ mod tests {
 
         assert!(!with_warmup.warmup_done);
         assert!(without_warmup.warmup_done);
+    }
+
+    #[test]
+    fn fresh_ready_heap_yields_nothing_before_warmup_done() {
+        // The scheduler seeds the ready heap at construction, but no entry is
+        // eligible for measured dispatch until warmup_done — every seeded
+        // entry is popped and discarded while warmups are pending. That is
+        // by design, but it means warmup success MUST republish the target.
+        let args = AppConfig {
+            warmup: true,
+            ..Default::default()
+        };
+        let mut states = vec![TargetState::new("192.0.2.1".to_string(), &args, 2, 443)];
+        let mut ready = ReadyQueue::new(&mut states, false, 1);
+        assert_eq!(ready.next(&mut states, 2), None);
+    }
+
+    #[test]
+    fn warmup_success_republishes_target_for_measured_probes() {
+        // Regression: a successful warmup previously never republished the
+        // target, so on reachable networks the scheduler saw an empty ready
+        // heap after the warmups completed and ended the scan with zero
+        // measured probes — zero results, an empty table, and Live Targets
+        // stuck on WARMUP. Mirrors the Ok arm of the warmup outcome path.
+        let args = AppConfig {
+            warmup: true,
+            ..Default::default()
+        };
+        let mut states = vec![TargetState::new("192.0.2.1".to_string(), &args, 2, 443)];
+        let mut ready = ReadyQueue::new(&mut states, false, 1);
+        assert_eq!(ready.next(&mut states, 2), None);
+
+        // State transition performed by the Warmup Ok arm.
+        states[0].warmup_done = true;
+        states[0].warmup_in_flight = false;
+        states[0].cold_ms = Some(1.0);
+        ready.push(0, &mut states[0]);
+
+        assert_eq!(ready.next(&mut states, 2), Some(0));
     }
 
     #[test]

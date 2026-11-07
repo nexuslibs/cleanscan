@@ -104,6 +104,15 @@ pub fn command_string(
             shell_quote(&fragment.xray_json()),
         );
     }
+    if let Some(mark) = config.mark {
+        kv(&mut parts, "--mark", mark);
+    }
+    if config.tls_fingerprint != crate::proxy::TlsFingerprint::Default {
+        kv(&mut parts, "--tls-fingerprint", config.tls_fingerprint);
+    }
+    if config.ech {
+        push(&mut parts, "--ech");
+    }
     kv(&mut parts, "--probes", config.probes);
     kv(&mut parts, "--concurrency", config.concurrency);
     kv(&mut parts, "--timeout-ms", config.timeout_ms);

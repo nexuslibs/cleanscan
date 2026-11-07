@@ -1,21 +1,23 @@
 # AGENTS.md
 
-Single Rust **binary** crate (`cargo test --lib` fails — there is no library target). Entrypoint is `src/main.rs`; the real work lives in `scanner.rs` (probe engine + warmup), `iface.rs` (network interface enumeration + source-address binding), `colo.rs` (embedded colo→country data), `config.rs`, `speed.rs`, and `src/tui/` (ratatui interface).
+Single Rust **binary** crate (`cargo test --lib` fails — there is no library target). Entrypoint is `src/main.rs` (clap `Args` + all `mod` declarations); the work lives in `scanner.rs` (probe engine + warmup), `discovery.rs` (connect sweep) / `syn.rs` (raw SYN sweep, `cfg(feature = "syn")`), `iface.rs` (interface enumeration + source-address binding), `proxy.rs` (TLS fragment + `--proxy-url` transport checks), `adaptive.rs`, `watch.rs`, `updater.rs` (self-update), `system_info.rs` (public-IP/ASN lookup), `colo.rs` (embedded colo→country data), `config.rs`, `speed.rs`, and `src/tui/` (ratatui interface; its tests live in `src/tui/tests.rs`).
 
 ## Developer commands
 
-Run in this order (mirrors CI, which fails the build on any step):
+Run in this order (mirrors CI `.github/workflows/ci.yml`, which fails the build on any step):
 
 ```bash
 cargo fmt --all -- --check      # must be clean
 cargo clippy --locked --all-targets -- -D warnings   # warnings are errors
 cargo build --locked
 cargo test --locked
+bash tests/install_detection.sh   # not run by cargo test; CI runs it after syn tests
 ```
 
 - `--locked` is used everywhere in CI — keep `Cargo.lock` committed and up to date.
 - Clippy uses `-D warnings`; unused fields/vars break the build, not just lint.
 - Run one test: `cargo test <test_name>` (substring match). `cargo test --lib` does **not** work in this bin crate.
+- `tests/install_detection.sh` dry-runs `install.sh` via `CLEANSCAN_TEST_OS/ARCH/TERMUX/PREFIX` + `CLEANSCAN_INSTALLER_DRY_RUN=1`, asserting the `target=`/`install_dir=` lines (musl vs Android/macos selection) and rejecting unsupported arches / Termux without `PREFIX`. There are no Rust integration tests outside the binary crate.
 
 ## Optional `syn` feature
 
@@ -28,7 +30,7 @@ cargo test --locked
   for the Linux and macOS release binaries. Android targets deliberately stay
   without the feature (no libpcap for Android).
 - Local verification: `cargo clippy --features syn --locked --all-targets -- -D warnings`
-  and `cargo test --features syn` (host builds need libpcap headers:
+  and `cargo test --features syn --locked` (host builds need libpcap headers:
   `libpcap-dev` on Debian/Ubuntu, `brew install libpcap` on macOS). At runtime
   the engine needs root (`euid 0`); its loopback end-to-end test skips itself
   when not root.
@@ -40,6 +42,7 @@ cargo test --locked
 
 ## Branch and commit enforcement
 
+- Agents creating or opening PRs MUST set the PR title to `type(scope): description` (`gh pr create --title "feat(proxy): …"`). Never use a bot mention such as `@coderabbitai`, or free-form text, as the PR title — put bot mentions only in PR comments/body.
 - `.github/workflows/conventional-commits.yml` validates PR titles, not branch
   names. Branch names therefore have no workflow-enforced prefix or pattern.
 - PR titles must match the workflow's Conventional Commit pattern:
@@ -47,10 +50,11 @@ cargo test --locked
   `feat`, `fix`, `perf`, `refactor`, `revert`, `style`, and `test`; scope and
   the `!` breaking-change marker are optional. Scope characters are limited to
   letters, numbers, `.`, `_`, `/`, and `-`.
-- Commit messages should use the same format so Release Please can classify
-  releases correctly. Examples: `feat(tui): add ASCII rendering`,
-  `fix(scanner): handle timeout`, `docs: clarify release workflow`, and
-  `feat!: change the export schema`.
+- Before reporting a PR as ready, verify its title matches that pattern (editing
+  the title re-triggers validation). Commit messages must use the same format so
+  Release Please can classify releases correctly. Examples: `feat(tui): add
+  ASCII rendering`, `fix(scanner): handle timeout`, `docs: clarify release
+  workflow`, and `feat!: change the export schema`.
 - Breaking changes may also use a `BREAKING CHANGE:` footer. The subject must
   be imperative, concise, and non-empty; free-form messages such as `update
   stuff` are invalid.
@@ -65,7 +69,7 @@ Releases are automated by Release Please and driven by **Conventional Commits**.
 
 ## Android (Termux) builds
 
-`*-linux-android` targets are built with the NDK (installed via Android Studio at `~/Library/Android/sdk/ndk/<version>`; CI installs `28.2.13676358` via `sdkmanager`). The `<triple>24-clang` wrappers serve as both CC and linker, plus `-Wl,-z,max-page-size=16384` for Android 15+ 16K-page devices. Termux installs (install.sh, updater.rs) prefer `*-linux-android` assets; the musl static-PIE builds serve non-Termux Linux. Android binaries link against Bionic and cannot run on non-Android hosts — verify them structurally (INTERP `/system/bin/linker64`, DYN, 16K LOAD alignment).
+`*-linux-android` targets are built with NDK `28.2.13676358` under `$ANDROID_HOME/ndk/` (`sdkmanager "ndk;28.2.13676358"` in release CI; `~/Library/Android/sdk/ndk/` when installed via Android Studio). The `<triple>24-clang` wrappers serve as both CC and linker, plus `-Wl,-z,max-page-size=16384` for Android 15+ 16K-page devices. Termux installs (install.sh, updater.rs) prefer `*-linux-android` assets; the musl static-PIE builds (linked with the `.github/tls_pad.c` TLS-alignment pad via the zig wrapper) serve non-Termux Linux. Android binaries link against Bionic and cannot run on non-Android hosts — verify Android builds structurally (INTERP `/system/bin/linker64`, DYN, 16K LOAD alignment). musl binaries are Linux-runnable on compatible hosts; keep their structural checks too (DYN static-PIE, no INTERP, Bionic-compatible TLS alignment).
 
 ## Conventions worth knowing
 
