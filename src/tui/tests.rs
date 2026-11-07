@@ -2550,6 +2550,28 @@ fn header_keeps_last_export_visible_at_narrow_width() {
 }
 
 #[test]
+fn header_keeps_last_export_visible_at_status_boundary() {
+    // At 74 wide, a DONE status (7 cols) would push a comparison receipt
+    // (50 cols) just over budget with the badge; the receipt must win.
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(1);
+    app.scan_complete = true;
+    app.scan_lifecycle = ScanLifecycle::Completed;
+    app.config.host = "a.very.long.cdn-edge.example-very-long-name.com".to_string();
+    app.config.path = "/a/very/long/probe/path/cdn-cgi/trace".to_string();
+    app.last_export = Some("cleanscan_comparison_1234567890.json".to_string());
+    let rendered = rendered(&mut app, 74, 20);
+    assert!(
+        lines_containing(&rendered, 74, "Last export") >= 1,
+        "Last export receipt must stay visible at 74 wide with DONE status, buffer:\n{rendered}"
+    );
+}
+
+#[test]
 fn d_retest_collects_degraded_and_failed_targets() {
     let mut app = App::new(
         AppConfig::default(),

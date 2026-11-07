@@ -244,9 +244,19 @@ pub fn app_header(
     used += badge.content.chars().count();
     spans.push(badge);
 
+    // The status chip sits before the receipt reservation below; drop it
+    // when it is the only thing pushing a "Last export" receipt over
+    // budget, so the receipt can still be shown.
+    let receipt_width = segments
+        .last()
+        .filter(|seg| seg.label == "Last export")
+        .map(segment_width)
+        .unwrap_or(0);
     if let Some((text, style)) = status {
         let w = text.chars().count() + 3; // │ + spaces
-        if used + w <= budget {
+        let receipt_alone_fits = used + receipt_width <= budget;
+        let receipt_with_status_fits = used + w + receipt_width <= budget;
+        if used + w <= budget && (!receipt_alone_fits || receipt_with_status_fits) {
             spans.push(Span::styled("│", theme::hint_style()));
             spans.push(Span::styled(format!(" {text} "), style));
             used += w;
