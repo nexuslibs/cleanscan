@@ -263,13 +263,14 @@ pub fn app_header(
         }
     }
 
-    let last_width = segments.last().map(segment_width).unwrap_or(0);
     let mut dropped_earlier = false;
     for (index, seg) in segments.iter().enumerate() {
         let seg_w = segment_width(seg);
         let is_last = index + 1 == segments.len();
-        // Keep room for the final segment when placing anything before it.
-        let reserve = if is_last { 0 } else { last_width };
+        // Keep room for the receipt (only) when placing anything before
+        // it; without a receipt, earlier segments are kept whenever they
+        // fit on their own.
+        let reserve = if is_last { 0 } else { receipt_width };
         if used + seg_w + reserve > budget {
             if is_last {
                 // Place the receipt if it fits on its own; else elide.

@@ -114,6 +114,7 @@ pub struct Args {
     /// cleanscan itself (connect sweep, --proxy-url checks, fragment
     /// tester); needs CAP_NET_ADMIN there. Unsupported on other platforms.
     /// Routes egress through the fwmark-selected table (e.g. around a TUN).
+    /// Use "off" (or "0") to clear a previously saved mark.
     #[arg(long)]
     pub mark: Option<String>,
 
@@ -126,8 +127,13 @@ pub struct Args {
     /// ECH config can be fetched (or this build lacks `--features ech`),
     /// refuse cleartext SNI instead of connecting. Applies to --proxy-url
     /// protocol checks and the TUI fragment tester.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "no_ech")]
     pub ech: bool,
+
+    /// Disable ECH, clearing a previously saved `--ech` setting.
+    /// Mutually exclusive with `--ech`.
+    #[arg(long = "no-ech", conflicts_with = "ech")]
+    pub no_ech: bool,
 
     /// List network interfaces with their IP addresses, then exit.
     #[arg(long)]
@@ -446,14 +452,21 @@ fn main() -> Result<()> {
     }
     config.interface = crate::iface::normalize_interface(args.interface.clone());
     if let Some(raw) = args.mark.as_deref() {
-        config.mark = Some(
-            crate::iface::parse_mark_value(raw)
-                .map_err(|e| anyhow::anyhow!("--mark: {e}; expected e.g. \"106\" or \"0x106\""))?,
-        );
-        if !crate::iface::mark_supported() {
-            anyhow::bail!(
-                "--mark (SO_MARK) is only supported on Linux and Android; on this platform it would have no effect"
-            );
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("off") || trimmed == "0" {
+            // Clear a persisted mark; no platform check needed to unset.
+            config.mark = None;
+        } else {
+            config.mark = Some(crate::iface::parse_mark_value(raw).map_err(|e| {
+                anyhow::anyhow!(
+                    "--mark: {e}; expected e.g. \"106\", \"0x106\", or \"off\" to clear"
+                )
+            })?);
+            if !crate::iface::mark_supported() {
+                anyhow::bail!(
+                    "--mark (SO_MARK) is only supported on Linux and Android; on this platform it would have no effect"
+                );
+            }
         }
     }
     if let Some(raw) = args.tls_fingerprint.as_deref() {
@@ -461,8 +474,14 @@ fn main() -> Result<()> {
             .parse()
             .map_err(|e| anyhow::anyhow!("--tls-fingerprint: {e}"))?;
     }
+    if args.ech && args.no_ech {
+        anyhow::bail!("--ech and --no-ech are mutually exclusive");
+    }
     if args.ech {
         config.ech = true;
+    }
+    if args.no_ech {
+        config.ech = false;
     }
     if let Some(raw) = args.tls_fragment.as_deref() {
         config.tls_fragment = if raw.trim().is_empty() {
@@ -1658,6 +1677,19 @@ mod tests {
             args.command,
             Some(Command::Update { check: true })
         ));
+    }
+
+    #[test]
+    fn ech_and_no_ech_flags_parse_and_conflict() {
+        let args = Args::try_parse_from(["cleanscan", "--no-ech"]).unwrap();
+        assert!(args.no_ech);
+        assert!(!args.ech);
+        assert!(
+            Args::try_parse_from(["cleanscan", "--ech", "--no-ech"]).is_err(),
+            "--ech and --no-ech must be mutually exclusive"
+        );
+        let args = Args::try_parse_from(["cleanscan", "--mark", "off"]).unwrap();
+        assert_eq!(args.mark.as_deref(), Some("off"));
     }
 
     #[test]

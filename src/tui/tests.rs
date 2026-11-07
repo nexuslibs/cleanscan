@@ -2572,6 +2572,56 @@ fn header_keeps_last_export_visible_at_status_boundary() {
 }
 
 #[test]
+fn header_without_receipt_keeps_segment_that_fits_alone() {
+    // Without a Last export receipt, earlier segments are no longer
+    // dropped just to reserve space for the final segment: a Host that
+    // fits on its own must stay, even if the final Elapsed segment
+    // then has to elide.
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(1);
+    app.scan_complete = true;
+    app.scan_lifecycle = ScanLifecycle::Completed;
+    app.config.host = "example.test".to_string();
+    app.last_export = None;
+    let rendered = rendered(&mut app, 60, 20);
+    assert!(
+        lines_containing(&rendered, 60, "example.test") >= 1,
+        "Host segment that fits alone must stay without a receipt, buffer:\n{rendered}"
+    );
+}
+
+#[test]
+fn dashboard_below_80_uses_micro_footer_without_clipped_labels() {
+    // The compact footer's fixed widths sum to 80, so below that the
+    // micro footer must be used rather than clipping button labels.
+    let mut app = App::new(
+        AppConfig::default(),
+        false,
+        Arc::new(AtomicBool::new(false)),
+    );
+    app.begin_scan(1);
+    app.scan_complete = true;
+    app.scan_lifecycle = ScanLifecycle::Completed;
+    let rendered = rendered(&mut app, 75, 20);
+    for label in [
+        "Export (e)",
+        "Speed test (t)",
+        "Fragments (g)",
+        "Customize (w)",
+    ] {
+        assert_eq!(
+            lines_containing(&rendered, 75, &label.chars().take(8).collect::<String>()),
+            lines_containing(&rendered, 75, label),
+            "compact label {label} must not appear clipped at 75 wide, buffer:\n{rendered}"
+        );
+    }
+}
+
+#[test]
 fn d_retest_collects_degraded_and_failed_targets() {
     let mut app = App::new(
         AppConfig::default(),

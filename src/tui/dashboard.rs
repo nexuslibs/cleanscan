@@ -114,7 +114,9 @@ fn render_dashboard(app: &mut App, frame: &mut Frame, area: Rect, compact: bool)
         render_scan_tabs(app, frame, chunks[2]);
     }
     render_scan_view(app, frame, chunks[3], compact);
-    if area.width < 72 {
+    // The compact footer's fixed widths sum to 80; below that it clips
+    // labels, so use the micro footer until the compact layout can fit.
+    if area.width < 80 {
         render_micro_footer(app, frame, chunks[4]);
     } else if compact {
         render_compact_footer(app, frame, chunks[4]);
