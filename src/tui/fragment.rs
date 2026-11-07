@@ -237,20 +237,13 @@ fn render_select(app: &mut App, frame: &mut Frame, area: Rect) {
         scroll = cursor_start + cursor_height - visible;
     }
     app.scroll = scroll.min(max_scroll);
-    let row_lines: Vec<Line> = {
-        let mut out = Vec::new();
-        let mut at = 0usize;
-        for (row, height) in rows.iter().zip(heights.iter()) {
-            let next = at + height;
-            if next > app.scroll && at < app.scroll + visible {
-                out.push(row.clone());
-            }
-            at = next;
-        }
-        out
-    };
+    // Pass every row to Paragraph and scroll by physical lines so partially
+    // visible rows keep their place instead of restarting from line one.
+    let row_lines = rows;
     frame.render_widget(
-        Paragraph::new(row_lines).wrap(Wrap { trim: false }),
+        Paragraph::new(row_lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.scroll as u16, 0)),
         Rect {
             x: inner.x,
             y: inner.y.saturating_add(1),

@@ -385,7 +385,7 @@ where
     let value = serde_json::Value::deserialize(deserializer)?;
     Ok(match value {
         serde_json::Value::Number(number) => match number.as_u64() {
-            Some(mark) if mark != 0 => Some(mark as u32),
+            Some(mark) if mark != 0 => u32::try_from(mark).ok(),
             _ => None,
         },
         _ => None,

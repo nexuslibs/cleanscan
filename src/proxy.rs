@@ -546,18 +546,22 @@ impl FragmentProfile {
                         "invalid finalmask JSON: stage {idx} lengths/delays must not be empty"
                     ));
                 }
-                // A stage whose repeating (last) length entry is zero while
-                // maxSplit is unlimited (absent or 0) never advances the
-                // split cursor — an infinite no-progress loop. Finite caps
-                // force the tail to the end, and zero-length prefixes with a
-                // progressing tail (e.g. PattNG [0,104,1]) are fine.
+                // A stage whose repeating (last) length entry can only
+                // produce zero while maxSplit can be unlimited never
+                // advances the split cursor — an infinite no-progress loop.
+                // `rand_between` excludes the upper bound, so an upper of 0
+                // or 1 with a clamped lower of 0 is zero-only. maxSplit is
+                // potentially unlimited whenever its lower bound clamps to
+                // 0 (it can draw 0). Finite caps force the tail to the end,
+                // and zero-length prefixes with a progressing tail (e.g.
+                // PattNG [0,104,1]) are fine.
                 let unlimited = match &max_split {
                     None => true,
-                    Some(range) => range.from.max(0) == 0 && range.to.max(0) == 0,
+                    Some(range) => range.from.max(0) == 0,
                 };
                 if unlimited {
                     if let Some(last) = lengths.last() {
-                        if last.from.max(0) == 0 && last.to.max(0) == 0 {
+                        if last.from.max(0) == 0 && last.to <= 1 {
                             return Err(format!(
                                 "invalid finalmask JSON: stage {idx} has zero length with unlimited maxSplit (splits would make no progress)"
                             ));
@@ -1957,6 +1961,33 @@ pub(crate) fn chrome_provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// using the Chrome provider/ALPN for `Chrome`, webpki roots on Android, and
 /// the platform verifier elsewhere; ECH goes through `client_config_ech`
 /// when the `ech` feature is compiled in.
+/// Reuse the parsed webpki root store across Android `ClientConfig`s so
+/// repeated client builds don't re-parse the full trust bundle each time.
+/// Sessions stay per-config (each builder call creates its own `ClientConfig`
+/// with its own resumption store); the store itself is refreshed on a short
+/// TTL so OS trust-store changes are still picked up.
+#[cfg(target_os = "android")]
+fn shared_android_roots() -> Result<rustls::RootCertStore, rustls::Error> {
+    use std::sync::Mutex;
+    static CACHE: OnceLock<Mutex<(Option<rustls::RootCertStore>, Instant)>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new((None, Instant::now())));
+    {
+        let guard = cache.lock().expect("root cache mutex poisoned");
+        if let Some(roots) = &guard.0 {
+            if guard.1.elapsed() < std::time::Duration::from_secs(60) {
+                return Ok(roots.clone());
+            }
+        }
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    for der in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
+        roots.add(der.clone())?;
+    }
+    let mut guard = cache.lock().expect("root cache mutex poisoned");
+    *guard = (Some(roots.clone()), Instant::now());
+    Ok(roots)
+}
+
 pub(crate) fn client_config(
     fingerprint: TlsFingerprint,
     ech_list: Option<&[u8]>,
@@ -1971,20 +2002,14 @@ pub(crate) fn client_config(
     #[cfg(target_os = "android")]
     let mut config = match fingerprint {
         TlsFingerprint::Chrome => {
-            let mut roots = rustls::RootCertStore::empty();
-            for der in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
-                roots.add(der.clone())?;
-            }
+            let roots = shared_android_roots()?;
             ClientConfig::builder_with_provider(chrome_provider())
                 .with_safe_default_protocol_versions()?
                 .with_root_certificates(roots)
                 .with_no_client_auth()
         }
         TlsFingerprint::Default => {
-            let mut roots = rustls::RootCertStore::empty();
-            for der in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
-                roots.add(der.clone())?;
-            }
+            let roots = shared_android_roots()?;
             ClientConfig::builder()
                 .with_root_certificates(roots)
                 .with_no_client_auth()
@@ -2039,10 +2064,7 @@ fn client_config_ech(
             provider.kx_groups = chrome.kx_groups.clone();
             #[cfg(target_os = "android")]
             {
-                let mut roots = rustls::RootCertStore::empty();
-                for der in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
-                    roots.add(der.clone())?;
-                }
+                let roots = shared_android_roots()?;
                 ClientConfig::builder_with_provider(Arc::new(provider))
                     .with_ech(rustls::client::EchMode::Enable(ech_config))?
                     .with_root_certificates(roots)
@@ -2059,10 +2081,7 @@ fn client_config_ech(
         TlsFingerprint::Default => {
             #[cfg(target_os = "android")]
             {
-                let mut roots = rustls::RootCertStore::empty();
-                for der in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
-                    roots.add(der.clone())?;
-                }
+                let roots = shared_android_roots()?;
                 ClientConfig::builder_with_provider(Arc::new(
                     rustls::crypto::aws_lc_rs::default_provider(),
                 ))

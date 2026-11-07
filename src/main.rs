@@ -110,10 +110,10 @@ pub struct Args {
     #[arg(long = "tls-fragment")]
     pub tls_fragment: Option<String>,
 
-    /// Linux socket mark (SO_MARK) for connections made by cleanscan itself
-    /// (connect sweep, --proxy-url checks, fragment tester), e.g. "106" or
-    /// "0x106". Required on Linux/Android and needs CAP_NET_ADMIN; routes
-    /// egress through the fwmark-selected table (e.g. around a TUN).
+    /// Linux/Android-only socket mark (SO_MARK) for connections made by
+    /// cleanscan itself (connect sweep, --proxy-url checks, fragment
+    /// tester); needs CAP_NET_ADMIN there. Unsupported on other platforms.
+    /// Routes egress through the fwmark-selected table (e.g. around a TUN).
     #[arg(long)]
     pub mark: Option<String>,
 
