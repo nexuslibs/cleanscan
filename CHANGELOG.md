@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.39.0](https://github.com/nexuslibs/cleanscan/compare/v0.38.0...v0.39.0) (2026-11-07)
+
+
+### Features
+
+* **args:** add --no-ech flag and improve --mark handling; update dashboard footer logic ([2d116db](https://github.com/nexuslibs/cleanscan/commit/2d116dbc3cb539641f3668df0d1e56ca22f46b27))
+* **proxy:** add PattNG 0/104/1 preset and stable-majority tester verdicts ([189c732](https://github.com/nexuslibs/cleanscan/commit/189c7323ec2135a930cf63ad99183fed5db136c4))
+* **proxy:** add PattNG 0/104/1 preset and stable-majority tester verdicts ([0de4934](https://github.com/nexuslibs/cleanscan/commit/0de4934fb8492b1330b0cd9f782d464f5db2fdf5))
+* **tests:** add tests for tall custom row visibility in fragment selection ([cc93a1b](https://github.com/nexuslibs/cleanscan/commit/cc93a1b88c2a53b5dd798abd91bec236802d9877))
+
+
+### Bug Fixes
+
+* **main:** clarify socket mark description for Linux/Android ([6dbf556](https://github.com/nexuslibs/cleanscan/commit/6dbf5567d79f9cb86a46411eff5bac6d3f4e795d))
+* **proxy:** improve handling of zero-length entries in fragment profiles ([6dbf556](https://github.com/nexuslibs/cleanscan/commit/6dbf5567d79f9cb86a46411eff5bac6d3f4e795d))
+* **scanner:** require complete CF-Ray header line before reporting colo ([ee14e91](https://github.com/nexuslibs/cleanscan/commit/ee14e918ffcafd899f5a229a100e772eae79fd6c))
+* **tui:** keep last-export receipt visible at narrow widths ([58099b9](https://github.com/nexuslibs/cleanscan/commit/58099b96928bf1a42d2cd9b192b50639f2b5e833))
+
 ## [0.38.0](https://github.com/nexuslibs/cleanscan/compare/v0.37.0...v0.38.0) (2026-08-15)
 
 
